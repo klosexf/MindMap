@@ -1,0 +1,175 @@
+import { z } from 'zod';
+
+export const SOURCE_TYPES = ['text', 'url', 'pdf', 'prompt'] as const;
+export type SourceType = (typeof SOURCE_TYPES)[number];
+
+export const sourceReferenceSchema = z.object({
+  type: z.enum(SOURCE_TYPES),
+  location: z.string().optional(),
+  page: z.number().int().positive().optional(),
+  timestamp: z.string().optional(),
+  url: z.string().url().optional(),
+  text: z.string().optional(),
+});
+
+export type SourceReference = z.infer<typeof sourceReferenceSchema>;
+
+export const nodeMetaSchema = z.object({
+  sourceRef: sourceReferenceSchema,
+  confidence: z.number().min(0).max(1).optional(),
+  type: z.enum(['main', 'detail', 'action', 'question']).default('detail'),
+  createdAt: z.number().int(),
+  createdBy: z.enum(['ai', 'user']).default('ai'),
+  editedAt: z.number().int().optional(),
+  editedBy: z.enum(['ai', 'user']).optional(),
+});
+
+export type NodeMeta = z.infer<typeof nodeMetaSchema>;
+
+export const nodeStyleSchema = z.object({
+  fill: z.string().optional(),
+  stroke: z.string().optional(),
+  fontSize: z.number().optional(),
+  fontWeight: z.enum(['normal', 'bold']).optional(),
+  fontStyle: z.enum(['normal', 'italic']).optional(),
+  icon: z.string().optional(),
+  shape: z.enum(['rect', 'rounded', 'circle', 'diamond']).optional(),
+});
+
+export type NodeStyle = z.infer<typeof nodeStyleSchema>;
+
+export type MindMapNode = {
+  id: string;
+  content: string;
+  children?: MindMapNode[];
+  collapsed?: boolean;
+  style?: NodeStyle;
+  meta: NodeMeta;
+};
+
+export const mindMapNodeSchema: z.ZodType<MindMapNode> = z.lazy(() =>
+  z.object({
+    id: z.string().min(1),
+    content: z.string().min(1).max(500),
+    children: z.array(mindMapNodeSchema).optional(),
+    collapsed: z.boolean().optional(),
+    style: nodeStyleSchema.optional(),
+    meta: nodeMetaSchema,
+  }),
+);
+
+export const treeMetaSchema = z.object({
+  title: z.string().optional(),
+  sourceType: z.enum(SOURCE_TYPES),
+  sourceUrl: z.string().url().optional(),
+  sourceFileName: z.string().optional(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+  version: z.number().int().min(1),
+  truncated: z.boolean().default(false),
+});
+
+export type TreeMeta = z.infer<typeof treeMetaSchema>;
+
+export const mindMapTreeSchema = z.object({
+  id: z.string().min(1),
+  root: mindMapNodeSchema,
+  meta: treeMetaSchema,
+});
+
+export type MindMapTree = z.infer<typeof mindMapTreeSchema>;
+
+export const llmNodeSchema: z.ZodType<{ content: string; children?: { content: string; children?: any[] }[] }> = z.lazy(() =>
+  z.object({
+    content: z.string().min(1).max(500),
+    children: z.array(llmNodeSchema).optional(),
+  }),
+);
+
+export const llmTreeSchema = z.object({
+  title: z.string().min(1).max(120),
+  root: llmNodeSchema,
+});
+
+export type LLMMindMapTree = z.infer<typeof llmTreeSchema>;
+
+export type TreePatch =
+  | {
+      type: 'add';
+      nodeId: string;
+      parentId: string;
+      index: number;
+      node: MindMapNode;
+      timestamp: number;
+    }
+  | {
+      type: 'update';
+      nodeId: string;
+      node: Partial<Pick<MindMapNode, 'content' | 'collapsed' | 'style' | 'meta'>>;
+      timestamp: number;
+    }
+  | {
+      type: 'delete';
+      nodeId: string;
+      timestamp: number;
+    }
+  | {
+      type: 'toggleCollapse';
+      nodeId: string;
+      timestamp: number;
+    };
+
+export const treePatchSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('add'),
+    nodeId: z.string().min(1),
+    parentId: z.string().min(1),
+    index: z.number().int().min(0),
+    node: mindMapNodeSchema,
+    timestamp: z.number().int(),
+  }),
+  z.object({
+    type: z.literal('update'),
+    nodeId: z.string().min(1),
+    node: z
+      .object({
+        content: z.string().min(1).max(500).optional(),
+        collapsed: z.boolean().optional(),
+        style: nodeStyleSchema.optional(),
+        meta: nodeMetaSchema.optional(),
+      })
+      .refine((v) => Object.keys(v).length > 0, 'update patch requires at least one field'),
+    timestamp: z.number().int(),
+  }),
+  z.object({
+    type: z.literal('delete'),
+    nodeId: z.string().min(1),
+    timestamp: z.number().int(),
+  }),
+  z.object({
+    type: z.literal('toggleCollapse'),
+    nodeId: z.string().min(1),
+    timestamp: z.number().int(),
+  }),
+]);
+
+export const treePatchListSchema = z.array(treePatchSchema);
+
+export interface ParsedChunk {
+  id: string;
+  text: string;
+  tokenEstimate: number;
+  sourceRef: SourceReference;
+}
+
+export interface NormalizedDocument {
+  markdown: string;
+  chunks: ParsedChunk[];
+  sourceMeta: {
+    type: SourceType;
+    title?: string;
+    sourceUrl?: string;
+    sourceFileName?: string;
+    ocrUsed?: boolean;
+  };
+}
