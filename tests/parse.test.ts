@@ -13,14 +13,27 @@ vi.mock('tesseract.js', () => ({
 }));
 
 function createSimplePdfBase64(content = 'Hello PDF Parser '.repeat(20)): string {
-  const stream = content ? `BT\n/F1 12 Tf\n72 720 Td\n(${content}) Tj\nET` : '';
+  return createMultiPagePdfBase64([content]);
+}
 
+function createMultiPagePdfBase64(contents: string[]): string {
+  const pageObjects = contents.flatMap((content, idx) => {
+    const pageObjectId = 4 + idx * 2;
+    const contentObjectId = pageObjectId + 1;
+    const stream = content ? `BT\n/F1 12 Tf\n72 720 Td\n(${content}) Tj\nET` : '';
+
+    return [
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentObjectId} 0 R >>`,
+      `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    ];
+  });
+
+  const kids = contents.map((_, idx) => `${4 + idx * 2} 0 R`).join(' ');
   const objects = [
     '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
-    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    `<< /Type /Pages /Kids [${kids}] /Count ${contents.length} >>`,
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ...pageObjects,
   ];
 
   let pdf = '%PDF-1.4\n';
@@ -79,6 +92,21 @@ describe('parseInput', () => {
     expect(doc.sourceMeta.type).toBe('pdf');
     expect(doc.markdown).toContain('Hello PDF Parser');
     expect(doc.chunks.length).toBeGreaterThan(0);
+  });
+
+  it('splits pdf text into page-level chunks with page source refs', async () => {
+    const base64 = createMultiPagePdfBase64([
+      'First PDF page about account verification and approval reminders.',
+      'Second PDF page about enterprise certification and signing QR codes.',
+    ]);
+
+    const doc = await parseInput({ type: 'pdf', content: base64, fileName: 'multi-page.pdf' });
+
+    expect(doc.chunks).toHaveLength(2);
+    expect(doc.chunks[0].sourceRef.page).toBe(1);
+    expect(doc.chunks[1].sourceRef.page).toBe(2);
+    expect(doc.chunks[0].text).toContain('## Page 1');
+    expect(doc.chunks[1].text).toContain('## Page 2');
   });
 
   it('runs OCR by default for low-text pdf files', async () => {

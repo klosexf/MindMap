@@ -39,9 +39,13 @@ async function loadPdfDocument(buffer: Uint8Array) {
   }).promise;
 }
 
-async function extractPdfText(buffer: Uint8Array): Promise<{ text: string; pages: number }> {
+async function extractPdfText(buffer: Uint8Array): Promise<{
+  text: string;
+  pages: number;
+  pageTexts: Array<{ page: number; text: string }>;
+}> {
   const pdf = await loadPdfDocument(buffer);
-  const pageTexts: string[] = [];
+  const pageTexts: Array<{ page: number; text: string }> = [];
 
   try {
     for (let i = 1; i <= pdf.numPages; i += 1) {
@@ -50,17 +54,19 @@ async function extractPdfText(buffer: Uint8Array): Promise<{ text: string; pages
       const text = textContent.items
         .map((item) => ('str' in item ? item.str ?? '' : ''))
         .join(' ')
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
 
       if (text) {
-        pageTexts.push(`## Page ${i}\n\n${text}`);
+        pageTexts.push({ page: i, text });
       }
     }
 
     return {
-      text: pageTexts.join('\n\n'),
+      text: pageTexts.map(({ page, text }) => `## Page ${page}\n\n${text}`).join('\n\n'),
       pages: pdf.numPages,
+      pageTexts,
     };
   } finally {
     await pdf.destroy();
@@ -123,10 +129,12 @@ async function ocrPdfFirstPage(buffer: Uint8Array): Promise<string> {
 export async function parsePdfInput(base64Data: string, fileName = 'document.pdf'): Promise<NormalizedDocument> {
   const raw = Buffer.from(base64Data, 'base64');
   let extracted = '';
+  let pageTexts: Array<{ page: number; text: string; heading?: string }> = [];
 
   try {
-    const { text } = await extractPdfText(new Uint8Array(raw));
+    const { text, pageTexts: extractedPageTexts } = await extractPdfText(new Uint8Array(raw));
     extracted = text;
+    pageTexts = extractedPageTexts;
   } catch {
     extracted = '';
   }
@@ -140,11 +148,13 @@ export async function parsePdfInput(base64Data: string, fileName = 'document.pdf
     if (ocrText.length > PDF_OCR_MIN_LENGTH) {
       ocrUsed = true;
       mergedText = `## OCR Extracted\n\n${ocrText}`;
+      pageTexts = [{ page: 1, heading: 'OCR Extracted', text: ocrText }];
     }
   }
 
   if (!mergedText) {
     mergedText = '该 PDF 未能提取到可读文本，已生成占位内容。建议上传可复制文本的 PDF 以获得更好结果。';
+    pageTexts = [{ page: 1, heading: 'PDF Notice', text: mergedText }];
   }
 
   const markdown = `# ${fileName}\n\n${mergedText}`;
@@ -154,10 +164,19 @@ export async function parsePdfInput(base64Data: string, fileName = 'document.pdf
     location: 'page:1',
     text: mergedText.slice(0, 240),
   });
+  const chunks = pageTexts.flatMap(({ page, heading, text }) => {
+    const pageSourceRef = createSourceRefFallback({
+      type: 'pdf',
+      page,
+      location: `page:${page}`,
+      text: text.slice(0, 240),
+    });
+    return chunkMarkdown(`# ${fileName}\n\n## ${heading || `Page ${page}`}\n\n${text}`, pageSourceRef);
+  });
 
   return {
     markdown,
-    chunks: chunkMarkdown(markdown, sourceRef),
+    chunks: chunks.length > 0 ? chunks : chunkMarkdown(markdown, sourceRef),
     sourceMeta: {
       type: 'pdf',
       title: fileName.replace(/\.pdf$/i, ''),

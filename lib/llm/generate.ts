@@ -45,6 +45,56 @@ function makeDefaultSourceRef(doc: NormalizedDocument): SourceReference {
   });
 }
 
+function createHeuristicNode(
+  content: string,
+  sourceRef: SourceReference,
+  type: MindMapNode['meta']['type'] = 'detail',
+  confidence = 0.65,
+): MindMapNode {
+  return {
+    id: nanoid(),
+    content: content.trim().slice(0, 120) || '未命名节点',
+    collapsed: false,
+    meta: {
+      sourceRef,
+      type,
+      confidence,
+      createdAt: Date.now(),
+      createdBy: 'ai',
+    },
+    children: [],
+  };
+}
+
+function cleanMarkdownText(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+.*$/gm, '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractSentences(text: string, limit: number): string[] {
+  return cleanMarkdownText(text)
+    .split(/[。！？.!?]/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function titleFromChunk(text: string, index: number): string {
+  const heading = text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .find((line) => /^#{2,6}\s+/.test(line));
+
+  if (heading) {
+    return heading.replace(/^#{2,6}\s+/, '').trim().slice(0, 80) || `分块 ${index + 1}`;
+  }
+
+  return extractSentences(text, 1)[0]?.slice(0, 80) || `分块 ${index + 1}`;
+}
+
 function createNodeFromLLM(raw: { content: string; children?: { content: string; children?: any[] }[] }, sourceRef: SourceReference): MindMapNode {
   const now = Date.now();
   return {
@@ -153,26 +203,39 @@ function heuristicTreeFromDocument(doc: NormalizedDocument): MindMapTree {
   const sourceRef = makeDefaultSourceRef(doc);
   const title = doc.sourceMeta.title || '快速生成导图';
 
-  const sentences = doc.markdown
-    .replace(/^#.*$/gm, '')
-    .split(/[。！？.!?\n]/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, 12);
+  if (doc.chunks.length > 1) {
+    const root = createHeuristicNode(title, sourceRef, 'main', 0.7);
 
-  const root: MindMapNode = {
-    id: nanoid(),
-    content: title,
-    collapsed: false,
-    meta: {
-      sourceRef,
-      type: 'main',
-      confidence: 0.7,
-      createdAt: Date.now(),
-      createdBy: 'ai',
-    },
-    children: [],
-  };
+    root.children = doc.chunks.slice(0, 24).map((chunk, index) => {
+      const chunkSourceRef = chunk.sourceRef || sourceRef;
+      const branch = createHeuristicNode(titleFromChunk(chunk.text, index), chunkSourceRef, 'detail', 0.68);
+      branch.children = extractSentences(chunk.text, 4).map((sentence) =>
+        createHeuristicNode(sentence.slice(0, 80), chunkSourceRef, 'detail', 0.62),
+      );
+      return branch;
+    });
+
+    const tree: MindMapTree = {
+      id: nanoid(),
+      root,
+      meta: {
+        title,
+        sourceType: doc.sourceMeta.type,
+        sourceUrl: doc.sourceMeta.sourceUrl,
+        sourceFileName: doc.sourceMeta.sourceFileName,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        version: 1,
+        truncated: false,
+      },
+    };
+
+    return clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
+  }
+
+  const sentences = extractSentences(doc.markdown, 12);
+
+  const root = createHeuristicNode(title, sourceRef, 'main', 0.7);
 
   const grouped = [
     { title: '核心概念', items: sentences.slice(0, 4) },
@@ -181,34 +244,12 @@ function heuristicTreeFromDocument(doc: NormalizedDocument): MindMapTree {
   ];
 
   for (const group of grouped) {
-    const branch: MindMapNode = {
-      id: nanoid(),
-      content: group.title,
-      collapsed: false,
-      meta: {
-        sourceRef,
-        type: 'detail',
-        confidence: 0.65,
-        createdAt: Date.now(),
-        createdBy: 'ai',
-      },
-      children: [],
-    };
+    const branch = createHeuristicNode(group.title, sourceRef, 'detail', 0.65);
 
     group.items.forEach((item) => {
-      branch.children?.push({
-        id: nanoid(),
-        content: item.slice(0, 80),
-        collapsed: false,
-        meta: {
-          sourceRef,
-          type: group.title === '行动建议' ? 'action' : 'detail',
-          confidence: 0.62,
-          createdAt: Date.now(),
-          createdBy: 'ai',
-        },
-        children: [],
-      });
+      branch.children?.push(
+        createHeuristicNode(item.slice(0, 80), sourceRef, group.title === '行动建议' ? 'action' : 'detail', 0.62),
+      );
     });
 
     if ((branch.children?.length ?? 0) > 0) {
