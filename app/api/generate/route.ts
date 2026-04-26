@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
-import { generateMindMapStream } from '@/lib/llm/generate';
-import { waitForFirstEventWithWarning } from '@/lib/llm/first-event-watchdog';
+import { buildHeuristicMindMapTree, generateMindMapStream } from '@/lib/llm/generate';
+import { FirstEventTimeoutError, waitForFirstEventWithWarning } from '@/lib/llm/first-event-watchdog';
 import { saveMindMap } from '@/lib/storage/mindmap-store';
 import { mindMapTreeSchema, sourceReferenceSchema, type MindMapTree } from '@/lib/types/mindmap';
 
@@ -96,13 +96,25 @@ export async function POST(req: Request) {
 
           controller.close();
         } catch (error) {
-          controller.enqueue(
-            encoder.encode(
-              sseMessage('error', {
-                message: error instanceof Error ? error.message : 'Generation failed',
-              }),
-            ),
-          );
+          if (error instanceof FirstEventTimeoutError) {
+            const fallback = buildHeuristicMindMapTree(normalizedDocument);
+            completedTree = fallback;
+            controller.enqueue(encoder.encode(sseMessage('skeleton', { tree: fallback })));
+            controller.enqueue(encoder.encode(sseMessage('complete', { tree: fallback })));
+          } else {
+            controller.enqueue(
+              encoder.encode(
+                sseMessage('error', {
+                  message: error instanceof Error ? error.message : 'Generation failed',
+                }),
+              ),
+            );
+          }
+
+          if (completedTree) {
+            await saveMindMap(completedTree);
+          }
+
           controller.close();
         }
       },

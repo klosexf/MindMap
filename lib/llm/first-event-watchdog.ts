@@ -1,3 +1,10 @@
+export class FirstEventTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`First event timeout after ${timeoutMs}ms`);
+    this.name = 'FirstEventTimeoutError';
+  }
+}
+
 export async function waitForFirstEventWithWarning<T>(
   nextPromise: Promise<IteratorResult<T>>,
   warningAfterMs: number,
@@ -21,7 +28,7 @@ export async function waitForFirstEventWithWarning<T>(
 
   if (result.kind === 'timeout') {
     await onWarning();
-    return nextPromise;
+    throw new FirstEventTimeoutError(warningAfterMs);
   }
 
   return result.value;

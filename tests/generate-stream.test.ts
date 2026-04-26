@@ -109,4 +109,82 @@ describe('generateMindMapStream', () => {
     expect(completeTree?.root.children?.[0].children?.[0].content).toContain('Authentication flow changes');
     expect(completeTree?.root.children?.[1].meta.sourceRef.page).toBe(2);
   });
+
+  it('filters OCR noise so fallback second-level nodes stay readable', async () => {
+    const doc: NormalizedDocument = {
+      markdown: [
+        '# 【产品经理_深圳 15-20K】谭艳丽 9年.pdf',
+        '',
+        '## OCR Page 1',
+        '',
+        '5czbz0scfs6d91271XB639m_EFZUxoz:WPqaWOWnfrwWMFaA 一 REE 1993.07.04 | 13352824120 |',
+        '求职 目标 : 产品 经 理 自我 评价 ETTOOIROTTOEYTSOTCORTOT GTR, SRR, REE, MPSSRRILH, SESBUR 25% RS: PEROT',
+        'SAAR BUR OW SK 20007 WARSEEARSES 15; BARR LE ASSP RAED;',
+        'ZEENSROSREI GUE BALEATONS SHNRIES ANOS ZRASHR 30;',
+        'SHEN BTCRRUSENCEERR RNG RRSEDOASHAED SRN OAD SRESTRME SuEROSRREE 5;',
+        'MUTE ETROLSEN ITER RNS REHIRIESSE QERAIE.',
+      ].join('\n'),
+      chunks: [
+        {
+          id: 'ocr_page_1',
+          text: [
+            '## OCR Page 1',
+            '',
+            '5czbz0scfs6d91271XB639m_EFZUxoz:WPqaWOWnfrwWMFaA 一 REE 1993.07.04 | 13352824120 |',
+            '求职 目标 : 产品 经 理 自我 评价 ETTOOIROTTOEYTSOTCORTOT GTR, SRR, REE, MPSSRRILH, SESBUR 25% RS: PEROT',
+            'SAAR BUR OW SK 20007 WARSEEARSES 15; BARR LE ASSP RAED;',
+            'ZEENSROSREI GUE BALEATONS SHNRIES ANOS ZRASHR 30;',
+            'SHEN BTCRRUSENCEERR RNG RRSEDOASHAED SRN OAD SRESTRME SuEROSRREE 5;',
+            'MUTE ETROLSEN ITER RNS REHIRIESSE QERAIE.',
+          ].join('\n'),
+          tokenEstimate: 80,
+          sourceRef: { type: 'pdf', page: 1, location: 'page:1', text: '求职 目标 : 产品 经 理 自我 评价' },
+        },
+      ],
+      sourceMeta: {
+        type: 'pdf',
+        title: '【产品经理_深圳 15-20K】谭艳丽 9年',
+        sourceFileName: '【产品经理_深圳 15-20K】谭艳丽 9年.pdf',
+      },
+    };
+
+    const originalProvider = process.env.LLM_PROVIDER;
+    const original = process.env.OPENAI_API_KEY;
+    process.env.LLM_PROVIDER = 'openai';
+    process.env.OPENAI_API_KEY = '';
+
+    let completeTree: MindMapTree | null = null;
+    for await (const event of generateMindMapStream(doc)) {
+      if (event.type === 'complete') {
+        completeTree = event.data.tree;
+      }
+    }
+
+    if (typeof originalProvider === 'string') {
+      process.env.LLM_PROVIDER = originalProvider;
+    } else {
+      delete process.env.LLM_PROVIDER;
+    }
+    if (typeof original === 'string') {
+      process.env.OPENAI_API_KEY = original;
+    } else {
+      delete process.env.OPENAI_API_KEY;
+    }
+
+    const secondLevelNodes = completeTree?.root.children?.flatMap((branch) =>
+      (branch.children || []).map((child) => child.content),
+    );
+    const joined = (secondLevelNodes || []).join(' ');
+
+    expect(secondLevelNodes?.length).toBeGreaterThan(0);
+    expect(joined).not.toContain('5czbz0scfs6d91271XB639m_EFZUxoz');
+    expect(joined).not.toContain('ETTOOIROTTOEYTSOTCORTOT');
+    expect(joined).not.toContain('92188547600 com');
+    expect(joined).not.toContain('SAAR BUR OW SK');
+    expect(joined).not.toContain('BARR LE ASSP RAED');
+    expect(joined).not.toContain('ZEENSROSREI');
+    expect(joined).not.toContain('BTCRRUSENCEERR');
+    expect(joined).not.toContain('MUTE ETROLSEN');
+    expect(joined).toMatch(/求职目标|产品经理|自我评价/);
+  });
 });

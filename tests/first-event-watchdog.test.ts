@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { waitForFirstEventWithWarning } from '@/lib/llm/first-event-watchdog';
+import { FirstEventTimeoutError, waitForFirstEventWithWarning } from '@/lib/llm/first-event-watchdog';
 
 describe('waitForFirstEventWithWarning', () => {
   it('does not call warning callback when first event arrives in time', async () => {
@@ -15,7 +15,7 @@ describe('waitForFirstEventWithWarning', () => {
     expect(onWarning).not.toHaveBeenCalled();
   });
 
-  it('calls warning callback once when first event exceeds timeout', async () => {
+  it('calls warning callback once and rejects with timeout error when first event exceeds timeout', async () => {
     vi.useFakeTimers();
     try {
       const onWarning = vi.fn();
@@ -24,6 +24,10 @@ describe('waitForFirstEventWithWarning', () => {
       });
 
       const pending = waitForFirstEventWithWarning(nextPromise, 20_000, onWarning);
+      const settled = pending.then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
 
       await vi.advanceTimersByTimeAsync(19_999);
       expect(onWarning).not.toHaveBeenCalled();
@@ -31,8 +35,12 @@ describe('waitForFirstEventWithWarning', () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(onWarning).toHaveBeenCalledTimes(1);
 
-      await vi.advanceTimersByTimeAsync(5_000);
-      await expect(pending).resolves.toEqual({ done: false, value: 'late' });
+      const result = await settled;
+      expect('error' in result).toBe(true);
+      if (!('error' in result)) {
+        throw new Error('Expected timeout rejection result');
+      }
+      expect(result.error).toBeInstanceOf(FirstEventTimeoutError);
     } finally {
       vi.useRealTimers();
     }

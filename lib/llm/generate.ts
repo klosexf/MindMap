@@ -1,6 +1,10 @@
+import { existsSync, readFileSync } from 'node:fs';
+
 import { nanoid } from 'nanoid';
 import { generateText, streamObject } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
+import type { FetchFunction } from '@ai-sdk/provider-utils';
+import { Agent } from 'undici';
 
 import {
   llmTreeSchema,
@@ -103,11 +107,69 @@ export interface MarkdownPreviewResult {
   model: string;
 }
 
+const CA_CERT_FALLBACK_PATHS = ['/etc/ssl/cert.pem', '/etc/ssl/certs/ca-certificates.crt'];
+let cachedZhipuFetch: FetchFunction | null | undefined;
+
 function parseNonNegativeInt(raw: string | undefined, fallback: number): number {
   if (raw == null || raw === '') return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value) || value < 0) return fallback;
   return Math.floor(value);
+}
+
+function resolveCaCertPath(): string | null {
+  const explicitPath = process.env.LLM_CA_CERT_PATH?.trim();
+  if (explicitPath) {
+    return existsSync(explicitPath) ? explicitPath : null;
+  }
+
+  const nodeExtraCaPath = process.env.NODE_EXTRA_CA_CERTS?.trim();
+  if (nodeExtraCaPath && existsSync(nodeExtraCaPath)) {
+    return nodeExtraCaPath;
+  }
+
+  const fallbackPath = CA_CERT_FALLBACK_PATHS.find((path) => existsSync(path));
+  return fallbackPath || null;
+}
+
+function getZhipuFetchWithLocalCA(): FetchFunction | undefined {
+  if (cachedZhipuFetch !== undefined) {
+    return cachedZhipuFetch || undefined;
+  }
+
+  const certPath = resolveCaCertPath();
+  if (!certPath) {
+    cachedZhipuFetch = null;
+    return undefined;
+  }
+
+  try {
+    const ca = readFileSync(certPath, 'utf8');
+    const dispatcher = new Agent({ connect: { ca } });
+
+    cachedZhipuFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const nextInit = (init || {}) as RequestInit & { dispatcher?: unknown };
+      if (nextInit.dispatcher) {
+        return fetch(input, nextInit);
+      }
+      return fetch(input, { ...nextInit, dispatcher } as RequestInit & { dispatcher: Agent });
+    }) as FetchFunction;
+    return cachedZhipuFetch;
+  } catch {
+    cachedZhipuFetch = null;
+    return undefined;
+  }
+}
+
+function createProviderClient(llmConfig: ResolvedLLMConfig) {
+  const customFetch = llmConfig.resolvedProvider === 'zhipu' ? getZhipuFetchWithLocalCA() : undefined;
+
+  return createOpenAI({
+    apiKey: llmConfig.apiKey,
+    baseURL: llmConfig.baseUrl,
+    name: llmConfig.resolvedProvider || 'openai',
+    fetch: customFetch,
+  });
 }
 
 function resolveLLMRequestConfig(provider?: OpenAICompatibleProvider): LLMRequestConfig {
@@ -187,12 +249,123 @@ function cleanMarkdownText(text: string): string {
     .trim();
 }
 
+const CJK_CHAR_RE = /[\u3400-\u9fff]/;
+const ASCII_TOKEN_ALLOWLIST = new Set(['AI', 'AIGC', 'API', 'APP', 'B2B', 'B2C', 'KPI', 'OKR', 'PDF', 'SQL', 'UI', 'UX']);
+
+function normalizeToken(token: string): string {
+  return token.replace(/^[^\p{L}\p{N}\u3400-\u9fff]+|[^\p{L}\p{N}\u3400-\u9fff]+$/gu, '');
+}
+
+function isNumericToken(token: string): boolean {
+  return /^[\d]+([./:\-][\d]+)*$/.test(token);
+}
+
+function collapseCjkSpacing(text: string): string {
+  let output = text;
+  let prev = '';
+  while (output !== prev) {
+    prev = output;
+    output = output.replace(/([\u3400-\u9fff])\s+([\u3400-\u9fff])/g, '$1$2');
+  }
+  return output;
+}
+
+function isLikelyNoiseToken(token: string, hasCjkContext: boolean): boolean {
+  if (!token) return true;
+  if (token.length > 24) return true;
+  if (/[A-Za-z]/.test(token) && /\d/.test(token) && token.length >= 8) return true;
+  if (/[_@]/.test(token) && token.length >= 6) return true;
+  if (/([A-Za-z])\1{4,}/.test(token)) return true;
+
+  const upper = token.toUpperCase();
+  const allUpperAscii = /^[A-Z]{4,}$/.test(token);
+  if (allUpperAscii && !ASCII_TOKEN_ALLOWLIST.has(upper)) return true;
+
+  if (!hasCjkContext) return false;
+
+  return false;
+}
+
+function shouldKeepAsciiTokenInCjkContext(token: string): boolean {
+  const upper = token.toUpperCase();
+  if (ASCII_TOKEN_ALLOWLIST.has(upper)) return true;
+  if (isNumericToken(token)) return true;
+
+  const hasLowercase = /[a-z]/.test(token);
+  const hasVowel = /[aeiou]/i.test(token);
+  return hasLowercase && hasVowel;
+}
+
+function sanitizeSentence(sentence: string): string {
+  const normalizedTokens = sentence
+    .split(/\s+/)
+    .map((token) => normalizeToken(token))
+    .filter(Boolean);
+
+  const hasCjkContext = normalizedTokens.some((token) => CJK_CHAR_RE.test(token));
+  const keptTokens = normalizedTokens.filter((token) => {
+    if (CJK_CHAR_RE.test(token)) return true;
+    if (isLikelyNoiseToken(token, hasCjkContext)) return false;
+    if (!hasCjkContext) return true;
+    return shouldKeepAsciiTokenInCjkContext(token);
+  });
+
+  const merged = collapseCjkSpacing(keptTokens.join(' '))
+    .replace(/\s+([,.;:!?，。！？、：；）\]】])/g, '$1')
+    .replace(/([（(\[【])\s+/g, '$1')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  return merged;
+}
+
+function isReadableSentence(sentence: string): boolean {
+  if (!sentence) return false;
+
+  const cjkChars = sentence.match(/[\u3400-\u9fff]/g)?.length ?? 0;
+  if (cjkChars >= 2) return true;
+
+  const tokens = sentence
+    .split(/\s+/)
+    .map((token) => normalizeToken(token))
+    .filter(Boolean);
+
+  const asciiAlphaTokens = tokens.filter((token) => /[A-Za-z]/.test(token));
+  if (asciiAlphaTokens.length < 3) return false;
+
+  const lowercaseChars = sentence.match(/[a-z]/g)?.length ?? 0;
+  const uppercaseTokens = asciiAlphaTokens.filter((token) => /^[A-Z]{2,}$/.test(token)).length;
+  const uppercaseRatio = uppercaseTokens / asciiAlphaTokens.length;
+  const noVowelLongTokenRatio =
+    asciiAlphaTokens.filter((token) => token.length >= 6 && !/[aeiou]/i.test(token)).length / asciiAlphaTokens.length;
+
+  if (lowercaseChars < 3 && uppercaseRatio >= 0.5) return false;
+  if (uppercaseRatio >= 0.75) return false;
+  if (noVowelLongTokenRatio >= 0.4) return false;
+
+  const asciiWords = sentence
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => /^[A-Za-z][A-Za-z-]*$/.test(token));
+  return asciiWords.length >= 3;
+}
+
 function extractSentences(text: string, limit: number): string[] {
-  return cleanMarkdownText(text)
-    .split(/[。！？.!?]/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, limit);
+  const cleaned = cleanMarkdownText(text);
+  const separators = /[。！？.!?;；|｜]/;
+
+  const sentences = cleaned
+    .split(separators)
+    .map((line) => sanitizeSentence(line))
+    .filter((line) => isReadableSentence(line));
+
+  const deduped = [...new Set(sentences)];
+  if (deduped.length > 0) {
+    return deduped.slice(0, limit);
+  }
+
+  const fallback = sanitizeSentence(cleaned);
+  return fallback && isReadableSentence(fallback) ? [fallback.slice(0, 160)] : [];
 }
 
 function titleFromChunk(text: string, index: number): string {
@@ -312,7 +485,7 @@ function buildDiffPatches(prevTree: MindMapTree, nextTree: MindMapTree): TreePat
   return patches;
 }
 
-function heuristicTreeFromDocument(doc: NormalizedDocument): MindMapTree {
+export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree {
   const sourceRef = makeDefaultSourceRef(doc);
   const title = doc.sourceMeta.title || '快速生成导图';
 
@@ -397,11 +570,119 @@ function buildPrompt(doc: NormalizedDocument): string {
     '2. 只输出与内容相关的信息，不要捏造事实。',
     '3. 每个节点文本简洁，尽量 20 字内。',
     '',
+    '质量控制：',
+    '- 确保每个节点内容完整且有意义',
+    '- 避免重复内容',
+    '- 保持层级逻辑清晰',
+    '- 重要信息优先级更高',
+    '',
     `标题建议：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
     '输入内容：',
     doc.markdown.slice(0, 12000),
   ].join('\n');
+}
+
+function buildCompatJsonPrompt(doc: NormalizedDocument): string {
+  return [
+    '你是资深知识整理助手，请把输入内容整理为思维导图 JSON。',
+    `约束：最大层级 ${MAX_TREE_DEPTH}，最大节点数 ${MAX_TREE_NODES}。`,
+    '输出规则：',
+    '1. 只输出一个 JSON 对象，不要 Markdown，不要解释，不要代码块。',
+    '2. JSON 结构必须是：{"title":"...","root":{"content":"...","children":[...]}}',
+    '3. 每个节点只允许字段：content（字符串）和 children（数组，可省略）。',
+    '4. 第一层主题建议 3~6 个，节点内容简洁、可读。',
+    '',
+    `标题建议：${doc.sourceMeta.title || '自动生成思维导图'}`,
+    '',
+    '输入内容：',
+    doc.markdown.slice(0, 12000),
+  ].join('\n');
+}
+
+function extractJsonCandidates(text: string): string[] {
+  const trimmed = text.trim();
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  const candidates = new Set<string>([trimmed, withoutFence]);
+
+  for (const source of [trimmed, withoutFence]) {
+    const start = source.indexOf('{');
+    if (start < 0) continue;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < source.length; i++) {
+      const char = source[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === '{') {
+        depth += 1;
+      } else if (char === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          candidates.add(source.slice(start, i + 1).trim());
+          break;
+        }
+      }
+    }
+  }
+
+  return [...candidates].filter(Boolean);
+}
+
+function parseLLMTreeFromText(text: string): LLMMindMapTree | null {
+  for (const candidate of extractJsonCandidates(text)) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      const validated = llmTreeSchema.safeParse(parsed);
+      if (validated.success) {
+        return validated.data;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+async function generateTreeWithCompatProvider(
+  doc: NormalizedDocument,
+  llmConfig: ResolvedLLMConfig,
+  requestConfig: LLMRequestConfig,
+  options: { abortSignal?: AbortSignal },
+): Promise<MindMapTree> {
+  const modelProvider = createProviderClient(llmConfig);
+  const languageModel = modelProvider.chat(llmConfig.model as any);
+  const result = await generateText({
+    model: languageModel,
+    prompt: buildCompatJsonPrompt(doc),
+    maxRetries: requestConfig.maxRetries,
+    timeout: requestConfig.timeoutMs,
+    abortSignal: options.abortSignal,
+    temperature: 0.2,
+    maxOutputTokens: 2200,
+  });
+
+  const parsedTree = parseLLMTreeFromText(result.text);
+  if (!parsedTree) {
+    throw new Error('兼容模式无法解析智谱返回的导图 JSON');
+  }
+
+  return llmTreeToMindMapTree(parsedTree, doc);
 }
 
 function buildMarkdownPreviewPrompt(doc: NormalizedDocument): string {
@@ -417,6 +698,12 @@ function buildMarkdownPreviewPrompt(doc: NormalizedDocument): string {
     '   - 二级标题：关键结论（bullet 列表）',
     '4. 每条 bullet 尽量 8~30 字。',
     '5. 输出语言：简体中文。',
+    '',
+    '质量控制：',
+    '- 确保每个节点内容完整且有意义',
+    '- 避免重复内容',
+    '- 保持层级逻辑清晰',
+    '- 重要信息优先级更高',
     '',
     `文档标题：${doc.sourceMeta.title || '未命名文档'}`,
     `来源类型：${doc.sourceMeta.type}`,
@@ -456,11 +743,7 @@ export async function generateMarkdownPreview(
   const markdownTimeoutSeconds = parseNonNegativeInt(process.env.LLM_MARKDOWN_TIMEOUT, 90);
   const markdownTimeoutMs = markdownTimeoutSeconds > 0 ? markdownTimeoutSeconds * 1000 : undefined;
   const markdownMaxRetries = parseNonNegativeInt(process.env.LLM_MARKDOWN_MAX_RETRIES, requestConfig.maxRetries);
-  const modelProvider = createOpenAI({
-    apiKey: llmConfig.apiKey,
-    baseURL: llmConfig.baseUrl,
-    name: llmConfig.resolvedProvider || 'openai',
-  });
+  const modelProvider = createProviderClient(llmConfig);
 
   const languageModel =
     llmConfig.resolvedProvider === 'openai'
@@ -496,7 +779,7 @@ export async function* generateMindMapStream(
   const hasApiKey = Boolean(llmConfig.apiKey);
 
   if (!llmConfig.supported || !hasApiKey) {
-    const fallback = heuristicTreeFromDocument(doc);
+    const fallback = buildHeuristicMindMapTree(doc);
     yield { type: 'skeleton', data: { tree: fallback } };
 
     const flattened = flattenTree(fallback.root);
@@ -525,15 +808,63 @@ export async function* generateMindMapStream(
   const model = llmConfig.model;
   const prompt = buildPrompt(doc);
   const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
-  const modelProvider = createOpenAI({
-    apiKey: llmConfig.apiKey,
-    baseURL: llmConfig.baseUrl,
-    name: llmConfig.resolvedProvider || 'openai',
-  });
-
-  let workingTree = heuristicTreeFromDocument(doc);
+  let workingTree = buildHeuristicMindMapTree(doc);
   let skeletonSent = false;
   let latestStableTree = workingTree;
+
+  if (llmConfig.resolvedProvider && llmConfig.resolvedProvider !== 'openai') {
+    skeletonSent = true;
+    yield {
+      type: 'skeleton',
+      data: {
+        tree: workingTree,
+      },
+    };
+
+    try {
+      const finalTree = await generateTreeWithCompatProvider(doc, llmConfig, requestConfig, options);
+      const patches = buildDiffPatches(latestStableTree, finalTree);
+      for (const patch of patches) {
+        workingTree = applyTreePatch(workingTree, patch);
+        if (patch.type === 'add') {
+          yield {
+            type: 'node',
+            data: {
+              patch,
+              node: patch.node,
+            },
+          };
+        }
+      }
+
+      yield {
+        type: 'complete',
+        data: {
+          tree: finalTree,
+        },
+      };
+      return;
+    } catch (error) {
+      yield {
+        type: 'error',
+        data: {
+          message:
+            error instanceof Error
+              ? `${error.message}. 已返回本地启发式结果（节点数 ${countNodes(workingTree.root)}）。`
+              : '生成失败，已返回本地启发式结果。',
+        },
+      };
+      yield {
+        type: 'complete',
+        data: {
+          tree: workingTree,
+        },
+      };
+      return;
+    }
+  }
+
+  const modelProvider = createProviderClient(llmConfig);
 
   try {
     // Most non-OpenAI providers expose Chat Completions compatible endpoints, not Responses API.
