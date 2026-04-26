@@ -1,6 +1,6 @@
 import { nanoid } from 'nanoid';
-import { streamObject } from 'ai';
-import { openai } from '@ai-sdk/openai';
+import { generateText, streamObject } from 'ai';
+import { createOpenAI } from '@ai-sdk/openai';
 
 import {
   llmTreeSchema,
@@ -33,6 +33,119 @@ interface IndexedNode {
   node: MindMapNode;
   parentId?: string;
   index: number;
+}
+
+type OpenAICompatibleProvider = 'openai' | 'zhipu' | 'kimi' | 'minimax' | 'qwen';
+
+interface OpenAICompatibleProviderConfig {
+  keyEnv: string;
+  baseEnv: string;
+  defaultModel: string;
+  defaultBaseUrl?: string;
+}
+
+const OPENAI_COMPATIBLE_PROVIDER_MAP: Record<OpenAICompatibleProvider, OpenAICompatibleProviderConfig> = {
+  openai: {
+    keyEnv: 'OPENAI_API_KEY',
+    baseEnv: 'OPENAI_BASE_URL',
+    defaultModel: 'gpt-4o-mini',
+  },
+  zhipu: {
+    keyEnv: 'ZHIPU_API_KEY',
+    baseEnv: 'ZHIPU_BASE_URL',
+    defaultModel: 'glm-4',
+    defaultBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+  },
+  kimi: {
+    keyEnv: 'MOONSHOT_API_KEY',
+    baseEnv: 'MOONSHOT_BASE_URL',
+    defaultModel: 'moonshot-v1-8k',
+    defaultBaseUrl: 'https://api.moonshot.cn/v1',
+  },
+  minimax: {
+    keyEnv: 'MINIMAX_API_KEY',
+    baseEnv: 'MINIMAX_BASE_URL',
+    defaultModel: 'abab6.5-chat',
+    defaultBaseUrl: 'https://api.minimax.chat/v1',
+  },
+  qwen: {
+    keyEnv: 'DASHSCOPE_API_KEY',
+    baseEnv: 'DASHSCOPE_BASE_URL',
+    defaultModel: 'qwen-plus',
+    defaultBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  },
+};
+
+const PROVIDER_ALIAS_MAP: Record<string, OpenAICompatibleProvider> = {
+  moonshot: 'kimi',
+  dashscope: 'qwen',
+};
+
+interface ResolvedLLMConfig {
+  provider: string;
+  resolvedProvider?: OpenAICompatibleProvider;
+  keyEnv?: string;
+  apiKey?: string;
+  baseUrl?: string;
+  model: string;
+  supported: boolean;
+}
+
+interface LLMRequestConfig {
+  maxRetries: number;
+  timeoutMs?: number;
+}
+
+export interface MarkdownPreviewResult {
+  title: string;
+  markdown: string;
+  provider: string;
+  model: string;
+}
+
+function parseNonNegativeInt(raw: string | undefined, fallback: number): number {
+  if (raw == null || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return fallback;
+  return Math.floor(value);
+}
+
+function resolveLLMRequestConfig(provider?: OpenAICompatibleProvider): LLMRequestConfig {
+  const fallbackRetries = provider === 'openai' ? 2 : 0;
+  const maxRetries = parseNonNegativeInt(process.env.LLM_MAX_RETRIES, fallbackRetries);
+  const timeoutSeconds = parseNonNegativeInt(process.env.LLM_TIMEOUT, 60);
+
+  return {
+    maxRetries,
+    timeoutMs: timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined,
+  };
+}
+
+function resolveLLMConfig(): ResolvedLLMConfig {
+  const requestedProvider = (process.env.LLM_PROVIDER || 'openai').trim().toLowerCase();
+  const normalizedProvider = PROVIDER_ALIAS_MAP[requestedProvider] ?? requestedProvider;
+  const providerConfig = OPENAI_COMPATIBLE_PROVIDER_MAP[normalizedProvider as OpenAICompatibleProvider];
+
+  if (!providerConfig) {
+    return {
+      provider: requestedProvider,
+      model: process.env.LLM_MODEL?.trim() || 'gpt-4o-mini',
+      supported: false,
+    };
+  }
+
+  const apiKey = process.env[providerConfig.keyEnv]?.trim();
+  const baseUrl = process.env[providerConfig.baseEnv]?.trim() || providerConfig.defaultBaseUrl;
+
+  return {
+    provider: requestedProvider,
+    resolvedProvider: normalizedProvider as OpenAICompatibleProvider,
+    keyEnv: providerConfig.keyEnv,
+    apiKey,
+    baseUrl,
+    model: process.env.LLM_MODEL?.trim() || providerConfig.defaultModel,
+    supported: true,
+  };
 }
 
 function makeDefaultSourceRef(doc: NormalizedDocument): SourceReference {
@@ -291,12 +404,98 @@ function buildPrompt(doc: NormalizedDocument): string {
   ].join('\n');
 }
 
+function buildMarkdownPreviewPrompt(doc: NormalizedDocument): string {
+  return [
+    '你是资深文档分析助手。请基于输入内容，输出一份中文 Markdown 解析稿。',
+    '要求：',
+    '1. 仅基于输入内容，不要编造事实。',
+    '2. 直接输出 Markdown 文本，不要输出 JSON，不要代码块包裹。',
+    '3. 结构必须包含：',
+    '   - 一级标题（文档主题）',
+    '   - 二级标题：文档摘要',
+    '   - 至少 2 个二级标题模块，每个模块含 bullet 列表',
+    '   - 二级标题：关键结论（bullet 列表）',
+    '4. 每条 bullet 尽量 8~30 字。',
+    '5. 输出语言：简体中文。',
+    '',
+    `文档标题：${doc.sourceMeta.title || '未命名文档'}`,
+    `来源类型：${doc.sourceMeta.type}`,
+    '',
+    '输入内容：',
+    doc.markdown.slice(0, 14000),
+  ].join('\n');
+}
+
+function normalizeMarkdownPreview(rawText: string, fallbackTitle: string): { title: string; markdown: string } {
+  const cleaned = rawText.trim();
+  if (!cleaned) {
+    throw new Error('LLM 返回空内容，无法生成 Markdown 解析。');
+  }
+
+  const markdown = cleaned.startsWith('#') ? cleaned : `# ${fallbackTitle}\n\n${cleaned}`;
+  const titleMatch = markdown.match(/^#\s+(.+)$/m);
+  const title = titleMatch?.[1]?.trim() || fallbackTitle;
+  return { title, markdown: markdown.endsWith('\n') ? markdown : `${markdown}\n` };
+}
+
+export async function generateMarkdownPreview(
+  doc: NormalizedDocument,
+  options: {
+    abortSignal?: AbortSignal;
+  } = {},
+): Promise<MarkdownPreviewResult> {
+  const llmConfig = resolveLLMConfig();
+  const hasApiKey = Boolean(llmConfig.apiKey);
+
+  if (!llmConfig.supported || !hasApiKey) {
+    const keyHint = llmConfig.keyEnv || '对应 provider 的 API key';
+    throw new Error(`LLM 未配置：请检查 ${keyHint}。`);
+  }
+
+  const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
+  const markdownTimeoutSeconds = parseNonNegativeInt(process.env.LLM_MARKDOWN_TIMEOUT, 90);
+  const markdownTimeoutMs = markdownTimeoutSeconds > 0 ? markdownTimeoutSeconds * 1000 : undefined;
+  const markdownMaxRetries = parseNonNegativeInt(process.env.LLM_MARKDOWN_MAX_RETRIES, requestConfig.maxRetries);
+  const modelProvider = createOpenAI({
+    apiKey: llmConfig.apiKey,
+    baseURL: llmConfig.baseUrl,
+    name: llmConfig.resolvedProvider || 'openai',
+  });
+
+  const languageModel =
+    llmConfig.resolvedProvider === 'openai'
+      ? modelProvider(llmConfig.model)
+      : modelProvider.chat(llmConfig.model as any);
+
+  const result = await generateText({
+    model: languageModel,
+    prompt: buildMarkdownPreviewPrompt(doc),
+    maxRetries: markdownMaxRetries,
+    timeout: markdownTimeoutMs ?? requestConfig.timeoutMs,
+    abortSignal: options.abortSignal,
+    temperature: 0.2,
+    maxOutputTokens: 1800,
+  });
+
+  const normalized = normalizeMarkdownPreview(result.text, doc.sourceMeta.title || '文档解析');
+  return {
+    title: normalized.title,
+    markdown: normalized.markdown,
+    provider: llmConfig.resolvedProvider || llmConfig.provider,
+    model: llmConfig.model,
+  };
+}
+
 export async function* generateMindMapStream(
   doc: NormalizedDocument,
+  options: {
+    abortSignal?: AbortSignal;
+  } = {},
 ): AsyncGenerator<GenerateStreamEvent> {
-  const hasApiKey = Boolean(process.env.OPENAI_API_KEY);
+  const llmConfig = resolveLLMConfig();
+  const hasApiKey = Boolean(llmConfig.apiKey);
 
-  if (!hasApiKey) {
+  if (!llmConfig.supported || !hasApiKey) {
     const fallback = heuristicTreeFromDocument(doc);
     yield { type: 'skeleton', data: { tree: fallback } };
 
@@ -323,18 +522,33 @@ export async function* generateMindMapStream(
     return;
   }
 
-  const model = process.env.LLM_MODEL || 'gpt-4o-mini';
+  const model = llmConfig.model;
   const prompt = buildPrompt(doc);
+  const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
+  const modelProvider = createOpenAI({
+    apiKey: llmConfig.apiKey,
+    baseURL: llmConfig.baseUrl,
+    name: llmConfig.resolvedProvider || 'openai',
+  });
 
   let workingTree = heuristicTreeFromDocument(doc);
   let skeletonSent = false;
   let latestStableTree = workingTree;
 
   try {
+    // Most non-OpenAI providers expose Chat Completions compatible endpoints, not Responses API.
+    const languageModel =
+      llmConfig.resolvedProvider === 'openai'
+        ? modelProvider(model)
+        : modelProvider.chat(model as any);
+
     const result = streamObject({
-      model: openai(model),
+      model: languageModel,
       schema: llmTreeSchema,
       prompt,
+      maxRetries: requestConfig.maxRetries,
+      timeout: requestConfig.timeoutMs,
+      abortSignal: options.abortSignal,
     });
 
     for await (const partial of result.partialObjectStream) {

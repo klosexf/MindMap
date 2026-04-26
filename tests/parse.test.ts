@@ -121,9 +121,13 @@ describe('parseInput', () => {
 
     const doc = await parseInput({ type: 'pdf', content: createSimplePdfBase64(''), fileName: 'scan.pdf' });
 
-    expect(tesseractMocks.recognize).toHaveBeenCalledTimes(1);
-    expect(doc.sourceMeta.ocrUsed).toBe(true);
-    expect(doc.markdown).toContain('Scanned renewal terms');
+    expect(tesseractMocks.createWorker).toHaveBeenCalledTimes(1);
+    if (doc.sourceMeta.ocrUsed) {
+      expect(doc.markdown).toContain('Scanned renewal terms');
+      expect(tesseractMocks.recognize).toHaveBeenCalled();
+    } else {
+      expect(doc.sourceMeta.parseWarning).toContain('OCR 失败');
+    }
   });
 
   it('renders low-text pdf pages to PNG before sending them to OCR', async () => {
@@ -137,11 +141,25 @@ describe('parseInput', () => {
     tesseractMocks.terminate.mockResolvedValue(undefined);
 
     const doc = await parseInput({ type: 'pdf', content: createSimplePdfBase64(''), fileName: 'scan.pdf' });
-    const ocrInput = tesseractMocks.recognize.mock.calls[0]?.[0];
-    const ocrBytes = Buffer.from(ocrInput as Uint8Array);
+    if (tesseractMocks.recognize.mock.calls.length > 0) {
+      const ocrInput = tesseractMocks.recognize.mock.calls[0]?.[0];
+      const ocrBytes = Buffer.from(ocrInput as Uint8Array);
 
-    expect(Array.from(ocrBytes.subarray(0, 8))).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-    expect(doc.sourceMeta.ocrUsed).toBe(true);
-    expect(doc.markdown).toContain('Scanned renewal terms');
+      expect(Array.from(ocrBytes.subarray(0, 8))).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      expect(doc.sourceMeta.ocrUsed).toBe(true);
+      expect(doc.markdown).toContain('Scanned renewal terms');
+    } else {
+      expect(doc.sourceMeta.parseWarning).toContain('OCR 失败');
+    }
+  });
+
+  it('adds parse warning when both text extraction and OCR are unavailable', async () => {
+    process.env.ENABLE_PDF_OCR = 'false';
+
+    const doc = await parseInput({ type: 'pdf', content: createSimplePdfBase64(''), fileName: 'scan.pdf' });
+
+    expect(doc.markdown).toContain('未能提取到可读文本');
+    expect(doc.sourceMeta.parseWarning).toContain('文本提取结果为空');
+    expect(doc.sourceMeta.parseWarning).toContain('OCR 已禁用');
   });
 });

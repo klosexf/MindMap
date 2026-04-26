@@ -171,5 +171,6 @@ export interface NormalizedDocument {
     sourceUrl?: string;
     sourceFileName?: string;
     ocrUsed?: boolean;
+    parseWarning?: string;
   };
 }

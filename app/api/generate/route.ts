@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
 import { generateMindMapStream } from '@/lib/llm/generate';
+import { waitForFirstEventWithWarning } from '@/lib/llm/first-event-watchdog';
 import { saveMindMap } from '@/lib/storage/mindmap-store';
 import { mindMapTreeSchema, sourceReferenceSchema, type MindMapTree } from '@/lib/types/mindmap';
 
@@ -36,16 +37,53 @@ function sseMessage(type: string, data: unknown): string {
   return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+function getFirstEventWarningMs(): number {
+  const fallback = 20_000;
+  const raw = Number(process.env.GENERATE_FIRST_EVENT_WARNING_MS ?? fallback);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
 export async function POST(req: Request) {
   try {
     const { normalizedDocument } = generateRequestSchema.parse(await req.json());
     const encoder = new TextEncoder();
     let completedTree: MindMapTree | null = null;
+    const firstEventWarningMs = getFirstEventWarningMs();
+    const requestStartedAt = Date.now();
+    const generationAbortController = new AbortController();
 
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          for await (const event of generateMindMapStream(normalizedDocument)) {
+          const iterator = generateMindMapStream(normalizedDocument, {
+            abortSignal: generationAbortController.signal,
+          })[Symbol.asyncIterator]();
+          let firstDataEventSent = false;
+
+          while (true) {
+            const nextPromise = iterator.next();
+            const iteration = firstDataEventSent
+              ? await nextPromise
+              : await waitForFirstEventWithWarning(nextPromise, firstEventWarningMs, async () => {
+                  controller.enqueue(
+                    encoder.encode(
+                      sseMessage('warning', {
+                        code: 'first_event_timeout',
+                        waitedMs: Date.now() - requestStartedAt,
+                        thresholdMs: firstEventWarningMs,
+                        message: `首个生成事件等待超过 ${Math.round(firstEventWarningMs / 1000)} 秒，已触发快速降级。`,
+                      }),
+                    ),
+                  );
+                  generationAbortController.abort('first_event_timeout');
+                });
+
+            if (iteration.done) {
+              break;
+            }
+
+            firstDataEventSent = true;
+            const event = iteration.value;
             if (event.type === 'complete') {
               completedTree = mindMapTreeSchema.parse(event.data.tree);
             }

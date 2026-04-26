@@ -1,15 +1,31 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 import { useRouter } from 'next/navigation';
 
 import type { MindMapTree, NormalizedDocument } from '@/lib/types/mindmap';
+import { buildTimingLines, type GenerationTimingMarks } from '@/lib/utils/generation-timing';
 
 type InputMode = 'text' | 'url' | 'pdf';
+const MODE_TABS: Array<{ mode: InputMode; label: string }> = [
+  { mode: 'text', label: '文本' },
+  { mode: 'url', label: 'URL' },
+  { mode: 'pdf', label: 'PDF' },
+];
 
 interface StreamEvent {
   type: string;
   data: any;
+}
+
+interface MarkdownDebugPayload {
+  title: string;
+  markdown: string;
+  proof?: {
+    source?: string;
+    provider?: string;
+    model?: string;
+  };
 }
 
 function readFileAsBase64(file: File): Promise<string> {
@@ -75,8 +91,33 @@ export function GenerateForm() {
   const [urlInput, setUrlInput] = useState('');
   const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [status, setStatus] = useState('等待输入...');
+  const [warning, setWarning] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [debugMarkdownOnly, setDebugMarkdownOnly] = useState(false);
+  const [markdownDebugResult, setMarkdownDebugResult] = useState<MarkdownDebugPayload | null>(null);
   const [loading, setLoading] = useState(false);
+  const [timingMarks, setTimingMarks] = useState<GenerationTimingMarks>({});
+  const [timingNow, setTimingNow] = useState(Date.now());
+
+  function switchMode(nextMode: InputMode) {
+    if (nextMode === mode) return;
+    setMode(nextMode);
+    setWarning(null);
+    setError(null);
+    if (!loading) {
+      setStatus('等待输入...');
+    }
+  }
+
+  function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') {
+      return;
+    }
+    event.preventDefault();
+    const delta = event.key === 'ArrowRight' ? 1 : -1;
+    const nextIndex = (index + delta + MODE_TABS.length) % MODE_TABS.length;
+    switchMode(MODE_TABS[nextIndex].mode);
+  }
 
   const canSubmit = useMemo(() => {
     if (loading) return false;
@@ -85,8 +126,25 @@ export function GenerateForm() {
     return Boolean(pdfFile);
   }, [loading, mode, pdfFile, textInput, urlInput]);
 
+  const timingLines = useMemo(() => {
+    if (!timingMarks.startedAt) return [];
+    const now = loading ? timingNow : timingMarks.completedAt ?? timingNow;
+    return buildTimingLines(timingMarks, now);
+  }, [loading, timingMarks, timingNow]);
+
+  useEffect(() => {
+    if (!loading) return;
+    const timer = window.setInterval(() => setTimingNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [loading]);
+
   async function submitGenerate() {
+    const startedAt = Date.now();
+    setTimingNow(startedAt);
+    setTimingMarks({ startedAt, parseStartedAt: startedAt });
+    setWarning(null);
     setError(null);
+    setMarkdownDebugResult(null);
     setLoading(true);
     setStatus('正在解析输入内容...');
 
@@ -102,7 +160,9 @@ export function GenerateForm() {
         if (pdfFile.size > 20 * 1024 * 1024) {
           throw new Error('文件过大，最大 20MB');
         }
+        setStatus('正在读取 PDF 文件...');
         const base64 = await readFileAsBase64(pdfFile);
+        setStatus('正在解析输入内容...');
         parsePayload = {
           type: 'pdf',
           content: base64,
@@ -122,6 +182,35 @@ export function GenerateForm() {
       }
 
       const parseJson = (await parseRes.json()) as { normalizedDocument: NormalizedDocument };
+      if (parseJson.normalizedDocument.sourceMeta.parseWarning) {
+        setWarning(parseJson.normalizedDocument.sourceMeta.parseWarning);
+      }
+      const streamStartedAt = Date.now();
+      setTimingMarks((prev) => ({
+        ...prev,
+        parseFinishedAt: streamStartedAt,
+        streamStartedAt,
+      }));
+      setTimingNow(streamStartedAt);
+
+      if (debugMarkdownOnly) {
+        setStatus('正在请求 AI 生成 Markdown 解析...');
+        const markdownRes = await fetch('/api/generate/markdown', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ normalizedDocument: parseJson.normalizedDocument }),
+        });
+
+        const markdownJson = (await markdownRes.json().catch(() => ({}))) as MarkdownDebugPayload & { error?: string };
+        if (!markdownRes.ok) {
+          throw new Error(markdownJson.error || 'Markdown 解析生成失败');
+        }
+
+        setMarkdownDebugResult(markdownJson);
+        setTimingMarks((prev) => ({ ...prev, completedAt: Date.now() }));
+        setStatus('Markdown 解析完成（测试模式）');
+        return;
+      }
 
       setStatus('开始流式生成导图骨架...');
 
@@ -137,9 +226,24 @@ export function GenerateForm() {
       }
 
       let finalTree: MindMapTree | null = null;
+      let firstEventSeen = false;
 
       for await (const event of consumeSSEStream(generateRes)) {
+        const now = Date.now();
+        setTimingNow(now);
+
+        if (!firstEventSeen) {
+          firstEventSeen = true;
+          setTimingMarks((prev) => ({ ...prev, firstEventAt: prev.firstEventAt ?? now }));
+        }
+
+        if (event.type === 'warning') {
+          setWarning(event.data?.message || '生成首包等待较久，系统仍在处理中，请稍候。');
+        }
+
         if (event.type === 'skeleton') {
+          setTimingMarks((prev) => ({ ...prev, skeletonAt: prev.skeletonAt ?? now }));
+          setWarning(null);
           setStatus('骨架已生成，正在补全节点...');
         }
 
@@ -153,6 +257,7 @@ export function GenerateForm() {
 
         if (event.type === 'complete') {
           finalTree = event.data?.tree as MindMapTree;
+          setTimingMarks((prev) => ({ ...prev, completedAt: now }));
           setStatus('生成完成，正在跳转编辑器...');
         }
       }
@@ -171,8 +276,10 @@ export function GenerateForm() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '生成失败');
       setStatus('生成失败');
+      setTimingMarks((prev) => ({ ...prev, completedAt: prev.completedAt ?? Date.now() }));
     } finally {
       setLoading(false);
+      setTimingNow(Date.now());
     }
   }
 
@@ -180,18 +287,24 @@ export function GenerateForm() {
     <section className="generate-card">
       <h2 className="panel-title">输入内容并生成导图</h2>
       <div className="input-tabs" role="tablist" aria-label="输入类型">
-        <button type="button" className={mode === 'text' ? 'active' : ''} onClick={() => setMode('text')}>
-          文本
-        </button>
-        <button type="button" className={mode === 'url' ? 'active' : ''} onClick={() => setMode('url')}>
-          URL
-        </button>
-        <button type="button" className={mode === 'pdf' ? 'active' : ''} onClick={() => setMode('pdf')}>
-          PDF
-        </button>
+        {MODE_TABS.map((tab, index) => (
+          <button
+            key={tab.mode}
+            id={`tab-${tab.mode}`}
+            role="tab"
+            aria-selected={mode === tab.mode}
+            aria-controls={`panel-${tab.mode}`}
+            type="button"
+            className={mode === tab.mode ? 'active' : ''}
+            onClick={() => switchMode(tab.mode)}
+            onKeyDown={(event) => handleTabKeyDown(event, index)}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
-      <div className="input-shell">
+      <div className="input-shell" id={`panel-${mode}`} role="tabpanel" aria-labelledby={`tab-${mode}`}>
         {mode === 'text' && (
           <textarea
             className="text-input"
@@ -223,9 +336,19 @@ export function GenerateForm() {
         )}
 
         <div className="input-actions">
-          <span className="input-hint">
-            {mode === 'pdf' ? '支持扫描件，必要时自动 OCR' : '建议输入关键段落，生成更稳定'}
-          </span>
+          <div className="input-action-left">
+            <span className="input-hint">
+              {mode === 'pdf' ? '支持扫描件，必要时自动 OCR' : '建议输入关键段落，生成更稳定'}
+            </span>
+            <label className="debug-toggle">
+              <input
+                type="checkbox"
+                checked={debugMarkdownOnly}
+                onChange={(event) => setDebugMarkdownOnly(event.target.checked)}
+              />
+              <span>测试模式：仅生成 Markdown 解析（不跳转导图）</span>
+            </label>
+          </div>
           <button type="button" className="primary-button" onClick={submitGenerate} disabled={!canSubmit}>
             {loading ? '生成中...' : '开始生成'}
           </button>
@@ -233,6 +356,25 @@ export function GenerateForm() {
       </div>
 
       <p className="status-line">{status}</p>
+      {timingLines.length > 0 && (
+        <ul className="timing-lines">
+          {timingLines.map((line) => (
+            <li key={line} className="timing-line-item">
+              {line}
+            </li>
+          ))}
+        </ul>
+      )}
+      {markdownDebugResult && (
+        <div className="markdown-debug-box">
+          <p className="markdown-debug-meta">
+            结果来源：{markdownDebugResult.proof?.source || 'unknown'} /{' '}
+            {markdownDebugResult.proof?.provider || 'unknown'} / {markdownDebugResult.proof?.model || 'unknown'}
+          </p>
+          <pre className="markdown-debug-content">{markdownDebugResult.markdown}</pre>
+        </div>
+      )}
+      {warning && <p className="warning-line">{warning}</p>}
       {error && <p className="error-line">{error}</p>}
     </section>
   );

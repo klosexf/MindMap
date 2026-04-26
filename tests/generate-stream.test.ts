@@ -21,7 +21,9 @@ describe('generateMindMapStream', () => {
       },
     };
 
+    const originalProvider = process.env.LLM_PROVIDER;
     const original = process.env.OPENAI_API_KEY;
+    process.env.LLM_PROVIDER = 'openai';
     process.env.OPENAI_API_KEY = '';
 
     const events = [] as string[];
@@ -30,7 +32,16 @@ describe('generateMindMapStream', () => {
       events.push(event.type);
     }
 
-    process.env.OPENAI_API_KEY = original;
+    if (typeof originalProvider === 'string') {
+      process.env.LLM_PROVIDER = originalProvider;
+    } else {
+      delete process.env.LLM_PROVIDER;
+    }
+    if (typeof original === 'string') {
+      process.env.OPENAI_API_KEY = original;
+    } else {
+      delete process.env.OPENAI_API_KEY;
+    }
 
     expect(events[0]).toBe('skeleton');
     expect(events.includes('complete')).toBe(true);
@@ -70,7 +81,9 @@ describe('generateMindMapStream', () => {
       },
     };
 
+    const originalProvider = process.env.LLM_PROVIDER;
     const original = process.env.OPENAI_API_KEY;
+    process.env.LLM_PROVIDER = 'openai';
     process.env.OPENAI_API_KEY = '';
 
     let completeTree: MindMapTree | null = null;
@@ -80,7 +93,16 @@ describe('generateMindMapStream', () => {
       }
     }
 
-    process.env.OPENAI_API_KEY = original;
+    if (typeof originalProvider === 'string') {
+      process.env.LLM_PROVIDER = originalProvider;
+    } else {
+      delete process.env.LLM_PROVIDER;
+    }
+    if (typeof original === 'string') {
+      process.env.OPENAI_API_KEY = original;
+    } else {
+      delete process.env.OPENAI_API_KEY;
+    }
 
     const branchTitles = completeTree?.root.children?.map((child) => child.content);
     expect(branchTitles).toEqual(['Page 1', 'Page 2']);
