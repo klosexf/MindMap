@@ -28,6 +28,19 @@ interface MarkdownDebugPayload {
   };
 }
 
+interface MindMapJsonDebugPayload {
+  json: unknown;
+  parsedJson?: string;
+  rawText?: string;
+  proof?: {
+    source?: string;
+    provider?: string;
+    model?: string;
+  };
+}
+
+type DebugMode = 'none' | 'markdown' | 'mindmapJson';
+
 function readFileAsBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -93,8 +106,9 @@ export function GenerateForm() {
   const [status, setStatus] = useState('等待输入...');
   const [warning, setWarning] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [debugMarkdownOnly, setDebugMarkdownOnly] = useState(false);
+  const [debugMode, setDebugMode] = useState<DebugMode>('none');
   const [markdownDebugResult, setMarkdownDebugResult] = useState<MarkdownDebugPayload | null>(null);
+  const [mindMapJsonDebugResult, setMindMapJsonDebugResult] = useState<MindMapJsonDebugPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [timingMarks, setTimingMarks] = useState<GenerationTimingMarks>({});
   const [timingNow, setTimingNow] = useState(Date.now());
@@ -145,6 +159,7 @@ export function GenerateForm() {
     setWarning(null);
     setError(null);
     setMarkdownDebugResult(null);
+    setMindMapJsonDebugResult(null);
     setLoading(true);
     setStatus('正在解析输入内容...');
 
@@ -193,7 +208,7 @@ export function GenerateForm() {
       }));
       setTimingNow(streamStartedAt);
 
-      if (debugMarkdownOnly) {
+      if (debugMode === 'markdown') {
         setStatus('正在请求 AI 生成 Markdown 解析...');
         const markdownRes = await fetch('/api/generate/markdown', {
           method: 'POST',
@@ -209,6 +224,25 @@ export function GenerateForm() {
         setMarkdownDebugResult(markdownJson);
         setTimingMarks((prev) => ({ ...prev, completedAt: Date.now() }));
         setStatus('Markdown 解析完成（测试模式）');
+        return;
+      }
+
+      if (debugMode === 'mindmapJson') {
+        setStatus('正在请求 AI 生成导图 JSON...');
+        const jsonRes = await fetch('/api/generate/mindmap-json', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ normalizedDocument: parseJson.normalizedDocument }),
+        });
+
+        const jsonPayload = (await jsonRes.json().catch(() => ({}))) as MindMapJsonDebugPayload & { error?: string };
+        if (!jsonRes.ok) {
+          throw new Error(jsonPayload.error || '导图 JSON 生成失败');
+        }
+
+        setMindMapJsonDebugResult(jsonPayload);
+        setTimingMarks((prev) => ({ ...prev, completedAt: Date.now() }));
+        setStatus('导图 JSON 生成完成（测试模式）');
         return;
       }
 
@@ -343,10 +377,18 @@ export function GenerateForm() {
             <label className="debug-toggle">
               <input
                 type="checkbox"
-                checked={debugMarkdownOnly}
-                onChange={(event) => setDebugMarkdownOnly(event.target.checked)}
+                checked={debugMode === 'markdown'}
+                onChange={() => setDebugMode((prev) => (prev === 'markdown' ? 'none' : 'markdown'))}
               />
               <span>测试模式：仅生成 Markdown 解析（不跳转导图）</span>
+            </label>
+            <label className="debug-toggle">
+              <input
+                type="checkbox"
+                checked={debugMode === 'mindmapJson'}
+                onChange={() => setDebugMode((prev) => (prev === 'mindmapJson' ? 'none' : 'mindmapJson'))}
+              />
+              <span>测试模式：仅生成思维导图 JSON（不跳转导图）</span>
             </label>
           </div>
           <button type="button" className="primary-button" onClick={submitGenerate} disabled={!canSubmit}>
@@ -372,6 +414,17 @@ export function GenerateForm() {
             {markdownDebugResult.proof?.provider || 'unknown'} / {markdownDebugResult.proof?.model || 'unknown'}
           </p>
           <pre className="markdown-debug-content">{markdownDebugResult.markdown}</pre>
+        </div>
+      )}
+      {mindMapJsonDebugResult && (
+        <div className="markdown-debug-box">
+          <p className="markdown-debug-meta">
+            结果来源：{mindMapJsonDebugResult.proof?.source || 'unknown'} /{' '}
+            {mindMapJsonDebugResult.proof?.provider || 'unknown'} / {mindMapJsonDebugResult.proof?.model || 'unknown'}
+          </p>
+          <pre className="markdown-debug-content">
+            {JSON.stringify(mindMapJsonDebugResult.json ?? {}, null, 2)}
+          </pre>
         </div>
       )}
       {warning && <p className="warning-line">{warning}</p>}

@@ -107,6 +107,14 @@ export interface MarkdownPreviewResult {
   model: string;
 }
 
+export interface MindMapJsonPreviewResult {
+  tree: LLMMindMapTree;
+  parsedJson: string;
+  rawText: string;
+  provider: string;
+  model: string;
+}
+
 const CA_CERT_FALLBACK_PATHS = ['/etc/ssl/cert.pem', '/etc/ssl/certs/ca-certificates.crt'];
 let cachedZhipuFetch: FetchFunction | null | undefined;
 
@@ -623,40 +631,6 @@ function buildDiffPatches(prevTree: MindMapTree, nextTree: MindMapTree): TreePat
   return patches;
 }
 
-const DOCUMENT_TYPE_PATTERNS: Record<string, { patterns: RegExp[]; categories: string[] }> = {
-  resume: {
-    patterns: [
-      /简历|个人简历|求职|工作经历|教育背景|项目经验|专业技能|自我评价/i,
-      /工作年限|期望薪资|联系电话|电子邮箱|学历|毕业院校/i,
-      /RESUME|CV|WORK EXPERIENCE|EDUCATION|SKILLS/i,
-    ],
-    categories: ['基本信息', '工作经历', '项目经验', '专业技能', '教育背景'],
-  },
-  report: {
-    patterns: [/报告|总结|分析|概述|结论|建议|数据|指标/i, /REPORT|SUMMARY|ANALYSIS|CONCLUSION/i],
-    categories: ['概述', '主要内容', '数据分析', '结论建议'],
-  },
-  article: {
-    patterns: [/摘要|关键词|引言|正文|参考文献|ABSTRACT|KEYWORDS/i],
-    categories: ['摘要', '主要内容', '关键观点', '结论'],
-  },
-  tutorial: {
-    patterns: [/教程|指南|步骤|方法|如何|教程|GUIDE|TUTORIAL|HOW TO/i],
-    categories: ['概述', '核心步骤', '注意事项', '总结'],
-  },
-};
-
-function detectDocumentType(markdown: string): { type: string; categories: string[] } {
-  const text = markdown.slice(0, 2000);
-  for (const [type, config] of Object.entries(DOCUMENT_TYPE_PATTERNS)) {
-    const matchCount = config.patterns.filter((p) => p.test(text)).length;
-    if (matchCount >= 2) {
-      return { type, categories: config.categories };
-    }
-  }
-  return { type: 'general', categories: ['主要内容', '关键细节', '补充信息'] };
-}
-
 function extractKeywords(text: string, limit: number): string[] {
   const cjkWords = text.match(/[\u3400-\u9fff]{2,8}/g) || [];
   const freq: Record<string, number> = {};
@@ -705,22 +679,19 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
   }
 
   const sentences = extractSentences(doc.markdown, 12);
-  const { type: docType, categories } = detectDocumentType(doc.markdown);
 
   const root = createHeuristicNode(title, sourceRef, 'main', 0.7);
 
-  const itemsPerCategory = Math.ceil(sentences.length / categories.length);
-  const grouped = categories.map((cat, index) => ({
-    title: cat,
-    items: sentences.slice(index * itemsPerCategory, (index + 1) * itemsPerCategory),
-  }));
+  const groupCount = Math.min(4, Math.max(3, Math.ceil(sentences.length / 3)));
+  const itemsPerGroup = Math.ceil(sentences.length / groupCount);
 
-  for (const group of grouped) {
-    if (group.items.length === 0) continue;
-    
-    const branch = createHeuristicNode(group.title, sourceRef, 'detail', 0.65);
+  for (let i = 0; i < groupCount; i++) {
+    const groupItems = sentences.slice(i * itemsPerGroup, (i + 1) * itemsPerGroup);
+    if (groupItems.length === 0) continue;
 
-    group.items.forEach((item) => {
+    const branch = createHeuristicNode(`主题 ${i + 1}`, sourceRef, 'detail', 0.65);
+
+    groupItems.forEach((item) => {
       branch.children?.push(
         createHeuristicNode(item.slice(0, 80), sourceRef, 'detail', 0.62),
       );
@@ -750,15 +721,6 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
 }
 
 function buildPrompt(doc: NormalizedDocument): string {
-  const { type: docType } = detectDocumentType(doc.markdown);
-  const docTypeHint: Record<string, string> = {
-    resume: '这是一份简历/履历文档，请按"基本信息、工作经历、项目经验、专业技能、教育背景"等模块组织内容。',
-    report: '这是一份报告/分析文档，请按"概述、主要内容、数据分析、结论建议"等模块组织内容。',
-    article: '这是一篇文章/论文，请按"摘要、主要内容、关键观点、结论"等模块组织内容。',
-    tutorial: '这是一份教程/指南，请按"概述、核心步骤、注意事项、总结"等模块组织内容。',
-    general: '请根据内容的实际结构组织思维导图。',
-  };
-
   return [
     '你是资深知识整理专家，请对文档内容进行优化总结，生成思维导图。',
     '',
@@ -767,9 +729,6 @@ function buildPrompt(doc: NormalizedDocument): string {
     '- **节点精炼**：避免节点过多和冗余，每个节点都应有独立价值',
     '- **逻辑清晰**：确保父子节点关系明确，层级递进合理',
     '- **信息完整**：在精简结构的同时，保留所有关键信息',
-    '',
-    '## 文档类型',
-    docTypeHint[docType] || docTypeHint.general,
     '',
     '## 约束条件',
     `- 最大层级：${MAX_TREE_DEPTH}`,
@@ -800,15 +759,6 @@ function buildPrompt(doc: NormalizedDocument): string {
 }
 
 function buildCompatJsonPrompt(doc: NormalizedDocument): string {
-  const { type: docType } = detectDocumentType(doc.markdown);
-  const docTypeHint: Record<string, string> = {
-    resume: '简历文档，按"基本信息、工作经历、项目经验、专业技能、教育背景"组织',
-    report: '报告文档，按"概述、主要内容、数据分析、结论建议"组织',
-    article: '文章文档，按"摘要、主要内容、关键观点、结论"组织',
-    tutorial: '教程文档，按"概述、核心步骤、注意事项、总结"组织',
-    general: '根据内容实际结构组织',
-  };
-
   return [
     '你是资深知识整理专家，请对文档内容进行优化总结，生成思维导图 JSON。',
     '',
@@ -817,17 +767,23 @@ function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '- 节点精炼：避免冗余，合并相似内容',
     '- 逻辑清晰：确保层级关系明确',
     '',
-    `文档类型：${docTypeHint[docType] || docTypeHint.general}`,
-    '',
     '## 输出规则',
     '1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释',
     '2. JSON 结构：{"title":"...","root":{"content":"...","children":[...]}}',
-    '3. 每个节点只有 content（字符串）和 children（数组，可省略）',
+    '3. 每个节点只有 content（字符串）和 children（数组）',
     '4. 第一层主题 3~6 个，基于核心内容重新组织，不必完全遵循原文结构',
     '5. 专业名词、人名、数据必须原样保留',
     '6. 合并相似内容，去除冗余信息',
-    '7. 第二层节点必须包含具体内容总结，呈现核心信息和关键细节',
-    '8. 优先考虑可读性和实用性，而非完全复现原文结构',
+    '7. 【重要】每个一级节点（root.children 中的节点）必须有 children 数组，包含 2~5 个具体内容节点',
+    '8. 【重要】一级节点不能只有 content，必须展开为具体的子节点',
+    '9. 优先考虑可读性和实用性，而非完全复现原文结构',
+    '',
+    '## 示例结构',
+    '正确示例：',
+    '{"title":"简历","root":{"content":"候选人概况","children":[{"content":"基本信息","children":[{"content":"姓名：张三"},{"content":"电话：138xxxx"}]}]}}',
+    '',
+    '错误示例（一级节点没有 children）：',
+    '{"title":"简历","root":{"content":"候选人概况","children":[{"content":"基本信息"}]}}  // ❌ 缺少 children',
     '',
     `文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
@@ -880,19 +836,23 @@ function extractJsonCandidates(text: string): string[] {
   return [...candidates].filter(Boolean);
 }
 
-function parseLLMTreeFromText(text: string): LLMMindMapTree | null {
+function parseLLMTreeFromTextWithMeta(text: string): { tree: LLMMindMapTree; parsedJson: string } | null {
   for (const candidate of extractJsonCandidates(text)) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
       const validated = llmTreeSchema.safeParse(parsed);
       if (validated.success) {
-        return validated.data;
+        return { tree: validated.data, parsedJson: candidate };
       }
     } catch {
       continue;
     }
   }
   return null;
+}
+
+function parseLLMTreeFromText(text: string): LLMMindMapTree | null {
+  return parseLLMTreeFromTextWithMeta(text)?.tree ?? null;
 }
 
 async function generateTreeWithCompatProvider(
@@ -910,7 +870,7 @@ async function generateTreeWithCompatProvider(
     timeout: requestConfig.timeoutMs,
     abortSignal: options.abortSignal,
     temperature: 0.2,
-    maxOutputTokens: 2200,
+    maxOutputTokens: 4000,
   });
 
   const parsedTree = parseLLMTreeFromText(result.text);
@@ -1000,6 +960,55 @@ export async function generateMarkdownPreview(
   return {
     title: normalized.title,
     markdown: normalized.markdown,
+    provider: llmConfig.resolvedProvider || llmConfig.provider,
+    model: llmConfig.model,
+  };
+}
+
+export async function generateMindMapJsonPreview(
+  doc: NormalizedDocument,
+  options: {
+    abortSignal?: AbortSignal;
+  } = {},
+): Promise<MindMapJsonPreviewResult> {
+  const llmConfig = resolveLLMConfig();
+  const hasApiKey = Boolean(llmConfig.apiKey);
+
+  if (!llmConfig.supported || !hasApiKey) {
+    const keyHint = llmConfig.keyEnv || '对应 provider 的 API key';
+    throw new Error(`LLM 未配置：请检查 ${keyHint}。`);
+  }
+
+  const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
+  const jsonTimeoutSeconds = parseNonNegativeInt(process.env.LLM_JSON_TIMEOUT, 90);
+  const jsonTimeoutMs = jsonTimeoutSeconds > 0 ? jsonTimeoutSeconds * 1000 : undefined;
+  const jsonMaxRetries = parseNonNegativeInt(process.env.LLM_JSON_MAX_RETRIES, requestConfig.maxRetries);
+  const modelProvider = createProviderClient(llmConfig);
+
+  const languageModel =
+    llmConfig.resolvedProvider === 'openai'
+      ? modelProvider(llmConfig.model)
+      : modelProvider.chat(llmConfig.model as any);
+
+  const result = await generateText({
+    model: languageModel,
+    prompt: buildCompatJsonPrompt(doc),
+    maxRetries: jsonMaxRetries,
+    timeout: jsonTimeoutMs ?? requestConfig.timeoutMs,
+    abortSignal: options.abortSignal,
+    temperature: 0.2,
+    maxOutputTokens: 2200,
+  });
+
+  const parsed = parseLLMTreeFromTextWithMeta(result.text);
+  if (!parsed) {
+    throw new Error('LLM 返回内容不是有效思维导图 JSON');
+  }
+
+  return {
+    tree: parsed.tree,
+    parsedJson: parsed.parsedJson,
+    rawText: result.text,
     provider: llmConfig.resolvedProvider || llmConfig.provider,
     model: llmConfig.model,
   };
