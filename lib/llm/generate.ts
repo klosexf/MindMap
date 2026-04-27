@@ -283,6 +283,32 @@ function isLikelyNoiseToken(token: string, hasCjkContext: boolean): boolean {
 
   if (!hasCjkContext) return false;
 
+  if (/^[A-Za-z]{2,}$/.test(token)) {
+    const upperChars = (token.match(/[A-Z]/g) || []).length;
+    const lowerChars = (token.match(/[a-z]/g) || []).length;
+    const upperRatio = upperChars / token.length;
+    if (upperRatio >= 0.6 && !ASCII_TOKEN_ALLOWLIST.has(upper)) {
+      return true;
+    }
+    const vowelCount = (token.match(/[aeiou]/gi) || []).length;
+    const vowelRatio = vowelCount / token.length;
+    if (vowelRatio < 0.15 && token.length >= 5) {
+      return true;
+    }
+    const consonantClusters = token.match(/[bcdfghjklmnpqrstvwxyz]{4,}/gi) || [];
+    if (consonantClusters.length > 0) {
+      return true;
+    }
+  }
+
+  if (/[A-Za-z]/.test(token) && /\d/.test(token) && token.length >= 5) {
+    const letterCount = (token.match(/[A-Za-z]/g) || []).length;
+    const digitCount = (token.match(/\d/g) || []).length;
+    if (letterCount >= 3 && digitCount >= 2 && !/^[A-Za-z]+\d+$/.test(token) && !/^\d+[A-Za-z]+$/.test(token)) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -294,6 +320,38 @@ function shouldKeepAsciiTokenInCjkContext(token: string): boolean {
   const hasLowercase = /[a-z]/.test(token);
   const hasVowel = /[aeiou]/i.test(token);
   return hasLowercase && hasVowel;
+}
+
+function isGarbledText(text: string): boolean {
+  if (!text || text.length < 5) return false;
+  
+  const tokens = text.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  
+  let garbledCount = 0;
+  for (const token of tokens) {
+    if (/^[A-Za-z]+$/.test(token)) {
+      const vowelCount = (token.match(/[aeiou]/gi) || []).length;
+      const vowelRatio = vowelCount / token.length;
+      if (vowelRatio < 0.1 && token.length >= 4) {
+        garbledCount++;
+        continue;
+      }
+      const consonantClusters = token.match(/[bcdfghjklmnpqrstvwxyz]{5,}/gi) || [];
+      if (consonantClusters.length > 0) {
+        garbledCount++;
+        continue;
+      }
+    }
+    if (/[A-Z]{3,}/.test(token) && /[a-z]/.test(token)) {
+      const upperRatio = (token.match(/[A-Z]/g) || []).length / token.length;
+      if (upperRatio > 0.5) {
+        garbledCount++;
+      }
+    }
+  }
+  
+  return garbledCount / tokens.length >= 0.4;
 }
 
 function sanitizeSentence(sentence: string): string {
@@ -321,9 +379,15 @@ function sanitizeSentence(sentence: string): string {
 
 function isReadableSentence(sentence: string): boolean {
   if (!sentence) return false;
+  
+  if (isGarbledText(sentence)) return false;
 
   const cjkChars = sentence.match(/[\u3400-\u9fff]/g)?.length ?? 0;
-  if (cjkChars >= 2) return true;
+  const totalChars = sentence.replace(/\s/g, '').length;
+  if (cjkChars >= 2) {
+    const cjkRatio = cjkChars / totalChars;
+    if (cjkRatio >= 0.3) return true;
+  }
 
   const tokens = sentence
     .split(/\s+/)
@@ -368,6 +432,70 @@ function extractSentences(text: string, limit: number): string[] {
   return fallback && isReadableSentence(fallback) ? [fallback.slice(0, 160)] : [];
 }
 
+function extractSmartTitle(markdown: string, fileName?: string): string {
+  const lines = markdown.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  
+  for (const line of lines.slice(0, 10)) {
+    if (/^#\s+/.test(line)) {
+      const title = line.replace(/^#\s+/, '').trim();
+      if (title.length >= 2 && title.length <= 80 && !isGarbledText(title)) {
+        return title;
+      }
+    }
+  }
+  
+  for (const line of lines.slice(0, 15)) {
+    if (/^#{2,6}\s+/.test(line)) {
+      const title = line.replace(/^#{2,6}\s+/, '').trim();
+      if (title.length >= 2 && title.length <= 80 && !isGarbledText(title)) {
+        return title;
+      }
+    }
+  }
+  
+  const resumePatterns = [
+    /【([^】]+)】/,
+    /([^\n]{2,30})[｜|]\s*[\u4e00-\u9fa5]{2,8}/,
+    /^([^\n]{2,20})\s*[\u4e00-\u9fa5]*简历/,
+    /姓名[：:]\s*([^\n]{2,10})/,
+  ];
+  
+  for (const pattern of resumePatterns) {
+    const match = markdown.match(pattern);
+    if (match && match[1]) {
+      const title = match[1].trim();
+      if (title.length >= 2 && title.length <= 40 && !isGarbledText(title)) {
+        return title;
+      }
+    }
+  }
+  
+  for (const line of lines.slice(0, 5)) {
+    const cleaned = line.replace(/[【】\[\]（）()]/g, ' ').trim();
+    if (cleaned.length >= 4 && cleaned.length <= 50) {
+      const cjkCount = (cleaned.match(/[\u4e00-\u9fa5]/g) || []).length;
+      const letterCount = (cleaned.match(/[A-Za-z]/g) || []).length;
+      const totalChars = cleaned.replace(/\s/g, '').length;
+      
+      if (cjkCount / totalChars >= 0.5 && !isGarbledText(cleaned)) {
+        return cleaned.slice(0, 50);
+      }
+      if (letterCount / totalChars >= 0.7 && !isGarbledText(cleaned)) {
+        return cleaned.slice(0, 50);
+      }
+    }
+  }
+  
+  if (fileName) {
+    const cleanName = fileName.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ');
+    if (cleanName.length >= 2 && cleanName.length <= 50) {
+      return cleanName;
+    }
+  }
+  
+  return '思维导图';
+}
+
 function titleFromChunk(text: string, index: number): string {
   const heading = text
     .split(/\n+/)
@@ -375,10 +503,20 @@ function titleFromChunk(text: string, index: number): string {
     .find((line) => /^#{2,6}\s+/.test(line));
 
   if (heading) {
-    return heading.replace(/^#{2,6}\s+/, '').trim().slice(0, 80) || `分块 ${index + 1}`;
+    const title = heading.replace(/^#{2,6}\s+/, '').trim();
+    if (title.length >= 2 && !isGarbledText(title)) {
+      return title.slice(0, 80);
+    }
   }
 
-  return extractSentences(text, 1)[0]?.slice(0, 80) || `分块 ${index + 1}`;
+  const sentences = extractSentences(text, 3);
+  for (const sentence of sentences) {
+    if (sentence.length >= 4 && sentence.length <= 80 && !isGarbledText(sentence)) {
+      return sentence.slice(0, 80);
+    }
+  }
+
+  return `分块 ${index + 1}`;
 }
 
 function createNodeFromLLM(raw: { content: string; children?: { content: string; children?: any[] }[] }, sourceRef: SourceReference): MindMapNode {
@@ -485,9 +623,56 @@ function buildDiffPatches(prevTree: MindMapTree, nextTree: MindMapTree): TreePat
   return patches;
 }
 
+const DOCUMENT_TYPE_PATTERNS: Record<string, { patterns: RegExp[]; categories: string[] }> = {
+  resume: {
+    patterns: [
+      /简历|个人简历|求职|工作经历|教育背景|项目经验|专业技能|自我评价/i,
+      /工作年限|期望薪资|联系电话|电子邮箱|学历|毕业院校/i,
+      /RESUME|CV|WORK EXPERIENCE|EDUCATION|SKILLS/i,
+    ],
+    categories: ['基本信息', '工作经历', '项目经验', '专业技能', '教育背景'],
+  },
+  report: {
+    patterns: [/报告|总结|分析|概述|结论|建议|数据|指标/i, /REPORT|SUMMARY|ANALYSIS|CONCLUSION/i],
+    categories: ['概述', '主要内容', '数据分析', '结论建议'],
+  },
+  article: {
+    patterns: [/摘要|关键词|引言|正文|参考文献|ABSTRACT|KEYWORDS/i],
+    categories: ['摘要', '主要内容', '关键观点', '结论'],
+  },
+  tutorial: {
+    patterns: [/教程|指南|步骤|方法|如何|教程|GUIDE|TUTORIAL|HOW TO/i],
+    categories: ['概述', '核心步骤', '注意事项', '总结'],
+  },
+};
+
+function detectDocumentType(markdown: string): { type: string; categories: string[] } {
+  const text = markdown.slice(0, 2000);
+  for (const [type, config] of Object.entries(DOCUMENT_TYPE_PATTERNS)) {
+    const matchCount = config.patterns.filter((p) => p.test(text)).length;
+    if (matchCount >= 2) {
+      return { type, categories: config.categories };
+    }
+  }
+  return { type: 'general', categories: ['主要内容', '关键细节', '补充信息'] };
+}
+
+function extractKeywords(text: string, limit: number): string[] {
+  const cjkWords = text.match(/[\u3400-\u9fff]{2,8}/g) || [];
+  const freq: Record<string, number> = {};
+  for (const word of cjkWords) {
+    freq[word] = (freq[word] || 0) + 1;
+  }
+  const stopWords = new Set(['的', '是', '在', '和', '了', '有', '不', '这', '我', '他', '她', '它', '们', '与', '及', '等', '为', '对', '以', '到', '从', '被', '把', '让', '给', '向', '于', '而', '或', '但', '如', '若', '则', '因', '所', '也', '都', '就', '还', '又', '再', '很', '更', '最', '已', '正', '将', '要', '能', '可', '应', '该', '会', '需', '须', '得', '着', '过', '去', '来', '起', '开', '出', '入', '上', '下', '中', '内', '外', '前', '后', '左', '右', '东', '西', '南', '北', '年', '月', '日', '时', '分', '秒', '个', '只', '些', '那', '哪', '每', '各', '某', '此', '彼', '何', '谁', '什', '么', '怎', '样', '几', '多', '少', '大', '小', '长', '短', '高', '低', '好', '坏', '新', '旧', '真', '假', '对', '错', '是', '非', '有', '无', '生', '死', '成', '败', '得', '失', '进', '退', '上', '下', '左', '右', '前', '后', '里', '外', '内', '中', '间', '旁', '边', '侧', '面', '底', '顶', '头', '尾', '首', '末', '始', '终', '初', '末', '先', '后', '早', '晚', '快', '慢', '急', '缓', '轻', '重', '软', '硬', '冷', '热', '干', '湿', '明', '暗', '黑', '白', '红', '黄', '蓝', '绿', '紫', '灰', '金', '银', '铜', '铁', '钢', '木', '石', '水', '火', '土', '风', '云', '雨', '雪', '雷', '电', '光', '影', '声', '色', '味', '香', '臭', '美', '丑', '善', '恶', '爱', '恨', '情', '仇', '恩', '怨', '喜', '怒', '哀', '乐', '悲', '欢', '离', '合', '聚', '散', '生', '死', '病', '痛', '苦', '累', '饿', '渴', '困', '倦', '醒', '睡', '梦', '想', '思', '念', '忘', '记', '知', '识', '学', '习', '教', '育', '读', '写', '说', '听', '看', '闻', '摸', '尝', '做', '作', '造', '建', '设', '计', '划', '策', '谋', '略', '术', '法', '道', '理', '义', '利', '名', '实', '虚', '真', '假', '正', '邪', '善', '恶', '美', '丑', '好', '坏', '对', '错', '是', '非', '有', '无', '生', '死', '成', '败', '得', '失']);
+  const sorted = Object.entries(freq)
+    .filter(([word]) => !stopWords.has(word) && word.length >= 2)
+    .sort((a, b) => b[1] - a[1]);
+  return sorted.slice(0, limit).map(([word]) => word);
+}
+
 export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree {
   const sourceRef = makeDefaultSourceRef(doc);
-  const title = doc.sourceMeta.title || '快速生成导图';
+  const title = extractSmartTitle(doc.markdown, doc.sourceMeta.sourceFileName) || doc.sourceMeta.title || '思维导图';
 
   if (doc.chunks.length > 1) {
     const root = createHeuristicNode(title, sourceRef, 'main', 0.7);
@@ -520,21 +705,24 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
   }
 
   const sentences = extractSentences(doc.markdown, 12);
+  const { type: docType, categories } = detectDocumentType(doc.markdown);
 
   const root = createHeuristicNode(title, sourceRef, 'main', 0.7);
 
-  const grouped = [
-    { title: '核心概念', items: sentences.slice(0, 4) },
-    { title: '关键细节', items: sentences.slice(4, 8) },
-    { title: '行动建议', items: sentences.slice(8, 12) },
-  ];
+  const itemsPerCategory = Math.ceil(sentences.length / categories.length);
+  const grouped = categories.map((cat, index) => ({
+    title: cat,
+    items: sentences.slice(index * itemsPerCategory, (index + 1) * itemsPerCategory),
+  }));
 
   for (const group of grouped) {
+    if (group.items.length === 0) continue;
+    
     const branch = createHeuristicNode(group.title, sourceRef, 'detail', 0.65);
 
     group.items.forEach((item) => {
       branch.children?.push(
-        createHeuristicNode(item.slice(0, 80), sourceRef, group.title === '行动建议' ? 'action' : 'detail', 0.62),
+        createHeuristicNode(item.slice(0, 80), sourceRef, 'detail', 0.62),
       );
     });
 
@@ -562,38 +750,86 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
 }
 
 function buildPrompt(doc: NormalizedDocument): string {
+  const { type: docType } = detectDocumentType(doc.markdown);
+  const docTypeHint: Record<string, string> = {
+    resume: '这是一份简历/履历文档，请按"基本信息、工作经历、项目经验、专业技能、教育背景"等模块组织内容。',
+    report: '这是一份报告/分析文档，请按"概述、主要内容、数据分析、结论建议"等模块组织内容。',
+    article: '这是一篇文章/论文，请按"摘要、主要内容、关键观点、结论"等模块组织内容。',
+    tutorial: '这是一份教程/指南，请按"概述、核心步骤、注意事项、总结"等模块组织内容。',
+    general: '请根据内容的实际结构组织思维导图。',
+  };
+
   return [
-    '你是资深知识整理助手，请把以下内容生成思维导图。',
-    `约束：最大层级 ${MAX_TREE_DEPTH}，最大节点数 ${MAX_TREE_NODES}。`,
-    '输出要求：',
-    '1. 结构要清晰，第一层为 3~6 个主题。',
-    '2. 只输出与内容相关的信息，不要捏造事实。',
-    '3. 每个节点文本简洁，尽量 20 字内。',
+    '你是资深知识整理专家，请对文档内容进行优化总结，生成思维导图。',
     '',
-    '质量控制：',
+    '## 核心原则',
+    '- **智能重组**：不拘泥于原文结构，基于核心内容重新组织，采用最清晰的方式呈现',
+    '- **节点精炼**：避免节点过多和冗余，每个节点都应有独立价值',
+    '- **逻辑清晰**：确保父子节点关系明确，层级递进合理',
+    '- **信息完整**：在精简结构的同时，保留所有关键信息',
+    '',
+    '## 文档类型',
+    docTypeHint[docType] || docTypeHint.general,
+    '',
+    '## 约束条件',
+    `- 最大层级：${MAX_TREE_DEPTH}`,
+    `- 最大节点数：${MAX_TREE_NODES}`,
+    '- 每个节点文本简洁，控制在 20 字以内',
+    '- 第一层节点数量控制在 3-6 个',
+    '',
+    '## 输出要求',
+    '1. **智能重组**：基于文档核心内容重新组织结构，不必完全遵循原文章节顺序',
+    '2. **内容精炼**：合并相似内容，去除冗余信息，确保每个节点都有独特价值',
+    '3. **术语保留**：专业名词、人名、公司名、数据等关键信息必须原样保留',
+    '4. **层级优化**：根节点为文档标题，第一层为核心主题，第二层为具体内容总结',
+    '5. **避免重复**：同一信息只在一个节点出现，避免层级间的信息重复',
+    '6. **内容详实**：第二层节点必须包含具体的内容总结，呈现核心信息和关键细节',
+    '7. **可读性强**：优先考虑思维导图的可读性和实用性，而非完全复现原文结构',
+    '',
+    '## 质量控制',
     '- 确保每个节点内容完整且有意义',
-    '- 避免重复内容',
-    '- 保持层级逻辑清晰',
-    '- 重要信息优先级更高',
+    '- 重要信息优先展示在更高层级',
+    '- 合并可以合并的内容，减少不必要的层级',
+    '- 保持层级逻辑清晰，父子节点关系明确',
     '',
-    `标题建议：${doc.sourceMeta.title || '自动生成思维导图'}`,
+    `## 文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
-    '输入内容：',
+    '## 输入内容',
     doc.markdown.slice(0, 12000),
   ].join('\n');
 }
 
 function buildCompatJsonPrompt(doc: NormalizedDocument): string {
+  const { type: docType } = detectDocumentType(doc.markdown);
+  const docTypeHint: Record<string, string> = {
+    resume: '简历文档，按"基本信息、工作经历、项目经验、专业技能、教育背景"组织',
+    report: '报告文档，按"概述、主要内容、数据分析、结论建议"组织',
+    article: '文章文档，按"摘要、主要内容、关键观点、结论"组织',
+    tutorial: '教程文档，按"概述、核心步骤、注意事项、总结"组织',
+    general: '根据内容实际结构组织',
+  };
+
   return [
-    '你是资深知识整理助手，请把输入内容整理为思维导图 JSON。',
-    `约束：最大层级 ${MAX_TREE_DEPTH}，最大节点数 ${MAX_TREE_NODES}。`,
-    '输出规则：',
-    '1. 只输出一个 JSON 对象，不要 Markdown，不要解释，不要代码块。',
-    '2. JSON 结构必须是：{"title":"...","root":{"content":"...","children":[...]}}',
-    '3. 每个节点只允许字段：content（字符串）和 children（数组，可省略）。',
-    '4. 第一层主题建议 3~6 个，节点内容简洁、可读。',
+    '你是资深知识整理专家，请对文档内容进行优化总结，生成思维导图 JSON。',
     '',
-    `标题建议：${doc.sourceMeta.title || '自动生成思维导图'}`,
+    '## 核心原则',
+    '- 智能重组：基于核心内容重新组织，不必完全遵循原文结构',
+    '- 节点精炼：避免冗余，合并相似内容',
+    '- 逻辑清晰：确保层级关系明确',
+    '',
+    `文档类型：${docTypeHint[docType] || docTypeHint.general}`,
+    '',
+    '## 输出规则',
+    '1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释',
+    '2. JSON 结构：{"title":"...","root":{"content":"...","children":[...]}}',
+    '3. 每个节点只有 content（字符串）和 children（数组，可省略）',
+    '4. 第一层主题 3~6 个，基于核心内容重新组织，不必完全遵循原文结构',
+    '5. 专业名词、人名、数据必须原样保留',
+    '6. 合并相似内容，去除冗余信息',
+    '7. 第二层节点必须包含具体内容总结，呈现核心信息和关键细节',
+    '8. 优先考虑可读性和实用性，而非完全复现原文结构',
+    '',
+    `文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
     '输入内容：',
     doc.markdown.slice(0, 12000),
