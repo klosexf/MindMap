@@ -26,6 +26,11 @@ import {
   flattenTree,
   getDefaultMindMapTree,
 } from '@/lib/utils/tree';
+import {
+  isWeChatArticleUrl,
+  generateWeChatMindMapViaZhipuWebSearch,
+  generateWeChatMindMapViaHunyuan,
+} from '@/lib/wechat/client';
 
 export type GenerateStreamEvent =
   | { type: 'skeleton'; data: { tree: MindMapTree } }
@@ -39,7 +44,7 @@ interface IndexedNode {
   index: number;
 }
 
-type OpenAICompatibleProvider = 'openai' | 'zhipu' | 'kimi' | 'minimax' | 'qwen';
+type OpenAICompatibleProvider = 'openai' | 'zhipu' | 'kimi' | 'minimax' | 'qwen' | 'hunyuan';
 
 interface OpenAICompatibleProviderConfig {
   keyEnv: string;
@@ -59,6 +64,12 @@ const OPENAI_COMPATIBLE_PROVIDER_MAP: Record<OpenAICompatibleProvider, OpenAICom
     baseEnv: 'ZHIPU_BASE_URL',
     defaultModel: 'glm-4',
     defaultBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+  },
+  hunyuan: {
+    keyEnv: 'HUNYUAN_API_KEY',
+    baseEnv: 'HUNYUAN_BASE_URL',
+    defaultModel: 'hunyuan-turbos-latest',
+    defaultBaseUrl: 'https://api.hunyuan.cloud.tencent.com/v1',
   },
   kimi: {
     keyEnv: 'MOONSHOT_API_KEY',
@@ -257,6 +268,221 @@ function cleanMarkdownText(text: string): string {
     .trim();
 }
 
+/**
+ * Clean markdown for LLM input: remove garbled/OCR-noise lines while
+ * preserving readable content and document structure (headings, etc).
+ *
+ * Key design: instead of discarding entire noisy lines (which loses valid
+ * CJK text mixed with OCR noise), we try to extract readable sub-segments.
+ */
+function cleanMarkdownForLLM(markdown: string): string {
+  const lines = markdown.split('\n');
+  const result: string[] = [];
+  let totalContentLines = 0;
+  let totalKeptLines = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Keep empty lines (paragraph separators)
+    if (!trimmed) {
+      result.push('');
+      continue;
+    }
+
+    // Keep markdown headings
+    if (/^#{1,6}\s+/.test(trimmed)) {
+      result.push(trimmed);
+      continue;
+    }
+
+    totalContentLines++;
+
+    // Strip common punctuation for analysis
+    const analysisText = trimmed
+      .replace(/[,;:|.!?，。！？、：；|｜\-—–()（）\[\]【】{}\/\\]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // If the line has enough CJK content (>=20%), it's likely readable — keep as-is
+    const cjkChars = (analysisText.match(/[\u3400-\u9fff]/g) || []).length;
+    const totalNonSpace = analysisText.replace(/\s/g, '').length;
+    if (totalNonSpace > 0 && cjkChars / totalNonSpace >= 0.2) {
+      const compacted = sanitizeSentence(trimmed);
+      const candidate = compacted || trimmed;
+      const candidateTokens = candidate.split(/\s+/).filter(Boolean);
+      const noiseTokenCount = candidateTokens.filter((token) => isLikelyNoiseToken(token, true)).length;
+      const hasHeavyNoise = candidateTokens.length >= 4 && noiseTokenCount / candidateTokens.length > 0.45;
+
+      result.push(hasHeavyNoise ? compacted || trimmed : candidate);
+      totalKeptLines++;
+      continue;
+    }
+
+    // If the line is short and mostly numbers/dates/phones, keep it
+    const digitAndPunct = (analysisText.match(/[\d\s\-/:.]/g) || []).length;
+    if (totalNonSpace > 0 && digitAndPunct / analysisText.length >= 0.7 && analysisText.length < 80) {
+      result.push(trimmed);
+      totalKeptLines++;
+      continue;
+    }
+
+    // Check if the line contains ANY meaningful CJK content mixed with noise.
+    // If so, try to extract readable segments instead of discarding the whole line.
+    if (cjkChars >= 3) {
+      const extracted = extractReadableSegmentsFromLine(trimmed);
+      if (extracted) {
+        result.push(extracted);
+        totalKeptLines++;
+        continue;
+      }
+    }
+
+    // Check for garbled text using existing detector
+    if (isGarbledText(analysisText)) {
+      continue; // Skip this line
+    }
+
+    // Filter out lines that are dominated by long numeric IDs / phone numbers
+    // These are common in OCR noise from forms and PDF headers
+    const tokens = analysisText.split(/\s+/).filter(Boolean);
+    if (tokens.length >= 3) {
+      const hasCjkContext = tokens.some((t) => CJK_CHAR_RE.test(t));
+      const noiseTokens = tokens.filter((t) => isLikelyNoiseToken(t, hasCjkContext)).length;
+      // Also count standalone long-number tokens as noise
+      const longNumericTokens = tokens.filter((t) => /^\d{7,}$/.test(t)).length;
+      const totalNoise = noiseTokens + longNumericTokens;
+      // If more than 50% of tokens are noise (including long numbers), skip
+      if (totalNoise / tokens.length > 0.5) {
+        continue;
+      }
+    }
+
+    result.push(trimmed);
+    totalKeptLines++;
+  }
+
+  const cleaned = result.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+
+  // Safety net: if we filtered out too aggressively (>70% of content lines dropped),
+  // fall back to a lighter cleaning that only removes clearly-garbled tokens
+  if (totalContentLines > 2 && totalKeptLines / totalContentLines < 0.3) {
+    return lightCleanMarkdown(markdown);
+  }
+
+  return cleaned;
+}
+
+/**
+ * Attempt to extract readable sub-segments from a noisy OCR line that contains
+ * both real CJK text and garbage. Splits on boundaries and keeps segments that
+ * pass readability checks.
+ */
+function extractReadableSegmentsFromLine(line: string): string | null {
+  // Split the line into segments on common delimiters that separate logical units
+  // OCR often outputs: [garble] [real content] [garble] | [more content] [garble]
+  const segments = line.split(/(\s*[|｜]\s*|\s{2,}|\s+(?=[\u3400-\u9fff])|(?<=[\u3400-\u9fff])\s+)/);
+
+  const keptSegments: string[] = [];
+
+  for (const seg of segments) {
+    const trimmedSeg = seg.trim();
+    if (!trimmedSeg || trimmedSeg.length < 2) continue;
+
+    // Analyze segment quality
+    const segAnalysis = trimmedSeg
+      .replace(/[,;:|.!?，。！？、：；\-—–()（）\[\]【】{}\/\\]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const segCJK = (segAnalysis.match(/[\u3400-\u9fff]/g) || []).length;
+    const segTotal = segAnalysis.replace(/\s/g, '').length;
+
+    // Keep segments with good CJK ratio or short clean segments
+    if (segTotal > 0 && segCJK / segTotal >= 0.25) {
+      keptSegments.push(trimmedSeg);
+      continue;
+    }
+
+    // Short numeric/date-like segments
+    if (trimmedSeg.length < 30 && /^[\d\s\-/:.+@]+$/.test(trimmedSeg.replace(/[()（）]/g, ''))) {
+      keptSegments.push(trimmedSeg);
+      continue;
+    }
+
+    // Extract numeric sub-segments from mixed segments (e.g. "REE 1993.07.04" → "1993.07.04")
+    const numericParts = segAnalysis.split(/\s+/).filter((p) => isNumericToken(p));
+    if (numericParts.length > 0) {
+      keptSegments.push(...numericParts);
+      // If segment has no CJK at all, numeric parts are all we can salvage
+      if (segCJK === 0) continue;
+    }
+
+    // Segment with any CJK and not detected as garbled
+    if (segCJK >= 1 && !isGarbledText(segAnalysis)) {
+      keptSegments.push(trimmedSeg);
+      continue;
+    }
+
+    // Pure ASCII segment: drop if every token looks like noise
+    if (segCJK === 0) {
+      const segTokens = segAnalysis.split(/\s+/).filter(Boolean);
+      if (segTokens.length === 0) continue;
+      const noiseCount = segTokens.filter((t) => isLikelyNoiseToken(t, false)).length;
+      if (noiseCount === segTokens.length) {
+        continue; // All tokens are noise — drop the segment
+      }
+      // Partially clean: keep conservatively
+      keptSegments.push(trimmedSeg);
+    }
+  }
+
+  if (keptSegments.length === 0) return null;
+  if (keptSegments.length === 1) return keptSegments[0].length >= 4 ? keptSegments[0] : null;
+
+  // Join kept segments with spaces
+  const joined = keptSegments.join(' ');
+  return joined.length >= 4 ? joined : null;
+}
+
+/**
+ * Lighter cleaning pass used as fallback when aggressive filtering removed too much.
+ * Only removes obviously garbled tokens/sentences, preserves most content.
+ */
+function lightCleanMarkdown(markdown: string): string {
+  const lines = markdown.split('\n');
+  const result: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      result.push('');
+      continue;
+    }
+
+    // Always keep headings
+    if (/^#{1,6}\s+/.test(trimmed)) {
+      result.push(trimmed);
+      continue;
+    }
+
+    // Apply sanitizeSentence which does per-token cleaning
+    const sanitized = sanitizeSentence(trimmed);
+    if (sanitized && sanitized.length >= 2 && !isGarbledText(sanitized)) {
+      result.push(sanitized);
+    } else if (trimmed.length >= 2) {
+      // Even if garbled, try keeping original for LLM to make sense of
+      const hasAnyCJK = /[\u3400-\u9fff]/.test(trimmed);
+      if (hasAnyCJK) {
+        result.push(trimmed);
+      }
+    }
+  }
+
+  return result.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 const CJK_CHAR_RE = /[\u3400-\u9fff]/;
 const ASCII_TOKEN_ALLOWLIST = new Set(['AI', 'AIGC', 'API', 'APP', 'B2B', 'B2C', 'KPI', 'OKR', 'PDF', 'SQL', 'UI', 'UX']);
 
@@ -280,32 +506,44 @@ function collapseCjkSpacing(text: string): string {
 
 function isLikelyNoiseToken(token: string, hasCjkContext: boolean): boolean {
   if (!token) return true;
-  if (token.length > 24) return true;
+  if (token.length > 18) return true;
   if (/[A-Za-z]/.test(token) && /\d/.test(token) && token.length >= 8) return true;
   if (/[_@]/.test(token) && token.length >= 6) return true;
   if (/([A-Za-z])\1{4,}/.test(token)) return true;
 
+  // Long numeric sequences (phone numbers, IDs, form codes) are noise
+  // unless they look like plausible dates or short counts
+  if (/^\d+$/.test(token) && token.length >= 7) {
+    // Allow common date-like patterns: YYYY, YYYYMM, YYYYMMDD, MMDD
+    if (/^(19|20)\d{2}([01]\d)?([0-3]\d)?$/.test(token)) return false;
+    if (/^[0-3]?\d[0-3]?\d$/.test(token) && token.length <= 4) return false;
+    // Everything else 7+ digits is likely an ID/phone/form code → noise
+    return true;
+  }
+
   const upper = token.toUpperCase();
-  const allUpperAscii = /^[A-Z]{4,}$/.test(token);
+  const allUpperAscii = /^[A-Z]{3,}$/.test(token);
   if (allUpperAscii && !ASCII_TOKEN_ALLOWLIST.has(upper)) return true;
 
-  if (!hasCjkContext) return false;
-
   if (/^[A-Za-z]{2,}$/.test(token)) {
-    const upperChars = (token.match(/[A-Z]/g) || []).length;
-    const lowerChars = (token.match(/[a-z]/g) || []).length;
-    const upperRatio = upperChars / token.length;
-    if (upperRatio >= 0.6 && !ASCII_TOKEN_ALLOWLIST.has(upper)) {
-      return true;
-    }
     const vowelCount = (token.match(/[aeiou]/gi) || []).length;
     const vowelRatio = vowelCount / token.length;
-    if (vowelRatio < 0.15 && token.length >= 5) {
+    // Extremely low vowel ratio → garbled regardless of CJK context
+    if (vowelRatio < 0.15 && token.length >= 4) {
       return true;
     }
+    // 4+ consecutive consonants → garbled regardless of CJK context
     const consonantClusters = token.match(/[bcdfghjklmnpqrstvwxyz]{4,}/gi) || [];
     if (consonantClusters.length > 0) {
       return true;
+    }
+    // Only apply strict upper-case check when there IS a CJK context
+    if (hasCjkContext) {
+      const upperChars = (token.match(/[A-Z]/g) || []).length;
+      const upperRatio = upperChars / token.length;
+      if (upperRatio >= 0.6 && !ASCII_TOKEN_ALLOWLIST.has(upper)) {
+        return true;
+      }
     }
   }
 
@@ -320,32 +558,56 @@ function isLikelyNoiseToken(token: string, hasCjkContext: boolean): boolean {
   return false;
 }
 
+/**
+ * Detect whether a CJK token looks like garbled/noisy text.
+ * Garbled OCR output often produces CJK strings that don't contain any
+ * recognizable words or meaningful patterns — just random characters mashed together.
+ */
+function isGarbledCjkToken(token: string): boolean {
+  if (!CJK_CHAR_RE.test(token)) return false;
+  if (token.length < 4) return false;
+
+  // Very long CJK tokens without any common punctuation or structure are suspicious
+  if (token.length >= 12) {
+    // Check for common Chinese function words that indicate real text
+    const hasFunctionWord = /的|是|在|和|了|有|不|这|为|与|对|以|到|从|及|等|中|上|下|人|大|小|好|用|进行|通过|可以|需要|应该|能够/.test(token);
+    if (!hasFunctionWord) return true;
+  }
+
+  // CJK tokens with repeated characters are often OCR errors
+  if (/(.)\1{2,}/.test(token)) return true;
+
+  return false;
+}
+
 function shouldKeepAsciiTokenInCjkContext(token: string): boolean {
   const upper = token.toUpperCase();
   if (ASCII_TOKEN_ALLOWLIST.has(upper)) return true;
   if (isNumericToken(token)) return true;
 
-  const hasLowercase = /[a-z]/.test(token);
-  const hasVowel = /[aeiou]/i.test(token);
-  return hasLowercase && hasVowel;
+  if (token.length < 5) return false;
+  if (!/^[a-z]+$/.test(token)) return false;
+  if (!/[aeiou]/.test(token)) return false;
+  if (isLikelyNoiseToken(token, true)) return false;
+  return true;
 }
 
 function isGarbledText(text: string): boolean {
   if (!text || text.length < 5) return false;
-  
+
   const tokens = text.split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return false;
-  
+
   let garbledCount = 0;
   for (const token of tokens) {
     if (/^[A-Za-z]+$/.test(token)) {
       const vowelCount = (token.match(/[aeiou]/gi) || []).length;
       const vowelRatio = vowelCount / token.length;
-      if (vowelRatio < 0.1 && token.length >= 4) {
+      if (vowelRatio < 0.15 && token.length >= 4) {
         garbledCount++;
         continue;
       }
-      const consonantClusters = token.match(/[bcdfghjklmnpqrstvwxyz]{5,}/gi) || [];
+      const consonantClusters = token.match(/[bcdfghjklmnpqrstvwxyz]{4,}/gi) || [];
       if (consonantClusters.length > 0) {
         garbledCount++;
         continue;
@@ -358,7 +620,7 @@ function isGarbledText(text: string): boolean {
       }
     }
   }
-  
+
   return garbledCount / tokens.length >= 0.4;
 }
 
@@ -370,9 +632,20 @@ function sanitizeSentence(sentence: string): string {
 
   const hasCjkContext = normalizedTokens.some((token) => CJK_CHAR_RE.test(token));
   const keptTokens = normalizedTokens.filter((token) => {
+    // Preserve ALL CJK tokens in general sanitization — they're almost always
+    // legitimate content. Garbled CJK detection should only happen at the
+    // final tree-node level where we have more context.
     if (CJK_CHAR_RE.test(token)) return true;
     if (isLikelyNoiseToken(token, hasCjkContext)) return false;
-    if (!hasCjkContext) return true;
+    if (!hasCjkContext) {
+      // Without CJK context, still filter: keep numbers, allowlist, and
+      // normal-looking English words (have lowercase + vowels)
+      if (isNumericToken(token)) return true;
+      if (ASCII_TOKEN_ALLOWLIST.has(token.toUpperCase())) return true;
+      const hasLowercase = /[a-z]/.test(token);
+      const hasVowel = /[aeiou]/i.test(token);
+      return hasLowercase && hasVowel;
+    }
     return shouldKeepAsciiTokenInCjkContext(token);
   });
 
@@ -420,6 +693,167 @@ function isReadableSentence(sentence: string): boolean {
     .map((token) => token.trim())
     .filter((token) => /^[A-Za-z][A-Za-z-]*$/.test(token));
   return asciiWords.length >= 3;
+}
+
+function isLikelyNoisyMixedText(text: string): boolean {
+  if (!text) return false;
+
+  const tokens = text
+    .split(/\s+/)
+    .map((token) => normalizeToken(token))
+    .filter(Boolean);
+  if (tokens.length === 0) return false;
+
+  const cjkTokenCount = tokens.filter((token) => CJK_CHAR_RE.test(token)).length;
+  if (cjkTokenCount === 0) return false;
+
+  const asciiTokens = tokens.filter((token) => /^[A-Za-z]+$/.test(token));
+  if (asciiTokens.length < 4) return false;
+
+  const suspiciousAscii = asciiTokens.filter((token) => {
+    const upper = token.toUpperCase();
+    if (ASCII_TOKEN_ALLOWLIST.has(upper)) return false;
+    if (token.length <= 2) return true;
+    if (isLikelyNoiseToken(token, true)) return true;
+    if (token.length <= 4 && !/[aeiou]/i.test(token)) return true;
+    return false;
+  }).length;
+
+  return suspiciousAscii / asciiTokens.length >= 0.5;
+}
+
+function sanitizeTreeNodeForOutput(node: MindMapNode): MindMapNode[] {
+  const sanitizedChildren = (node.children || []).flatMap((child) => sanitizeTreeNodeForOutput(child));
+  const content = sanitizeSentence(node.content) || node.content.trim();
+  const trimmed = content.slice(0, 120).trim();
+
+  if (!trimmed) {
+    return sanitizedChildren;
+  }
+
+  if (isGarbledText(trimmed) || isLikelyNoisyMixedText(trimmed)) {
+    return sanitizedChildren;
+  }
+
+  // Filter out nodes that are purely numeric (IDs, phone numbers, counts without context)
+  if (/^\d+$/.test(trimmed) && trimmed.length >= 4) {
+    return sanitizedChildren;
+  }
+
+  // Filter out nodes that look like a mix of numbers and fragments with no coherent meaning
+  // e.g. "04 13352824120 92188547600 求职目标产品经理自我评价 25 20007"
+  if (/^\d{2,}\s/.test(trimmed) && trimmed.split(/\s+/).filter(t => /^\d{4,}$/.test(t)).length >= 2) {
+    return sanitizedChildren;
+  }
+
+  return [{ ...node, content: trimmed, children: sanitizedChildren }];
+}
+
+function sanitizeMindMapTreeForOutput(tree: MindMapTree, fallbackTitle: string): MindMapTree {
+  const rootContent = sanitizeSentence(tree.root.content) || tree.root.content.trim() || fallbackTitle || '思维导图';
+  const root = {
+    ...tree.root,
+    content: rootContent.slice(0, 120).trim() || fallbackTitle || '思维导图',
+    children: (tree.root.children || []).flatMap((child) => sanitizeTreeNodeForOutput(child)),
+  };
+
+  return {
+    ...tree,
+    root,
+  };
+}
+
+const CATEGORY_LABEL_RE = /(经历|背景|评价|信息|技能|项目|职责|成果|总结|目标|方式|教育|工作|联系)/;
+
+function isCategoryLikeLabel(text: string): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (CATEGORY_LABEL_RE.test(trimmed)) return true;
+  // Very short pure-CJK labels are usually category headers.
+  return /^[\u3400-\u9fff]{2,6}$/.test(trimmed);
+}
+
+function collectChunkSentences(doc: NormalizedDocument): Array<{ sentence: string; sourceRef: SourceReference }> {
+  const collected: Array<{ sentence: string; sourceRef: SourceReference }> = [];
+  for (const chunk of doc.chunks) {
+    const chunkSourceRef = chunk.sourceRef || makeDefaultSourceRef(doc);
+    const sentences = extractSentences(chunk.text, 8);
+    for (const sentence of sentences) {
+      const normalized = sentence.trim().slice(0, 90);
+      if (!normalized) continue;
+      if (isGarbledText(normalized) || isLikelyNoisyMixedText(normalized)) continue;
+      collected.push({ sentence: normalized, sourceRef: chunkSourceRef });
+    }
+  }
+  return collected;
+}
+
+function scoreSentenceForBranch(branchLabel: string, sentence: string): number {
+  const branchKeywords = branchLabel.match(/[\u3400-\u9fff]{2,6}|[A-Za-z]{3,}/g) || [];
+  if (branchKeywords.length === 0) return 0;
+  let score = 0;
+  for (const keyword of branchKeywords) {
+    if (sentence.includes(keyword)) score += 1;
+  }
+  return score;
+}
+
+function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): MindMapTree {
+  const topChildren = tree.root.children || [];
+  if (topChildren.length === 0) return tree;
+
+  const emptyTopChildren = topChildren.filter((child) => (child.children?.length || 0) === 0);
+  const emptyRatio = emptyTopChildren.length / topChildren.length;
+  const shouldAugment = topChildren.length >= 3 && emptyRatio >= 0.6;
+  if (!shouldAugment) return tree;
+
+  const pool = collectChunkSentences(doc);
+  if (pool.length === 0) return tree;
+  const usedSentences = new Set<string>();
+
+  const nextRootChildren = topChildren.map((child) => {
+    if ((child.children?.length || 0) > 0) return child;
+    if (!isCategoryLikeLabel(child.content)) return child;
+
+    const ranked = pool
+      .map((item) => ({
+        ...item,
+        score: scoreSentenceForBranch(child.content, item.sentence),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const selected = ranked.filter((item) => item.score > 0 && !usedSentences.has(item.sentence)).slice(0, 2);
+    if (selected.length === 0) {
+      const fallback = ranked.find((item) => !usedSentences.has(item.sentence));
+      if (fallback) selected.push(fallback);
+    }
+    if (selected.length === 0) return child;
+
+    for (const item of selected) usedSentences.add(item.sentence);
+    const details = selected.map((item) =>
+      createHeuristicNode(item.sentence, item.sourceRef, 'detail', 0.6),
+    );
+
+    return {
+      ...child,
+      children: details,
+    };
+  });
+
+  return {
+    ...tree,
+    root: {
+      ...tree.root,
+      children: nextRootChildren,
+    },
+  };
+}
+
+export function repairSparseFirstLayerForDoc(tree: MindMapTree, doc: NormalizedDocument): MindMapTree {
+  const fallbackTitle = tree.meta.title || doc.sourceMeta.title || '思维导图';
+  const sanitized = sanitizeMindMapTreeForOutput(tree, fallbackTitle);
+  return ensureFirstLayerDetails(sanitized, doc);
 }
 
 function extractSentences(text: string, limit: number): string[] {
@@ -570,7 +1004,9 @@ function llmTreeToMindMapTree(llmTree: LLMMindMapTree, doc: NormalizedDocument):
   };
 
   const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
-  return mindMapTreeSchema.parse(clamped);
+  const parsed = mindMapTreeSchema.parse(clamped);
+  const sanitized = sanitizeMindMapTreeForOutput(parsed, doc.sourceMeta.title || '思维导图');
+  return ensureFirstLayerDetails(sanitized, doc);
 }
 
 function buildDiffPatches(prevTree: MindMapTree, nextTree: MindMapTree): TreePatch[] {
@@ -675,7 +1111,9 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
       },
     };
 
-    return clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
+    const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
+    const sanitized = sanitizeMindMapTreeForOutput(clamped, title);
+    return ensureFirstLayerDetails(sanitized, doc);
   }
 
   const sentences = extractSentences(doc.markdown, 12);
@@ -717,78 +1155,90 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
     },
   };
 
-  return clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
+  const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
+  const sanitized = sanitizeMindMapTreeForOutput(clamped, title);
+  return ensureFirstLayerDetails(sanitized, doc);
 }
 
+const ANTI_HALLUCINATION_SYSTEM = [
+  '你是一个严格的知识提取工具，不是创作助手。',
+  '你的唯一工作是从用户提供的文档中提取信息并组织为结构化输出。',
+  '绝对禁止编造、推测、补充、合理化任何文档中未明确出现的信息。',
+  '遇到模糊或无法识别的内容，直接忽略，不要猜测。',
+  '文档中没有的分类维度，不要创建节点。',
+].join('\n');
+
 function buildPrompt(doc: NormalizedDocument): string {
+  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, 12000);
   return [
-    '你是资深知识整理专家，请对文档内容进行优化总结，生成思维导图。',
+    '从下方文档原文中提取信息，组织为思维导图结构。',
+    '',
+    '## 绝对规则（违反任何一条即视为失败）',
+    '1. 只输出文档中明确出现的信息。文档没写的，一个字也不许加',
+    '2. 文档中模糊、乱码、无法识别的内容，直接忽略，不要猜测其含义',
+    '3. 文档中不存在的分类/维度，不要创建对应节点',
+    '4. 不许编造数据、案例、人名、公司名、技能、经历等任何原文未提及的细节',
     '',
     '## 核心原则',
-    '- **智能重组**：不拘泥于原文结构，基于核心内容重新组织，采用最清晰的方式呈现',
-    '- **节点精炼**：避免节点过多和冗余，每个节点都应有独立价值',
-    '- **逻辑清晰**：确保父子节点关系明确，层级递进合理',
-    '- **信息完整**：在精简结构的同时，保留所有关键信息',
+    '- **忠实原文**：所有节点内容必须源自文档原文，可概括和重组，但绝不可添加原文没有的信息',
+    '- **按需提取**：只创建文档中确实有内容的分类，2-8 个一级节点均可，没有内容的维度不创建',
+    '- **语义聚合**：关联紧密的信息合并为一个节点（如"公司名 | 职位 | 时间段"合为一个节点）',
+    '- **自然层级**：根据内容复杂度自适应深度——简单信息扁平，复杂信息展开',
     '',
     '## 约束条件',
     `- 最大层级：${MAX_TREE_DEPTH}`,
     `- 最大节点数：${MAX_TREE_NODES}`,
-    '- 每个节点文本简洁，控制在 20 字以内',
-    '- 第一层节点数量控制在 3-6 个',
+    '- 节点文本控制在 35 字以内',
+    '- 一级节点数量由文档实际内容决定（2-8 个均可），不凑数',
+    '',
+    '## 节点组织原则',
+    '1. 关联紧密的信息合并为一个节点，其 children 是具体细节',
+    '2. 某类别下有多个独立子项时，每个子项作为独立节点',
+    '3. 禁止空标签节点（仅写分类名称而无实质内容）',
+    '4. 同一维度的信息归入同一父节点',
     '',
     '## 输出要求',
-    '1. **智能重组**：基于文档核心内容重新组织结构，不必完全遵循原文章节顺序',
-    '2. **内容精炼**：合并相似内容，去除冗余信息，确保每个节点都有独特价值',
-    '3. **术语保留**：专业名词、人名、公司名、数据等关键信息必须原样保留',
-    '4. **层级优化**：根节点为文档标题，第一层为核心主题，第二层为具体内容总结',
-    '5. **避免重复**：同一信息只在一个节点出现，避免层级间的信息重复',
-    '6. **内容详实**：第二层节点必须包含具体的内容总结，呈现核心信息和关键细节',
-    '7. **可读性强**：优先考虑思维导图的可读性和实用性，而非完全复现原文结构',
-    '',
-    '## 质量控制',
-    '- 确保每个节点内容完整且有意义',
-    '- 重要信息优先展示在更高层级',
-    '- 合并可以合并的内容，减少不必要的层级',
-    '- 保持层级逻辑清晰，父子节点关系明确',
+    '1. 基于文档核心内容重组结构，而非复述原文顺序',
+    '2. 专业名词、人名、公司名、数据等原样保留',
+    '3. 如果某个维度文档中没有相关信息，就不创建该节点',
     '',
     `## 文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
     '## 输入内容',
-    doc.markdown.slice(0, 12000),
+    cleanedMarkdown,
   ].join('\n');
 }
 
 function buildCompatJsonPrompt(doc: NormalizedDocument): string {
+  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, 12000);
   return [
-    '你是资深知识整理专家，请对文档内容进行优化总结，生成思维导图 JSON。',
+    '从下方文档原文中提取信息，组织为思维导图 JSON。',
+    '',
+    '## 绝对规则（违反任何一条即视为失败）',
+    '1. 只输出文档中明确出现的信息。文档没写的，一个字也不许加',
+    '2. 文档中模糊、乱码、无法识别的内容，直接忽略，不要猜测其含义',
+    '3. 文档中不存在的分类/维度，不要创建对应节点',
+    '4. 不许编造数据、案例、人名、公司名、技能、经历等任何原文未提及的细节',
     '',
     '## 核心原则',
-    '- 智能重组：基于核心内容重新组织，不必完全遵循原文结构',
-    '- 节点精炼：避免冗余，合并相似内容',
-    '- 逻辑清晰：确保层级关系明确',
+    '- 忠实原文：所有节点内容必须源自文档原文，可概括重组但绝不可添加原文没有的信息',
+    '- 按需提取：只创建文档中确实有内容的分类，2-8 个一级节点均可，没有内容的维度不创建',
+    '- 语义聚合：关联紧密的信息合并到同一节点下',
+    '- 逻辑清晰：层级关系明确，形成完整知识脉络',
     '',
     '## 输出规则',
     '1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释',
     '2. JSON 结构：{"title":"...","root":{"content":"...","children":[...]}}',
     '3. 每个节点只有 content（字符串）和 children（数组）',
-    '4. 第一层主题 3~6 个，基于核心内容重新组织，不必完全遵循原文结构',
+    '4. 一级主题数量由文档实际内容决定（2-8 个），不凑数',
     '5. 专业名词、人名、数据必须原样保留',
-    '6. 合并相似内容，去除冗余信息',
-    '7. 【重要】每个一级节点（root.children 中的节点）必须有 children 数组，包含 2~5 个具体内容节点',
-    '8. 【重要】一级节点不能只有 content，必须展开为具体的子节点',
-    '9. 优先考虑可读性和实用性，而非完全复现原文结构',
-    '',
-    '## 示例结构',
-    '正确示例：',
-    '{"title":"简历","root":{"content":"候选人概况","children":[{"content":"基本信息","children":[{"content":"姓名：张三"},{"content":"电话：138xxxx"}]}]}}',
-    '',
-    '错误示例（一级节点没有 children）：',
-    '{"title":"简历","root":{"content":"候选人概况","children":[{"content":"基本信息"}]}}  // ❌ 缺少 children',
+    '6. 如果某个维度文档中没有相关信息，就不创建该节点',
+    '7. 禁止空标签节点（仅写分类名称而无实质内容）',
     '',
     `文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
     '输入内容：',
-    doc.markdown.slice(0, 12000),
+    cleanedMarkdown,
   ].join('\n');
 }
 
@@ -836,7 +1286,49 @@ function extractJsonCandidates(text: string): string[] {
   return [...candidates].filter(Boolean);
 }
 
+function tryRepairTruncatedJson(text: string): string {
+  let repaired = text.trim();
+
+  // Strip markdown fences
+  repaired = repaired.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+
+  // Extract from first { to end
+  const startIdx = repaired.indexOf('{');
+  if (startIdx < 0) return text;
+  repaired = repaired.slice(startIdx);
+
+  // Try to close unclosed strings
+  const inStringCount = (repaired.match(/(?<!\\)"/g) || []).length;
+  if (inStringCount % 2 !== 0) {
+    repaired += '"';
+  }
+
+  // Count unclosed brackets
+  let braces = 0;
+  let brackets = 0;
+  let inStr = false;
+  let esc = false;
+  for (const ch of repaired) {
+    if (inStr) {
+      if (esc) { esc = false; } else if (ch === '\\') { esc = true; } else if (ch === '"') { inStr = false; }
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') braces++;
+    else if (ch === '}') braces--;
+    else if (ch === '[') brackets++;
+    else if (ch === ']') brackets--;
+  }
+
+  // Close unclosed brackets and braces
+  while (brackets > 0) { repaired += ']'; brackets--; }
+  while (braces > 0) { repaired += '}'; braces--; }
+
+  return repaired;
+}
+
 function parseLLMTreeFromTextWithMeta(text: string): { tree: LLMMindMapTree; parsedJson: string } | null {
+  // First try: normal extraction
   for (const candidate of extractJsonCandidates(text)) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
@@ -848,6 +1340,21 @@ function parseLLMTreeFromTextWithMeta(text: string): { tree: LLMMindMapTree; par
       continue;
     }
   }
+
+  // Second try: repair truncated JSON
+  const repaired = tryRepairTruncatedJson(text);
+  if (repaired !== text) {
+    try {
+      const parsed = JSON.parse(repaired) as unknown;
+      const validated = llmTreeSchema.safeParse(parsed);
+      if (validated.success) {
+        return { tree: validated.data, parsedJson: repaired };
+      }
+    } catch {
+      // repair failed, fall through
+    }
+  }
+
   return null;
 }
 
@@ -863,14 +1370,16 @@ async function generateTreeWithCompatProvider(
 ): Promise<MindMapTree> {
   const modelProvider = createProviderClient(llmConfig);
   const languageModel = modelProvider.chat(llmConfig.model as any);
+  const jsonMaxTokens = parseNonNegativeInt(process.env.LLM_JSON_MAX_TOKENS, 8000);
   const result = await generateText({
     model: languageModel,
+    system: ANTI_HALLUCINATION_SYSTEM,
     prompt: buildCompatJsonPrompt(doc),
     maxRetries: requestConfig.maxRetries,
     timeout: requestConfig.timeoutMs,
     abortSignal: options.abortSignal,
     temperature: 0.2,
-    maxOutputTokens: 4000,
+    maxOutputTokens: jsonMaxTokens,
   });
 
   const parsedTree = parseLLMTreeFromText(result.text);
@@ -905,7 +1414,7 @@ function buildMarkdownPreviewPrompt(doc: NormalizedDocument): string {
     `来源类型：${doc.sourceMeta.type}`,
     '',
     '输入内容：',
-    doc.markdown.slice(0, 14000),
+    cleanMarkdownForLLM(doc.markdown).slice(0, 14000),
   ].join('\n');
 }
 
@@ -948,6 +1457,7 @@ export async function generateMarkdownPreview(
 
   const result = await generateText({
     model: languageModel,
+    system: ANTI_HALLUCINATION_SYSTEM,
     prompt: buildMarkdownPreviewPrompt(doc),
     maxRetries: markdownMaxRetries,
     timeout: markdownTimeoutMs ?? requestConfig.timeoutMs,
@@ -979,10 +1489,66 @@ export async function generateMindMapJsonPreview(
     throw new Error(`LLM 未配置：请检查 ${keyHint}。`);
   }
 
+  // ===== 微信文章 + 混元搜索增强：优先走混元联网生成路径 =====
+  const isWeChatUrl = doc.sourceMeta.type === 'wechat' ||
+    (doc.sourceMeta.sourceUrl && isWeChatArticleUrl(doc.sourceMeta.sourceUrl));
+
+  // 优先尝试腾讯混元（元宝）搜索增强，微信生态独家资源
+  if (isWeChatUrl) {
+    const hunyuanApiKey = process.env.HUNYUAN_API_KEY?.trim();
+    if (hunyuanApiKey) {
+      try {
+        const { json: rawJson } = await generateWeChatMindMapViaHunyuan(
+          doc.sourceMeta.sourceUrl!,
+        );
+
+        const parsed = parseLLMTreeFromTextWithMeta(rawJson);
+        if (parsed) {
+          return {
+            tree: parsed.tree,
+            parsedJson: parsed.parsedJson,
+            rawText: rawJson,
+            provider: 'hunyuan-search-enhancement',
+            model: process.env.HUNYUAN_MODEL?.trim() || 'hunyuan-turbos-latest',
+          };
+        }
+      } catch (hunyuanError) {
+        const errMsg = hunyuanError instanceof Error ? hunyuanError.message : '混元搜索增强失败';
+        console.warn(`[MindMap] 腾讯混元搜索增强生成微信文章思维导图JSON预览失败，降级：${errMsg}`);
+      }
+    }
+  }
+
+  // 降级：智谱AI联网搜索
+  if (isWeChatUrl && llmConfig.resolvedProvider === 'zhipu' && llmConfig.apiKey) {
+    try {
+      const { json: rawJson } = await generateWeChatMindMapViaZhipuWebSearch(
+        doc.sourceMeta.sourceUrl!,
+        { model: llmConfig.model },
+      );
+
+      const parsed = parseLLMTreeFromTextWithMeta(rawJson);
+      if (parsed) {
+        return {
+          tree: parsed.tree,
+          parsedJson: parsed.parsedJson,
+          rawText: rawJson,
+          provider: 'zhipu-web-search',
+          model: llmConfig.model,
+        };
+      }
+    } catch (zhipuWebSearchError) {
+      // 联网生成失败，降级到普通流程
+      const errMsg = zhipuWebSearchError instanceof Error ? zhipuWebSearchError.message : '智谱AI联网生成失败';
+      console.warn(`[MindMap] 智谱AI联网生成微信文章思维导图JSON预览失败，降级到普通流程：${errMsg}`);
+    }
+  }
+
   const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
   const jsonTimeoutSeconds = parseNonNegativeInt(process.env.LLM_JSON_TIMEOUT, 90);
   const jsonTimeoutMs = jsonTimeoutSeconds > 0 ? jsonTimeoutSeconds * 1000 : undefined;
   const jsonMaxRetries = parseNonNegativeInt(process.env.LLM_JSON_MAX_RETRIES, requestConfig.maxRetries);
+  const jsonMaxTokens = parseNonNegativeInt(process.env.LLM_JSON_MAX_TOKENS, 8000);
   const modelProvider = createProviderClient(llmConfig);
 
   const languageModel =
@@ -992,17 +1558,24 @@ export async function generateMindMapJsonPreview(
 
   const result = await generateText({
     model: languageModel,
+    system: ANTI_HALLUCINATION_SYSTEM,
     prompt: buildCompatJsonPrompt(doc),
     maxRetries: jsonMaxRetries,
     timeout: jsonTimeoutMs ?? requestConfig.timeoutMs,
     abortSignal: options.abortSignal,
     temperature: 0.2,
-    maxOutputTokens: 2200,
+    maxOutputTokens: jsonMaxTokens,
   });
 
-  const parsed = parseLLMTreeFromTextWithMeta(result.text);
+  const rawText = result.text;
+  const parsed = parseLLMTreeFromTextWithMeta(rawText);
   if (!parsed) {
-    throw new Error('LLM 返回内容不是有效思维导图 JSON');
+    const isTruncated = rawText.length > 100 && !rawText.trim().endsWith('}');
+    const preview = rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText;
+    const hint = isTruncated
+      ? '（JSON 似乎被截断，可能是输出过长。可尝试在 .env 中设置 LLM_JSON_MAX_TOKENS=8000 后重试）'
+      : `（LLM 返回内容前 300 字符：${preview}）`;
+    throw new Error(`LLM 返回内容不是有效思维导图 JSON ${hint}`);
   }
 
   return {
@@ -1048,6 +1621,77 @@ export async function* generateMindMapStream(
 
     yield { type: 'complete', data: { tree: fallback } };
     return;
+  }
+
+  // ===== 微信文章 + 混元搜索增强：优先走混元联网生成路径 =====
+  const isWeChatUrl = doc.sourceMeta.type === 'wechat' ||
+    (doc.sourceMeta.sourceUrl && isWeChatArticleUrl(doc.sourceMeta.sourceUrl));
+
+  if (isWeChatUrl) {
+    const hunyuanApiKey = process.env.HUNYUAN_API_KEY?.trim();
+    if (hunyuanApiKey) {
+      let workingTree = buildHeuristicMindMapTree(doc);
+      yield { type: 'skeleton', data: { tree: workingTree } };
+
+      try {
+        const { json: rawJson } = await generateWeChatMindMapViaHunyuan(
+          doc.sourceMeta.sourceUrl!,
+        );
+
+        const parsedTree = parseLLMTreeFromText(rawJson);
+        if (parsedTree) {
+          const finalTree = llmTreeToMindMapTree(parsedTree, doc);
+          const patches = buildDiffPatches(workingTree, finalTree);
+          for (const patch of patches) {
+            workingTree = applyTreePatch(workingTree, patch);
+            if (patch.type === 'add') {
+              yield { type: 'node', data: { patch, node: patch.node } };
+            }
+          }
+          yield { type: 'complete', data: { tree: finalTree } };
+          return;
+        }
+      } catch (hunyuanError) {
+        const errMsg = hunyuanError instanceof Error ? hunyuanError.message : '混元搜索增强失败';
+        console.warn(`[MindMap] 腾讯混元搜索增强生成微信文章思维导图失败，降级：${errMsg}`);
+      }
+    }
+  }
+
+  // 降级：智谱AI联网搜索
+  if (isWeChatUrl && llmConfig.resolvedProvider === 'zhipu' && llmConfig.apiKey) {
+    let workingTree = buildHeuristicMindMapTree(doc);
+    yield { type: 'skeleton', data: { tree: workingTree } };
+
+    try {
+      const { json: rawJson } = await generateWeChatMindMapViaZhipuWebSearch(
+        doc.sourceMeta.sourceUrl!,
+        { model: llmConfig.model },
+      );
+
+      const parsedTree = parseLLMTreeFromText(rawJson);
+      if (parsedTree) {
+        const finalTree = llmTreeToMindMapTree(parsedTree, doc);
+
+        // 发送增量补丁
+        const patches = buildDiffPatches(workingTree, finalTree);
+        for (const patch of patches) {
+          workingTree = applyTreePatch(workingTree, patch);
+          if (patch.type === 'add') {
+            yield { type: 'node', data: { patch, node: patch.node } };
+          }
+        }
+
+        yield { type: 'complete', data: { tree: finalTree } };
+        return;
+      }
+      // JSON 解析失败，降级到普通流程
+    } catch (zhipuWebSearchError) {
+      // 联网生成失败，降级到普通流程
+      const errMsg = zhipuWebSearchError instanceof Error ? zhipuWebSearchError.message : '智谱AI联网生成失败';
+      // 不抛出错误，降级继续走普通流程
+      console.warn(`[MindMap] 智谱AI联网生成微信文章思维导图失败，降级到普通流程：${errMsg}`);
+    }
   }
 
   const model = llmConfig.model;
@@ -1121,6 +1765,7 @@ export async function* generateMindMapStream(
     const result = streamObject({
       model: languageModel,
       schema: llmTreeSchema,
+      system: ANTI_HALLUCINATION_SYSTEM,
       prompt,
       maxRetries: requestConfig.maxRetries,
       timeout: requestConfig.timeoutMs,

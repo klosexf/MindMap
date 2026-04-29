@@ -1,6 +1,6 @@
 'use client';
 
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef } from 'react';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Graph } from '@antv/g6';
 
 import type { MindMapTree } from '@/lib/types/mindmap';
@@ -10,12 +10,14 @@ import { createLayerRenderer, selectRenderMode } from '@/lib/utils/renderer';
 
 export interface MindMapEditorRef {
   exportPngDataUrl: () => Promise<string | null>;
+  startEditingNode: (nodeId: string) => void;
 }
 
 interface MindMapEditorProps {
   tree: MindMapTree;
   selectedNodeId: string | null;
   onSelectNode: (id: string | null) => void;
+  onUpdateNodeContent: (id: string, content: string) => void;
 }
 
 const _canvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
@@ -93,14 +95,132 @@ function getNodeTextMetrics(datum: { id?: string; data?: { label?: string } }, r
 }
 
 export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(function MindMapEditor(
-  { tree, selectedNodeId, onSelectNode },
+  { tree, selectedNodeId, onSelectNode, onUpdateNodeContent },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const graphRef = useRef<Graph | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const nodeCount = useMemo(() => countNodes(tree.root), [tree]);
   const renderMode = useMemo(() => selectRenderMode(nodeCount), [nodeCount]);
+
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [editRect, setEditRect] = useState<DOMRect | null>(null);
+
+  const commitEdit = useCallback(
+    (value: string) => {
+      if (editingNodeId && value.trim()) {
+        onUpdateNodeContent(editingNodeId, value.trim());
+      }
+      setEditingNodeId(null);
+      setEditValue('');
+      setEditRect(null);
+    },
+    [editingNodeId, onUpdateNodeContent],
+  );
+
+  const cancelEdit = useCallback(() => {
+    setEditingNodeId(null);
+    setEditValue('');
+    setEditRect(null);
+  }, []);
+
+  /** Compute the screen position of a node and open the inline editor */
+  const startEditingNode = useCallback(
+    (nodeId: string) => {
+      const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
+      if (!graph || graph.destroyed) return;
+
+      const nodeData = graph.getNodeData(nodeId);
+      if (!nodeData) return;
+
+      const label = (nodeData.data?.label as string) || '';
+      setEditValue(label);
+      setEditingNodeId(nodeId);
+
+      // Strategy 1: getElementRenderBounds + getClientByCanvas
+      // Strategy 2: find SVG DOM element by node ID
+      // Strategy 3: fallback to canvas center
+      requestAnimationFrame(() => {
+        const container = containerRef.current;
+        if (!container) return;
+
+        const canvasEl = container.querySelector('canvas') || container.querySelector('svg');
+        if (!canvasEl) return;
+
+        let rect: DOMRect | null = null;
+
+        // --- Strategy 1: use G6's coordinate API ---
+        try {
+          const bounds = graph.getElementRenderBounds(nodeId);
+          if (bounds) {
+            const minX = Math.min(bounds.min[0], bounds.max[0]);
+            const minY = Math.min(bounds.min[1], bounds.max[1]);
+            const maxX = Math.max(bounds.min[0], bounds.max[0]);
+            const maxY = Math.max(bounds.min[1], bounds.max[1]);
+            const w = maxX - minX;
+            const h = maxY - minY;
+
+            // Convert canvas (graph) coords to browser client coords
+            const topLeft = graph.getClientByCanvas([minX, minY]);
+            const bottomRight = graph.getClientByCanvas([maxX, maxY]);
+
+            if (topLeft && bottomRight) {
+              const [tlX, tlY] = Array.isArray(topLeft) ? topLeft : [0, 0];
+              const [brX, brY] = Array.isArray(bottomRight) ? bottomRight : [0, 0];
+              rect = new DOMRect(
+                tlX,
+                tlY,
+                brX - tlX || w,
+                brY - tlY || h,
+              );
+            }
+          }
+        } catch {
+          // Strategy 1 failed
+        }
+
+        // --- Strategy 2: find the node's SVG group element ---
+        if (!rect) {
+          const svgEl = container.querySelector('svg');
+          if (svgEl) {
+            // G6 SVG renderer assigns node IDs as element IDs
+            const selectors = [
+              `[id="${nodeId}"]`,
+              `g[id="${nodeId}"]`,
+            ];
+            for (const sel of selectors) {
+              try {
+                const el = svgEl.querySelector(sel);
+                if (el) {
+                  rect = el.getBoundingClientRect();
+                  break;
+                }
+              } catch {
+                // invalid selector, skip
+              }
+            }
+          }
+        }
+
+        // --- Strategy 3: fallback to canvas center ---
+        if (!rect) {
+          const canvasRect = canvasEl.getBoundingClientRect();
+          rect = new DOMRect(
+            canvasRect.left + canvasRect.width / 2 - 120,
+            canvasRect.top + canvasRect.height / 2 - 22,
+            240,
+            44,
+          );
+        }
+
+        setEditRect(rect);
+      });
+    },
+    [tree.root.id],
+  );
 
   useImperativeHandle(ref, () => ({
     exportPngDataUrl: async () => {
@@ -108,6 +228,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       if (!graph || graph.destroyed) return null;
       return graph.toDataURL({ mode: 'overall', type: 'image/png', encoderOptions: 1 });
     },
+    startEditingNode,
   }));
 
   useEffect(() => {
@@ -178,6 +299,14 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       onSelectNode(evt?.target?.id ?? null);
     });
 
+    graph.on('node:dblclick', (evt: any) => {
+      const nodeId = evt?.target?.id ?? null;
+      if (nodeId) {
+        onSelectNode(nodeId);
+        startEditingNode(nodeId);
+      }
+    });
+
     graph.render();
     graph.fitView();
     graphRef.current = graph;
@@ -189,7 +318,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       }
       graphRef.current = null;
     };
-  }, [onSelectNode, renderMode, tree]);
+  }, [onSelectNode, renderMode, tree, startEditingNode]);
 
   useEffect(() => {
     const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
@@ -198,6 +327,11 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     graph.focusElement(selectedNodeId, true);
   }, [selectedNodeId]);
 
+  const isRoot = editingNodeId === tree.root.id;
+  const metrics = editingNodeId
+    ? getNodeTextMetrics({ id: editingNodeId, data: { label: editValue } }, tree.root.id)
+    : null;
+
   return (
     <div className="editor-wrap">
       <div className="editor-meta">
@@ -205,6 +339,46 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
         <span>渲染模式: {renderMode.toUpperCase()}</span>
       </div>
       <div ref={containerRef} className="editor-canvas" />
+      {editingNodeId && editRect && (
+        <div
+          className="node-inline-editor"
+          style={{
+            position: 'fixed',
+            left: editRect.left,
+            top: editRect.top,
+            width: editRect.width,
+            height: editRect.height,
+            zIndex: 100,
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <textarea
+            ref={textareaRef}
+            className="node-inline-textarea"
+            value={editValue}
+            onChange={(e) => setEditValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                commitEdit(editValue);
+              }
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelEdit();
+              }
+              // Prevent G6 keyboard handlers from interfering
+              e.stopPropagation();
+            }}
+            onBlur={() => commitEdit(editValue)}
+            style={{
+              fontSize: metrics?.fontSize ?? (isRoot ? 14 : 12),
+              fontWeight: metrics?.fontWeight ?? (isRoot ? 600 : 500),
+              lineHeight: `${metrics?.lineHeight ?? (isRoot ? 22 : 19)}px`,
+            }}
+            autoFocus
+          />
+        </div>
+      )}
     </div>
   );
 });

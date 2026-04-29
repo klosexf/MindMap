@@ -163,13 +163,7 @@ export function EditorPage({ id }: EditorPageProps) {
 
   function renameNode() {
     if (!tree || !selectedNodeId) return;
-    const node = findNodeById(tree.root, selectedNodeId);
-    if (!node) return;
-
-    const value = window.prompt('修改节点文本', node.content);
-    if (value?.trim()) {
-      updateNodeContent(selectedNodeId, value.trim());
-    }
+    editorRef.current?.startEditingNode(selectedNodeId);
   }
 
   if (loading) {
@@ -242,7 +236,13 @@ export function EditorPage({ id }: EditorPageProps) {
             onExportPng={exportPng}
           />
 
-          <MindMapEditor ref={editorRef} tree={tree} selectedNodeId={selectedNodeId} onSelectNode={setSelectedNode} />
+          <MindMapEditor
+            ref={editorRef}
+            tree={tree}
+            selectedNodeId={selectedNodeId}
+            onSelectNode={setSelectedNode}
+            onUpdateNodeContent={updateNodeContent}
+          />
         </div>
       </section>
     </main>

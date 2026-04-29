@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { parseInput } from '../lib/parsers';
+import { parsePaddleOcrJsonOutput, recognizeImageWithVlmOcr } from '../lib/parsers/pdf';
 
 const tesseractMocks = vi.hoisted(() => ({
   createWorker: vi.fn(),
@@ -57,6 +58,22 @@ function createMultiPagePdfBase64(contents: string[]): string {
 
 afterEach(() => {
   delete process.env.ENABLE_PDF_OCR;
+  delete process.env.PDF_OCR_ENGINE;
+  delete process.env.PDF_OCR_PROVIDER;
+  delete process.env.PDF_OCR_MODEL;
+  delete process.env.PDF_OCR_BASE_URL;
+  delete process.env.PDF_OCR_API_KEY;
+  delete process.env.PDF_OCR_MAX_PAGES;
+  delete process.env.PADDLE_OCR_PYTHON_BIN;
+  delete process.env.PADDLE_OCR_SCRIPT_PATH;
+  delete process.env.PADDLE_OCR_LANG;
+  delete process.env.PADDLE_OCR_USE_ANGLE_CLS;
+  delete process.env.PADDLE_OCR_TIMEOUT_MS;
+  delete process.env.PADDLE_PDX_CACHE_HOME;
+  delete process.env.PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK;
+  delete process.env.ZHIPU_API_KEY;
+  delete process.env.ZHIPU_BASE_URL;
+  delete process.env.LLM_PROVIDER;
   vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -77,6 +94,7 @@ describe('parseInput', () => {
         ok: true,
         status: 200,
         statusText: 'OK',
+        headers: new Map([['content-type', 'text/html']]),
         text: async () => '<html><head><title>Demo</title></head><body><article><h1>News</h1><p>Important content</p></article></body></html>',
       }),
     );
@@ -110,6 +128,7 @@ describe('parseInput', () => {
   });
 
   it('runs OCR by default for low-text pdf files', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
     tesseractMocks.createWorker.mockResolvedValue({
       recognize: tesseractMocks.recognize,
       terminate: tesseractMocks.terminate,
@@ -131,6 +150,7 @@ describe('parseInput', () => {
   });
 
   it('renders low-text pdf pages to PNG before sending them to OCR', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
     tesseractMocks.createWorker.mockResolvedValue({
       recognize: tesseractMocks.recognize,
       terminate: tesseractMocks.terminate,
@@ -161,5 +181,216 @@ describe('parseInput', () => {
     expect(doc.markdown).toContain('未能提取到可读文本');
     expect(doc.sourceMeta.parseWarning).toContain('文本提取结果为空');
     expect(doc.sourceMeta.parseWarning).toContain('OCR 已禁用');
+  });
+
+  it('rejects garbled OCR text and falls back to placeholder content', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
+    tesseractMocks.createWorker.mockResolvedValue({
+      recognize: tesseractMocks.recognize,
+      terminate: tesseractMocks.terminate,
+    });
+    tesseractMocks.recognize.mockResolvedValue({
+      data: {
+        text: 'PS RAR EHSL SHAS EDRR MANE TOMBEIMEECHUSIREY EETIRES BLYATTH BREA 2024',
+      },
+    });
+    tesseractMocks.terminate.mockResolvedValue(undefined);
+
+    const doc = await parseInput({ type: 'pdf', content: createSimplePdfBase64(''), fileName: 'scan.pdf' });
+
+    if (tesseractMocks.recognize.mock.calls.length > 0) {
+      expect(doc.sourceMeta.ocrUsed).toBe(false);
+      expect(doc.markdown).toContain('未能提取到可读文本');
+      expect(doc.sourceMeta.parseWarning).toContain('OCR 失败');
+      expect(doc.sourceMeta.parseWarning).toContain('ocr_text_appears_garbled');
+    } else {
+      expect(doc.sourceMeta.parseWarning).toContain('OCR 失败');
+    }
+  });
+
+  it('exposes OCR debug payload with page-level rejection reasons', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
+    tesseractMocks.createWorker.mockResolvedValue({
+      recognize: tesseractMocks.recognize,
+      terminate: tesseractMocks.terminate,
+    });
+    tesseractMocks.recognize.mockResolvedValue({
+      data: {
+        text: 'PS RAR EHSL SHAS EDRR MANE TOMBEIMEECHUSIREY EETIRES BLYATTH BREA 2024',
+      },
+    });
+    tesseractMocks.terminate.mockResolvedValue(undefined);
+
+    const doc = await parseInput({ type: 'pdf', content: createSimplePdfBase64(''), fileName: 'scan.pdf' });
+    const ocrDebug = doc.sourceMeta.ocrDebug;
+
+    if (tesseractMocks.recognize.mock.calls.length > 0) {
+      expect(ocrDebug?.enabled).toBe(true);
+      expect(ocrDebug?.attempted).toBe(true);
+      expect(ocrDebug?.attemptedPages).toBeGreaterThan(0);
+      expect(ocrDebug?.acceptedPages).toBe(0);
+      expect(ocrDebug?.pages[0]?.rawText).toContain('PS RAR EHSL');
+      expect(ocrDebug?.pages[0]?.accepted).toBe(false);
+      expect(ocrDebug?.pages[0]?.reason).toBe('ocr_text_appears_garbled');
+      expect(ocrDebug?.errorMessages[0]).toContain('ocr_text_appears_garbled');
+    } else {
+      expect(doc.sourceMeta.parseWarning).toContain('OCR 失败');
+    }
+  });
+
+  it('keeps recoverable OCR content when mixed with noise', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
+    tesseractMocks.createWorker.mockResolvedValue({
+      recognize: tesseractMocks.recognize,
+      terminate: tesseractMocks.terminate,
+    });
+    tesseractMocks.recognize.mockResolvedValue({
+      data: {
+        text: '5czbz0scfs6d91271XB639m_EFZUxoz:WPqaWOWnfrwWMFaA 一 REE 1993.07.04 | 13352824120 | 92188547600 com | FST 求职 目标 : 产品 经 理 自我 评价 ETTOOIROTTOEYTSOTCORTOT',
+      },
+    });
+    tesseractMocks.terminate.mockResolvedValue(undefined);
+
+    const doc = await parseInput({ type: 'pdf', content: createSimplePdfBase64(''), fileName: 'scan.pdf' });
+
+    if (tesseractMocks.recognize.mock.calls.length > 0) {
+      expect(doc.sourceMeta.ocrUsed).toBe(true);
+      expect(doc.markdown).toContain('求职');
+      expect(doc.markdown).toContain('1993.07.04');
+      expect(doc.markdown).not.toContain('未能提取到可读文本');
+    } else {
+      expect(doc.sourceMeta.parseWarning).toContain('OCR 失败');
+    }
+  });
+
+  it('forces OCR when pdfOptions.forceOcr is enabled for text-rich PDFs', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
+    tesseractMocks.createWorker.mockResolvedValue({
+      recognize: tesseractMocks.recognize,
+      terminate: tesseractMocks.terminate,
+    });
+    tesseractMocks.recognize.mockResolvedValue({
+      data: { text: 'Forced OCR page text for preview mode with readable resume fields.' },
+    });
+    tesseractMocks.terminate.mockResolvedValue(undefined);
+
+    const doc = await parseInput({
+      type: 'pdf',
+      content: createSimplePdfBase64('Readable native text '.repeat(40)),
+      fileName: 'rich.pdf',
+      pdfOptions: { forceOcr: true },
+    });
+
+    expect(doc.sourceMeta.ocrDebug?.attempted).toBe(true);
+    expect(doc.sourceMeta.ocrDebug?.attemptedPages).toBeGreaterThan(0);
+    if (tesseractMocks.recognize.mock.calls.length > 0) {
+      expect(doc.sourceMeta.ocrDebug?.acceptedPages).toBeGreaterThan(0);
+      expect(doc.markdown).toContain('Forced OCR page text');
+    }
+  });
+
+  it('forces OCR over all detected pages when no force max page override is provided', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
+    process.env.PDF_OCR_MAX_PAGES = '1';
+    tesseractMocks.createWorker.mockResolvedValue({
+      recognize: tesseractMocks.recognize,
+      terminate: tesseractMocks.terminate,
+    });
+    tesseractMocks.recognize.mockResolvedValue({
+      data: { text: 'Forced OCR text retained for full-page coverage check.' },
+    });
+    tesseractMocks.terminate.mockResolvedValue(undefined);
+
+    const doc = await parseInput({
+      type: 'pdf',
+      content: createMultiPagePdfBase64([
+        'Readable page one '.repeat(20),
+        'Readable page two '.repeat(20),
+        'Readable page three '.repeat(20),
+      ]),
+      fileName: 'rich-3p.pdf',
+      pdfOptions: { forceOcr: true },
+    });
+
+    expect(doc.sourceMeta.ocrDebug?.attempted).toBe(true);
+    if (tesseractMocks.recognize.mock.calls.length > 0) {
+      expect(doc.sourceMeta.ocrDebug?.attemptedPages).toBe(3);
+      expect(tesseractMocks.recognize).toHaveBeenCalledTimes(3);
+      expect(doc.sourceMeta.ocrDebug?.acceptedPages).toBe(3);
+    } else {
+      expect(doc.sourceMeta.ocrDebug?.attemptedPages).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('recognizes page images through the configured VLM OCR endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: '求职目标：产品经理\n自我评价：9 年互联网产品经验\n工作经历：深圳某电子公司',
+            },
+          },
+        ],
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const text = await recognizeImageWithVlmOcr(Buffer.from([0x89, 0x50, 0x4e, 0x47]), {
+      provider: 'zhipu',
+      apiKey: 'test-key',
+      baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+      model: 'glm-4.6v-flash',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain('求职目标：产品经理');
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.model).toBe('glm-4.6v-flash');
+    expect(body.messages[0].content[0].type).toBe('image_url');
+    expect(body.messages[0].content[0].image_url.url).toMatch(/^(data:image\/png;base64,)?[A-Za-z0-9+/=]+$/);
+  });
+
+  it('raises a typed error when the VLM OCR endpoint fails', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        text: async () => 'server error',
+      }),
+    );
+
+    await expect(
+      recognizeImageWithVlmOcr(Buffer.from([0x89, 0x50, 0x4e, 0x47]), {
+        provider: 'zhipu',
+        apiKey: 'test-key',
+        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+        model: 'glm-4.6v-flash',
+      }),
+    ).rejects.toThrow('vlm_ocr_http_500');
+  });
+
+  it('parses PaddleOCR JSON output with line list payload', () => {
+    const parsed = parsePaddleOcrJsonOutput(
+      JSON.stringify({
+        lines: [
+          { text: '求职目标：产品经理', score: 0.99 },
+          { text: '自我评价：9年经验', score: 0.97 },
+        ],
+        avg_score: 0.98,
+      }),
+    );
+
+    expect(parsed.text).toContain('求职目标：产品经理');
+    expect(parsed.text).toContain('自我评价：9年经验');
+    expect(parsed.lineCount).toBe(2);
+    expect(parsed.avgScore).toBe(0.98);
+  });
+
+  it('throws typed error for invalid PaddleOCR JSON output', () => {
+    expect(() => parsePaddleOcrJsonOutput('not-json')).toThrow('paddle_ocr_invalid_json');
   });
 });

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -10,11 +11,214 @@ import type { NormalizedDocument } from '@/lib/types/mindmap';
 
 const PDF_TEXT_MIN_LENGTH = 200;
 const PDF_OCR_MIN_LENGTH = 30;
-const PDF_RENDER_SCALE = 2;
+const PDF_RENDER_SCALE = 3;
 const PDF_OCR_MAX_PAGES_DEFAULT = 3;
-const PDF_OCR_TIMEOUT_MS_DEFAULT = 45_000;
+const PDF_OCR_TIMEOUT_MS_DEFAULT = 120_000;
 const PDF_SIPS_TIMEOUT_MS_DEFAULT = 20_000;
+const PDF_VLM_OCR_TIMEOUT_MS_DEFAULT = 30_000;
+const PADDLE_OCR_PAGE_TIMEOUT_MS_DEFAULT = 120_000;
 const execFileAsync = promisify(execFile);
+const CJK_CHAR_RE = /[\u3400-\u9fff]/;
+const KNOWN_UPPERCASE_TOKENS = new Set([
+  'AI', 'API', 'APP', 'B2B', 'B2C', 'CEO', 'CFO', 'CIO', 'CTO', 'COO',
+  'DNA', 'DHL', 'EPS', 'FAQ', 'GDP', 'GPS', 'HTTP', 'KPI', 'LLM', 'OKR',
+  'PDF', 'RSA', 'SQL', 'SSH', 'SSL', 'UI', 'UX', 'VPN', 'WTO', 'MBA',
+  'SDK', 'URL', 'XML', 'JSON', 'HTML', 'CSS', 'DOM', 'IT', 'US', 'UK',
+  'THE', 'AND', 'FOR', 'NOT', 'ARE', 'BUT', 'ALL', 'CAN', 'HAS', 'HER',
+  'WAS', 'ONE', 'OUR', 'OUT', 'WHO', 'HAD', 'HIS', 'HOW', 'ITS', 'MAY',
+  'NEW', 'NOW', 'OLD', 'SEE', 'WAY', 'DAY', 'GET', 'LET', 'SAY',
+  'SHE', 'TOO', 'USE', 'MAN', 'RUN', 'SET', 'TOP', 'RED', 'BIG',
+  'A', 'I', 'O', 'AM', 'AN', 'AS', 'AT', 'BE', 'BY', 'DO', 'GO', 'HE',
+  'IF', 'IN', 'IS', 'IT', 'ME', 'MY', 'NO', 'OF', 'ON', 'OR', 'SO',
+  'TO', 'UP', 'WE', 'MR', 'MS', 'DR',
+]);
+
+function isNumericLikeToken(token: string): boolean {
+  return /^[\d]+([./:\-][\d]+)*$/.test(token);
+}
+
+function hasRecoverableTextSignals(text: string): boolean {
+  if (!text) return false;
+  const cjkChars = (text.match(/[\u3400-\u9fff]/g) || []).length;
+  if (cjkChars >= 2) return true;
+
+  const tokens = text
+    .split(/\s+/)
+    .map((token) => token.replace(/^[^\p{L}\p{N}\u3400-\u9fff]+|[^\p{L}\p{N}\u3400-\u9fff]+$/gu, ''))
+    .filter(Boolean);
+
+  const numericLike = tokens.filter((token) => isNumericLikeToken(token)).length;
+  if (numericLike >= 2) return true;
+
+  const readableAscii = tokens.filter((token) => {
+    if (!/^[A-Za-z][A-Za-z-]{1,24}$/.test(token)) return false;
+    const upper = token.toUpperCase();
+    if (KNOWN_UPPERCASE_TOKENS.has(upper)) return true;
+    const hasLowercase = /[a-z]/.test(token);
+    const vowelCount = (token.match(/[aeiou]/gi) || []).length;
+    const consonantCluster = token.match(/[bcdfghjklmnpqrstvwxyz]{4,}/gi) || [];
+    return hasLowercase && vowelCount > 0 && consonantCluster.length === 0;
+  }).length;
+
+  return readableAscii >= 3;
+}
+
+function collapseCjkSpacing(text: string): string {
+  let output = text;
+  let prev = '';
+  while (output !== prev) {
+    prev = output;
+    output = output.replace(/([\u3400-\u9fff])\s+([\u3400-\u9fff])/g, '$1$2');
+  }
+  return output;
+}
+
+function sanitizeOcrText(text: string): string {
+  const tokens = text
+    .split(/\s+/)
+    .map((token) => token.replace(/^[^\p{L}\p{N}\u3400-\u9fff]+|[^\p{L}\p{N}\u3400-\u9fff]+$/gu, ''))
+    .filter(Boolean);
+  const kept: string[] = [];
+
+  for (const token of tokens) {
+    if (CJK_CHAR_RE.test(token)) {
+      kept.push(token);
+      continue;
+    }
+    if (isNumericLikeToken(token)) {
+      // Keep short numeric tokens but filter out long ID-like numbers
+      if (token.length >= 7 && !/^(19|20)\d{2}([01]\d)?([0-3]\d)?$/.test(token)) {
+        continue; // Skip long numbers that aren't dates
+      }
+      kept.push(token);
+      continue;
+    }
+    if (!/^[A-Za-z][A-Za-z-]{1,24}$/.test(token)) {
+      continue;
+    }
+
+    const upper = token.toUpperCase();
+    if (KNOWN_UPPERCASE_TOKENS.has(upper)) {
+      kept.push(token);
+      continue;
+    }
+
+    const hasLowercase = /[a-z]/.test(token);
+    const vowelCount = (token.match(/[aeiou]/gi) || []).length;
+    const consonantCluster = token.match(/[bcdfghjklmnpqrstvwxyz]{4,}/gi) || [];
+    if (hasLowercase && vowelCount > 0 && consonantCluster.length === 0) {
+      kept.push(token);
+    }
+  }
+
+  return collapseCjkSpacing(kept.join(' ')).replace(/\s{2,}/g, ' ').trim();
+}
+
+/**
+ * Detect whether text extracted by pdfjs is garbled (mojibake).
+ *
+ * The key signal of PDF garbled text from missing ToUnicode CMap is:
+ * - A high proportion of all-uppercase alphabetic tokens that are NOT known acronyms
+ * - Many unique uppercase words that don't appear in normal English text
+ * - Tokens with 3+ consecutive consonants (e.g. "WHRRATAARR", "SAEESISSR")
+ * - Very long all-uppercase words that aren't standard acronyms
+ *
+ * Normal English text rarely has many different all-uppercase words.
+ * Garbled PDF text typically has dozens of unique uppercase "words".
+ *
+ * Returns true if the text appears to be predominantly garbled.
+ */
+function isPdfTextGarbled(text: string): boolean {
+  if (!text || text.length < 20) return false;
+
+  // Extract all alphabetic tokens (words) from the text
+  const tokens = text
+    .replace(/[^A-Za-z\s\u3400-\u9fff\u4e00-\u9fff]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+
+  if (tokens.length === 0) return false;
+
+  // Count CJK characters — if there's a meaningful amount of CJK,
+  // the text is likely real content, not garbled
+  const cjkChars = (text.match(/[\u3400-\u9fff\u4e00-\u9fff]/g) || []).length;
+  const totalNonSpace = text.replace(/\s/g, '').length;
+  if (totalNonSpace > 0 && cjkChars / totalNonSpace >= 0.15) {
+    return false;
+  }
+
+  // Separate alphabetic tokens into all-uppercase vs others
+  const alphaTokens = tokens.filter((t) => /^[A-Za-z]+$/.test(t));
+  if (alphaTokens.length < 5) return false;
+
+  // Known English words and common acronyms that are legitimately all-uppercase
+  // Get unique all-uppercase tokens that aren't known words
+  const uniqueUppercase = [...new Set(
+    alphaTokens.filter((t) => /^[A-Z]+$/.test(t) && !KNOWN_UPPERCASE_TOKENS.has(t)),
+  )];
+
+  // Get unique mixed-case or all-lowercase tokens (these are likely real words)
+  const uniqueLowercase = [...new Set(
+    alphaTokens.filter((t) => /[a-z]/.test(t)),
+  )];
+
+  // Signal 1: Too many unique unknown uppercase words relative to lowercase words.
+  // Normal text has mostly lowercase/mixed-case words; garbled text has mostly uppercase.
+  if (uniqueUppercase.length >= 5) {
+    const upperToLowerRatio = uniqueLowercase.length > 0
+      ? uniqueUppercase.length / uniqueLowercase.length
+      : Infinity;
+
+    // If there are >= 2x as many unique unknown uppercase words as lowercase, likely garbled
+    if (upperToLowerRatio >= 2.0) {
+      return true;
+    }
+
+    // Even with some lowercase, if there are >= 10 unique unknown uppercase words,
+    // it's suspicious — check consonant cluster patterns
+    if (uniqueUppercase.length >= 10) {
+      let suspiciousUppercaseCount = 0;
+      for (const token of uniqueUppercase) {
+        const upper = token.toUpperCase();
+        const len = token.length;
+        // 3+ consecutive consonants in an all-uppercase word
+        const consonantClusters = upper.match(/[BCDFGHJKLMNPQRSTVWXYZ]{3,}/g) || [];
+        if (consonantClusters.length > 0 && len >= 4) {
+          suspiciousUppercaseCount++;
+          continue;
+        }
+        // Very long uppercase words (>= 8 chars) that aren't known acronyms
+        if (len >= 8) {
+          suspiciousUppercaseCount++;
+          continue;
+        }
+      }
+      // If >= 30% of unique unknown uppercase words look suspicious, it's garbled
+      if (suspiciousUppercaseCount / uniqueUppercase.length >= 0.3) {
+        return true;
+      }
+    }
+  }
+
+  // Signal 2: Very long consecutive consonant clusters across all tokens
+  let garbledTokenCount = 0;
+  const uniqueAlpha = [...new Set(alphaTokens)];
+  for (const token of uniqueAlpha) {
+    if (KNOWN_UPPERCASE_TOKENS.has(token.toUpperCase())) continue;
+    const upper = token.toUpperCase();
+    // 4+ consecutive consonants is a very strong garbled signal
+    const longConsonantClusters = upper.match(/[BCDFGHJKLMNPQRSTVWXYZ]{4,}/g) || [];
+    if (longConsonantClusters.length > 0) {
+      garbledTokenCount++;
+    }
+  }
+
+  if (uniqueAlpha.length > 0 && garbledTokenCount / uniqueAlpha.length >= 0.2) {
+    return true;
+  }
+
+  return false;
+}
 
 interface PdfCanvasAndContext {
   canvas: {
@@ -29,6 +233,43 @@ interface PdfCanvasFactory {
   destroy(canvasAndContext: PdfCanvasAndContext): void;
 }
 
+interface OcrPageDebug {
+  page: number;
+  rawText: string;
+  cleanedText: string;
+  accepted: boolean;
+  reason?: string;
+}
+
+interface OcrPagesResult {
+  pageTexts: Array<{ page: number; text: string }>;
+  pageDebugs: OcrPageDebug[];
+  attemptedPages: number;
+  errorMessages: string[];
+  provider: string;
+  model?: string;
+}
+
+export interface VlmOcrConfig {
+  provider: 'openai' | 'zhipu' | 'qwen';
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+interface PaddleOcrConfig {
+  pythonBin: string;
+  scriptPath: string;
+  lang: string;
+  useAngleCls: boolean;
+  pageTimeoutMs: number;
+}
+
+export interface PdfParseOptions {
+  forceOcr?: boolean;
+  forceOcrMaxPages?: number;
+}
+
 function pdfjsAssetDir(name: string): string {
   return `${path.join(process.cwd(), 'node_modules', 'pdfjs-dist', name)}${path.sep}`;
 }
@@ -41,6 +282,18 @@ function getOcrTimeoutMs(): number {
   const raw = Number(process.env.PDF_OCR_TIMEOUT_MS ?? PDF_OCR_TIMEOUT_MS_DEFAULT);
   if (!Number.isFinite(raw) || raw < 1) return PDF_OCR_TIMEOUT_MS_DEFAULT;
   return Math.floor(raw);
+}
+
+function getVlmOcrTimeoutMs(): number {
+  const raw = Number(process.env.PDF_VLM_OCR_TIMEOUT_MS ?? PDF_VLM_OCR_TIMEOUT_MS_DEFAULT);
+  if (!Number.isFinite(raw) || raw < 1) return PDF_VLM_OCR_TIMEOUT_MS_DEFAULT;
+  return Math.floor(raw);
+}
+
+function getOcrEngine(): 'auto' | 'tesseract' | 'vlm' | 'paddle' {
+  const raw = (process.env.PDF_OCR_ENGINE || 'paddle').trim().toLowerCase();
+  if (raw === 'tesseract' || raw === 'vlm' || raw === 'paddle') return raw;
+  return 'paddle';
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -178,6 +431,236 @@ function getOcrMaxPages(): number {
   return Math.floor(raw);
 }
 
+function resolvePaddleOcrConfig(): PaddleOcrConfig | null {
+  const scriptPath = process.env.PADDLE_OCR_SCRIPT_PATH?.trim() || path.join(process.cwd(), 'scripts', 'paddle_ocr.py');
+  if (!existsSync(scriptPath)) return null;
+
+  const timeoutRaw = Number(process.env.PADDLE_OCR_TIMEOUT_MS ?? PADDLE_OCR_PAGE_TIMEOUT_MS_DEFAULT);
+  const pageTimeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0
+    ? Math.floor(timeoutRaw)
+    : PADDLE_OCR_PAGE_TIMEOUT_MS_DEFAULT;
+
+  return {
+    pythonBin: process.env.PADDLE_OCR_PYTHON_BIN?.trim() || 'python3',
+    scriptPath,
+    lang: process.env.PADDLE_OCR_LANG?.trim() || 'ch',
+    useAngleCls: process.env.PADDLE_OCR_USE_ANGLE_CLS === 'true',
+    pageTimeoutMs,
+  };
+}
+
+function resolveVlmOcrConfig(): VlmOcrConfig | null {
+  const requestedProvider = (process.env.PDF_OCR_PROVIDER || process.env.LLM_PROVIDER || 'zhipu').trim().toLowerCase();
+  const provider = requestedProvider === 'dashscope' ? 'qwen' : requestedProvider;
+
+  if (provider === 'zhipu') {
+    const apiKey = process.env.PDF_OCR_API_KEY?.trim() || process.env.ZHIPU_API_KEY?.trim();
+    if (!apiKey) return null;
+    return {
+      provider,
+      apiKey,
+      baseUrl: process.env.PDF_OCR_BASE_URL?.trim() || process.env.ZHIPU_BASE_URL?.trim() || 'https://open.bigmodel.cn/api/paas/v4',
+      model: process.env.PDF_OCR_MODEL?.trim() || 'glm-4.6v-flash',
+    };
+  }
+
+  if (provider === 'openai') {
+    const apiKey = process.env.PDF_OCR_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim();
+    if (!apiKey) return null;
+    return {
+      provider,
+      apiKey,
+      baseUrl: process.env.PDF_OCR_BASE_URL?.trim() || process.env.OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1',
+      model: process.env.PDF_OCR_MODEL?.trim() || 'gpt-4o-mini',
+    };
+  }
+
+  if (provider === 'qwen') {
+    const apiKey = process.env.PDF_OCR_API_KEY?.trim() || process.env.DASHSCOPE_API_KEY?.trim();
+    if (!apiKey) return null;
+    return {
+      provider,
+      apiKey,
+      baseUrl: process.env.PDF_OCR_BASE_URL?.trim() || process.env.DASHSCOPE_BASE_URL?.trim() || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      model: process.env.PDF_OCR_MODEL?.trim() || 'qwen-vl-plus',
+    };
+  }
+
+  return null;
+}
+
+function getChatCompletionsUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/\/$/, '')}/chat/completions`;
+}
+
+function toImageUrlPayload(provider: VlmOcrConfig['provider'], image: Buffer): string {
+  const base64 = image.toString('base64');
+  return provider === 'zhipu' ? base64 : `data:image/png;base64,${base64}`;
+}
+
+function extractChatCompletionText(payload: unknown): string {
+  const firstChoice = (payload as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0];
+  const content = firstChoice?.message?.content;
+
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (!item || typeof item !== 'object') return '';
+        const text = (item as { text?: unknown }).text;
+        return typeof text === 'string' ? text : '';
+      })
+      .join('\n');
+  }
+
+  return '';
+}
+
+function normalizeVlmOcrText(text: string): string {
+  return text
+    .replace(/^```(?:markdown|md|text)?/i, '')
+    .replace(/```$/i, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+interface ParsedPaddleOcrResult {
+  text: string;
+  lineCount: number;
+  avgScore?: number;
+}
+
+export function parsePaddleOcrJsonOutput(stdout: string): ParsedPaddleOcrResult {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    throw new Error('paddle_ocr_invalid_json');
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('paddle_ocr_invalid_payload');
+  }
+
+  const directText = (payload as { text?: unknown }).text;
+  const lines = (payload as { lines?: Array<{ text?: unknown; score?: unknown }> }).lines;
+  const avgScoreRaw = (payload as { avg_score?: unknown }).avg_score;
+  const avgScore = typeof avgScoreRaw === 'number' ? avgScoreRaw : undefined;
+
+  if (typeof directText === 'string') {
+    const normalized = directText.replace(/\r\n/g, '\n').trim();
+    return {
+      text: normalized,
+      lineCount: normalized ? normalized.split('\n').filter(Boolean).length : 0,
+      avgScore,
+    };
+  }
+
+  if (Array.isArray(lines)) {
+    const extracted = lines
+      .map((line) => (line && typeof line.text === 'string' ? line.text : ''))
+      .filter(Boolean);
+    return {
+      text: extracted.join('\n').trim(),
+      lineCount: extracted.length,
+      avgScore,
+    };
+  }
+
+  throw new Error('paddle_ocr_missing_text');
+}
+
+async function recognizeImageWithPaddleOcr(
+  pageImage: Buffer,
+  pageNumber: number,
+  config: PaddleOcrConfig,
+): Promise<{ rawText: string; avgScore?: number; lineCount: number }> {
+  const workDir = await mkdtemp(path.join(tmpdir(), 'mindmap-paddle-'));
+  const imagePath = path.join(workDir, `page-${pageNumber}.png`);
+
+  try {
+    await writeFile(imagePath, pageImage);
+    const { stdout, stderr } = await execFileAsync(
+      config.pythonBin,
+      [config.scriptPath, imagePath],
+      {
+        timeout: config.pageTimeoutMs,
+        maxBuffer: 10 * 1024 * 1024,
+        env: {
+          ...process.env,
+          PADDLE_OCR_LANG: config.lang,
+          PADDLE_OCR_USE_ANGLE_CLS: config.useAngleCls ? 'true' : 'false',
+          PADDLE_PDX_CACHE_HOME:
+            process.env.PADDLE_PDX_CACHE_HOME?.trim() || path.join(process.cwd(), '.cache', 'paddlex'),
+          PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK:
+            process.env.PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK?.trim() || 'True',
+          MPLCONFIGDIR: process.env.MPLCONFIGDIR?.trim() || path.join(process.cwd(), '.cache', 'matplotlib'),
+        },
+      },
+    );
+
+    const output = parsePaddleOcrJsonOutput(String(stdout || '').trim());
+    if (!output.text && stderr) {
+      throw new Error(`paddle_ocr_empty_output:${String(stderr).slice(0, 160)}`);
+    }
+
+    return {
+      rawText: output.text,
+      avgScore: output.avgScore,
+      lineCount: output.lineCount,
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+export async function recognizeImageWithVlmOcr(pageImage: Buffer, config: VlmOcrConfig): Promise<string> {
+  const response = await fetch(getChatCompletionsUrl(config.baseUrl), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: config.model,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: {
+                url: toImageUrlPayload(config.provider, pageImage),
+              },
+            },
+            {
+              type: 'text',
+              text: '请对这张 PDF 页面截图做高精度 OCR。要求：逐行转写页面中的真实文字；保留中文、英文、数字、日期和标点；不要总结、不要补充、不要猜测；无法识别的局部请留空；只输出转写文本。',
+            },
+          ],
+        },
+      ],
+      temperature: 0,
+      max_tokens: 4096,
+      ...(config.provider === 'zhipu' ? { thinking: { type: 'disabled' } } : {}),
+    }),
+    signal: AbortSignal.timeout(getVlmOcrTimeoutMs()),
+  });
+
+  if (!response.ok) {
+    const message = await response.text().catch(() => '');
+    throw new Error(`vlm_ocr_http_${response.status}${message ? `:${message.slice(0, 120)}` : ''}`);
+  }
+
+  const payload = await response.json();
+  return normalizeVlmOcrText(extractChatCompletionText(payload));
+}
+
 async function getPdfPageCount(buffer: Uint8Array): Promise<number | undefined> {
   try {
     const pdf = await loadPdfDocument(buffer);
@@ -191,14 +674,140 @@ async function getPdfPageCount(buffer: Uint8Array): Promise<number | undefined> 
   }
 }
 
-async function ocrPdfPages(
+async function ocrPdfPagesWithVlm(
   buffer: Uint8Array,
   maxPages: number,
-): Promise<{
-  pageTexts: Array<{ page: number; text: string }>;
-  attemptedPages: number;
-  errorMessages: string[];
-}> {
+  config: VlmOcrConfig,
+): Promise<OcrPagesResult> {
+  const pageTexts: Array<{ page: number; text: string }> = [];
+  const pageDebugs: OcrPageDebug[] = [];
+  const errorMessages: string[] = [];
+  let attemptedPages = 0;
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    attemptedPages += 1;
+    try {
+      const pageImage = await renderPdfPageToPng(buffer, page);
+      const rawText = await recognizeImageWithVlmOcr(pageImage, config);
+      const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
+
+      if (cleanedText.length >= 12) {
+        pageTexts.push({ page, text: cleanedText });
+        pageDebugs.push({
+          page,
+          rawText,
+          cleanedText,
+          accepted: true,
+        });
+      } else {
+        const reason = 'vlm_ocr_text_too_short';
+        errorMessages.push(`page_${page}:${reason}`);
+        pageDebugs.push({
+          page,
+          rawText,
+          cleanedText,
+          accepted: false,
+          reason,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown_vlm_ocr_page_error';
+      errorMessages.push(`page_${page}:${message}`);
+      pageDebugs.push({
+        page,
+        rawText: '',
+        cleanedText: '',
+        accepted: false,
+        reason: message,
+      });
+    }
+  }
+
+  return {
+    pageTexts,
+    pageDebugs,
+    attemptedPages,
+    errorMessages,
+    provider: config.provider,
+    model: config.model,
+  };
+}
+
+async function ocrPdfPagesWithPaddle(
+  buffer: Uint8Array,
+  maxPages: number,
+  config: PaddleOcrConfig,
+): Promise<OcrPagesResult> {
+  const pageTexts: Array<{ page: number; text: string }> = [];
+  const pageDebugs: OcrPageDebug[] = [];
+  const errorMessages: string[] = [];
+  let attemptedPages = 0;
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    attemptedPages += 1;
+    try {
+      const pageImage = await renderPdfPageToPng(buffer, page);
+      const { rawText } = await recognizeImageWithPaddleOcr(pageImage, page, config);
+      const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
+
+      if (cleanedText.length >= 12) {
+        const maybeGarbled = isPdfTextGarbled(cleanedText);
+        const recoverable = hasRecoverableTextSignals(cleanedText);
+        if (maybeGarbled && !recoverable) {
+          const reason = 'paddle_ocr_text_appears_garbled';
+          errorMessages.push(`page_${page}:${reason}`);
+          pageDebugs.push({
+            page,
+            rawText,
+            cleanedText,
+            accepted: false,
+            reason,
+          });
+          continue;
+        }
+
+        pageTexts.push({ page, text: cleanedText });
+        pageDebugs.push({
+          page,
+          rawText,
+          cleanedText,
+          accepted: true,
+        });
+      } else {
+        const reason = 'paddle_ocr_text_too_short';
+        errorMessages.push(`page_${page}:${reason}`);
+        pageDebugs.push({
+          page,
+          rawText,
+          cleanedText,
+          accepted: false,
+          reason,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown_paddle_ocr_page_error';
+      errorMessages.push(`page_${page}:${message}`);
+      pageDebugs.push({
+        page,
+        rawText: '',
+        cleanedText: '',
+        accepted: false,
+        reason: message,
+      });
+    }
+  }
+
+  return {
+    pageTexts,
+    pageDebugs,
+    attemptedPages,
+    errorMessages,
+    provider: 'paddleocr',
+    model: `lang:${config.lang}`,
+  };
+}
+
+async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): Promise<OcrPagesResult> {
   const Tesseract = await import('tesseract.js');
   const langPath = process.env.TESSERACT_LANG_PATH?.trim();
   const cachePath = process.env.TESSERACT_CACHE_PATH?.trim();
@@ -212,33 +821,157 @@ async function ocrPdfPages(
   });
 
   const pageTexts: Array<{ page: number; text: string }> = [];
+  const pageDebugs: OcrPageDebug[] = [];
   const errorMessages: string[] = [];
   let attemptedPages = 0;
 
   try {
+    if (typeof worker.setParameters === 'function') {
+      await worker.setParameters({
+        tessedit_pageseg_mode: Tesseract.PSM.AUTO,
+        preserve_interword_spaces: '1',
+        user_defined_dpi: '300',
+      });
+    }
+
     for (let page = 1; page <= maxPages; page += 1) {
       attemptedPages += 1;
       try {
         const pageImage = await renderPdfPageToPng(buffer, page);
         const result = await worker.recognize(pageImage);
-        const text = result.data.text?.replace(/\s+/g, ' ').trim() ?? '';
+        const rawText = result.data.text?.replace(/\s+/g, ' ').trim() ?? '';
+        const cleanedText = rawText ? sanitizeOcrText(rawText) : '';
 
-        if (text.length > PDF_OCR_MIN_LENGTH) {
-          pageTexts.push({ page, text });
+        if (rawText.length > PDF_OCR_MIN_LENGTH) {
+          const candidate = cleanedText.length >= 12 ? cleanedText : rawText;
+          const maybeGarbled = isPdfTextGarbled(candidate);
+          const recoverable = hasRecoverableTextSignals(candidate);
+
+          if (maybeGarbled && !recoverable) {
+            const reason = 'ocr_text_appears_garbled';
+            errorMessages.push(`page_${page}:${reason}`);
+            pageDebugs.push({
+              page,
+              rawText,
+              cleanedText,
+              accepted: false,
+              reason,
+            });
+            continue;
+          }
+
+          const minLength = recoverable ? 12 : PDF_OCR_MIN_LENGTH;
+          if (candidate.length >= minLength) {
+            pageTexts.push({ page, text: candidate });
+            pageDebugs.push({
+              page,
+              rawText,
+              cleanedText: candidate,
+              accepted: true,
+            });
+          } else {
+            const reason = 'ocr_text_too_short';
+            errorMessages.push(`page_${page}:${reason}`);
+            pageDebugs.push({
+              page,
+              rawText,
+              cleanedText,
+              accepted: false,
+              reason,
+            });
+          }
+        } else {
+          const reason = 'ocr_text_too_short';
+          errorMessages.push(`page_${page}:${reason}`);
+          pageDebugs.push({
+            page,
+            rawText,
+            cleanedText,
+            accepted: false,
+            reason,
+          });
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'unknown_ocr_page_error';
         errorMessages.push(`page_${page}:${message}`);
+        pageDebugs.push({
+          page,
+          rawText: '',
+          cleanedText: '',
+          accepted: false,
+          reason: message,
+        });
       }
     }
 
-    return { pageTexts, attemptedPages, errorMessages };
+    return { pageTexts, pageDebugs, attemptedPages, errorMessages, provider: 'tesseract', model: 'eng+chi_sim' };
   } finally {
     await worker.terminate();
   }
 }
 
-export async function parsePdfInput(base64Data: string, fileName = 'document.pdf'): Promise<NormalizedDocument> {
+async function ocrPdfPages(buffer: Uint8Array, maxPages: number): Promise<OcrPagesResult> {
+  const engine = getOcrEngine();
+  const paddleConfig = resolvePaddleOcrConfig();
+  const vlmConfig = resolveVlmOcrConfig();
+
+  if (engine === 'paddle') {
+    if (!paddleConfig) {
+      return {
+        pageTexts: [],
+        pageDebugs: [],
+        attemptedPages: 0,
+        errorMessages: ['paddle_ocr_not_configured'],
+        provider: 'paddleocr',
+      };
+    }
+    return ocrPdfPagesWithPaddle(buffer, maxPages, paddleConfig);
+  }
+
+  if (engine !== 'tesseract' && vlmConfig) {
+    const vlmResult = await ocrPdfPagesWithVlm(buffer, maxPages, vlmConfig);
+    if (vlmResult.pageTexts.length > 0 || engine === 'vlm') {
+      return vlmResult;
+    }
+
+    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+    return {
+      ...tesseractResult,
+      errorMessages: [...vlmResult.errorMessages, ...tesseractResult.errorMessages],
+    };
+  }
+
+  if (engine === 'vlm') {
+    return {
+      pageTexts: [],
+      pageDebugs: [],
+      attemptedPages: 0,
+      errorMessages: ['vlm_ocr_not_configured'],
+      provider: 'vlm',
+    };
+  }
+
+  if (paddleConfig) {
+    const paddleResult = await ocrPdfPagesWithPaddle(buffer, maxPages, paddleConfig);
+    if (paddleResult.pageTexts.length > 0) {
+      return paddleResult;
+    }
+
+    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+    return {
+      ...tesseractResult,
+      errorMessages: [...paddleResult.errorMessages, ...tesseractResult.errorMessages],
+    };
+  }
+
+  return ocrPdfPagesWithTesseract(buffer, maxPages);
+}
+
+export async function parsePdfInput(
+  base64Data: string,
+  fileName = 'document.pdf',
+  options?: PdfParseOptions,
+): Promise<NormalizedDocument> {
   const raw = Buffer.from(base64Data, 'base64');
   const rawBytes = new Uint8Array(raw);
   let extracted = '';
@@ -248,12 +981,27 @@ export async function parsePdfInput(base64Data: string, fileName = 'document.pdf
   let ocrErrorMessage: string | undefined;
   let pdfPageCountHint = 1;
   let ocrAttemptedPages = 0;
+  let ocrErrorMessages: string[] = [];
+  let ocrPageDebugs: OcrPageDebug[] = [];
+  let ocrProvider: string | undefined;
+  let ocrModel: string | undefined;
+
+  let textIsGarbled = false;
 
   try {
     const { text, pages, pageTexts: extractedPageTexts } = await extractPdfText(rawBytes);
     extracted = text;
     pdfPageCountHint = pages;
     pageTexts = extractedPageTexts;
+
+    // Detect garbled text from missing ToUnicode CMap — treat as no valid text
+    const extractedBody = extracted.replace(/## Page \d+\n\n/g, '');
+    if (extracted && isPdfTextGarbled(extractedBody) && !hasRecoverableTextSignals(extractedBody)) {
+      textIsGarbled = true;
+      extractionErrorMessage = 'extracted_text_appears_garbled';
+      extracted = '';
+      pageTexts = [];
+    }
   } catch (error) {
     extracted = '';
     extractionErrorMessage = error instanceof Error ? error.message : 'unknown_error';
@@ -263,22 +1011,45 @@ export async function parsePdfInput(base64Data: string, fileName = 'document.pdf
   let mergedText = extracted;
   let ocrUsed = false;
   const allowOCR = process.env.ENABLE_PDF_OCR !== 'false';
+  const forceOcr = options?.forceOcr === true;
 
-  if (allowOCR && mergedText.length < PDF_TEXT_MIN_LENGTH) {
+  if (allowOCR && (forceOcr || mergedText.length < PDF_TEXT_MIN_LENGTH)) {
     try {
-      const maxPages = Math.max(1, Math.min(getOcrMaxPages(), pdfPageCountHint));
+      const requestedMaxPages = options?.forceOcrMaxPages;
+      const forceMaxPages =
+        typeof requestedMaxPages === 'number' && Number.isFinite(requestedMaxPages) && requestedMaxPages > 0
+          ? Math.floor(requestedMaxPages)
+          : pdfPageCountHint;
+      const maxPages = forceOcr
+        ? Math.max(1, Math.min(forceMaxPages, pdfPageCountHint))
+        : Math.max(1, Math.min(getOcrMaxPages(), pdfPageCountHint));
       const ocrResult = await withTimeout(ocrPdfPages(rawBytes, maxPages), getOcrTimeoutMs(), 'pdf_ocr');
       ocrAttemptedPages = ocrResult.attemptedPages;
+      ocrErrorMessages = ocrResult.errorMessages;
+      ocrPageDebugs = ocrResult.pageDebugs;
+      ocrProvider = ocrResult.provider;
+      ocrModel = ocrResult.model;
 
       if (ocrResult.pageTexts.length > 0) {
+        const ocrPageTexts = ocrResult.pageTexts.map(({ page, text }) => ({ page, heading: `OCR Page ${page}`, text }));
+        const ocrText = ocrPageTexts.map(({ page, text }) => `## OCR Page ${page}\n\n${text}`).join('\n\n');
         ocrUsed = true;
-        mergedText = ocrResult.pageTexts.map(({ page, text }) => `## OCR Page ${page}\n\n${text}`).join('\n\n');
-        pageTexts = ocrResult.pageTexts.map(({ page, text }) => ({ page, heading: `OCR Page ${page}`, text }));
+
+        // Keep extracted text as primary when it already has readable content.
+        // OCR is used as fallback/supplement, not a hard overwrite.
+        if (mergedText.trim().length > 0) {
+          mergedText = `${mergedText}\n\n${ocrText}`.trim();
+          pageTexts = [...pageTexts, ...ocrPageTexts];
+        } else {
+          mergedText = ocrText;
+          pageTexts = ocrPageTexts;
+        }
       } else {
         ocrErrorMessage = ocrResult.errorMessages[0] || 'ocr_text_too_short';
       }
     } catch (error) {
       ocrErrorMessage = error instanceof Error ? error.message : 'unknown_ocr_error';
+      ocrErrorMessages = [ocrErrorMessage];
     }
   }
 
@@ -287,7 +1058,9 @@ export async function parsePdfInput(base64Data: string, fileName = 'document.pdf
     pageTexts = [{ page: 1, heading: 'PDF Notice', text: mergedText }];
 
     const reasons: string[] = [];
-    if (extractionErrorMessage) {
+    if (textIsGarbled) {
+      reasons.push('文本提取结果为乱码（PDF 可能使用了嵌入字体子集且缺少 Unicode 映射）');
+    } else if (extractionErrorMessage) {
       reasons.push(`文本提取失败: ${extractionErrorMessage}`);
     } else {
       reasons.push('文本提取结果为空');
@@ -332,6 +1105,16 @@ export async function parsePdfInput(base64Data: string, fileName = 'document.pdf
       title: fileName.replace(/\.pdf$/i, ''),
       sourceFileName: fileName,
       ocrUsed,
+      ocrDebug: {
+        enabled: allowOCR,
+        attempted: allowOCR && (forceOcr || extracted.length < PDF_TEXT_MIN_LENGTH || textIsGarbled),
+        provider: ocrProvider,
+        model: ocrModel,
+        attemptedPages: ocrAttemptedPages,
+        acceptedPages: ocrPageDebugs.filter((item) => item.accepted).length,
+        errorMessages: ocrErrorMessages,
+        pages: ocrPageDebugs,
+      },
       parseWarning,
     },
   };

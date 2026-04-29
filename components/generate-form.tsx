@@ -39,7 +39,15 @@ interface MindMapJsonDebugPayload {
   };
 }
 
-type DebugMode = 'none' | 'markdown' | 'mindmapJson';
+interface OcrPreviewPayload {
+  ocrUsed: boolean;
+  parseWarning?: string;
+  ocrDebug?: NonNullable<NormalizedDocument['sourceMeta']['ocrDebug']>;
+  acceptedText: string;
+  rejectedSummary: string;
+}
+
+type DebugMode = 'none' | 'markdown' | 'mindmapJson' | 'ocrPreview';
 
 function readFileAsBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -109,6 +117,7 @@ export function GenerateForm() {
   const [debugMode, setDebugMode] = useState<DebugMode>('none');
   const [markdownDebugResult, setMarkdownDebugResult] = useState<MarkdownDebugPayload | null>(null);
   const [mindMapJsonDebugResult, setMindMapJsonDebugResult] = useState<MindMapJsonDebugPayload | null>(null);
+  const [ocrPreviewResult, setOcrPreviewResult] = useState<OcrPreviewPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [timingMarks, setTimingMarks] = useState<GenerationTimingMarks>({});
   const [timingNow, setTimingNow] = useState(Date.now());
@@ -133,12 +142,45 @@ export function GenerateForm() {
     switchMode(MODE_TABS[nextIndex].mode);
   }
 
+  const urlValidation = useMemo(() => {
+    if (mode !== 'url') return { valid: true, hint: null as string | null };
+    const trimmed = urlInput.trim();
+    if (!trimmed) return { valid: false, hint: null };
+    if (!/^https?:\/\//.test(trimmed)) {
+      return { valid: false, hint: '链接必须以 http:// 或 https:// 开头' };
+    }
+    try {
+      const urlObj = new URL(trimmed);
+      if (!['http:', 'https:'].includes(urlObj.protocol)) {
+        return { valid: false, hint: '仅支持 HTTP/HTTPS 链接' };
+      }
+      if (!urlObj.hostname.includes('.')) {
+        return { valid: false, hint: '请输入有效的域名' };
+      }
+      // 对已知反爬/拦截平台给出前置提示
+      const hostname = urlObj.hostname;
+      if (hostname.includes('mp.weixin.qq.com')) {
+        return { valid: true, hint: '提示：微信公众号文章可能无法直接抓取，如遇失败请复制文章内容到「文本」模式' };
+      }
+      if (hostname.includes('zhihu.com')) {
+        return { valid: true, hint: '提示：知乎文章可能无法直接抓取，如遇失败请复制文章内容到「文本」模式' };
+      }
+      if (hostname.includes('jianshu.com')) {
+        return { valid: true, hint: '提示：简书文章可能无法直接抓取，如遇失败请复制文章内容到「文本」模式' };
+      }
+      return { valid: true, hint: null };
+    } catch {
+      return { valid: false, hint: '链接格式不正确' };
+    }
+  }, [mode, urlInput]);
+
   const canSubmit = useMemo(() => {
     if (loading) return false;
+    if (debugMode === 'ocrPreview' && mode !== 'pdf') return false;
     if (mode === 'text') return textInput.trim().length > 0;
-    if (mode === 'url') return /^https?:\/\//.test(urlInput.trim());
+    if (mode === 'url') return urlValidation.valid && /^https?:\/\//.test(urlInput.trim());
     return Boolean(pdfFile);
-  }, [loading, mode, pdfFile, textInput, urlInput]);
+  }, [debugMode, loading, mode, pdfFile, textInput, urlInput, urlValidation.valid]);
 
   const timingLines = useMemo(() => {
     if (!timingMarks.startedAt) return [];
@@ -160,11 +202,20 @@ export function GenerateForm() {
     setError(null);
     setMarkdownDebugResult(null);
     setMindMapJsonDebugResult(null);
+    setOcrPreviewResult(null);
     setLoading(true);
     setStatus('正在解析输入内容...');
 
     try {
-      let parsePayload: { type: InputMode | 'prompt'; content: string; fileName?: string };
+      let parsePayload: {
+        type: InputMode | 'prompt';
+        content: string;
+        fileName?: string;
+        pdfOptions?: {
+          forceOcr?: boolean;
+          forceOcrMaxPages?: number;
+        };
+      };
 
       if (mode === 'text') {
         parsePayload = { type: 'text', content: textInput.trim() };
@@ -182,6 +233,7 @@ export function GenerateForm() {
           type: 'pdf',
           content: base64,
           fileName: pdfFile.name,
+          pdfOptions: debugMode === 'ocrPreview' ? { forceOcr: true } : undefined,
         };
       }
 
@@ -200,6 +252,37 @@ export function GenerateForm() {
       if (parseJson.normalizedDocument.sourceMeta.parseWarning) {
         setWarning(parseJson.normalizedDocument.sourceMeta.parseWarning);
       }
+
+      if (debugMode === 'ocrPreview') {
+        if (parseJson.normalizedDocument.sourceMeta.type !== 'pdf') {
+          throw new Error('OCR 文本预览仅支持 PDF 输入');
+        }
+        const ocrDebug = parseJson.normalizedDocument.sourceMeta.ocrDebug;
+        const acceptedPages = (ocrDebug?.pages || []).filter((item) => item.accepted && item.cleanedText.trim().length > 0);
+        const rejectedPages = (ocrDebug?.pages || []).filter((item) => !item.accepted);
+        const acceptedText = acceptedPages.length > 0
+          ? acceptedPages
+              .map((item) => `## OCR Page ${item.page}\n\n${item.cleanedText}`)
+              .join('\n\n')
+          : '未采集到可用 OCR 文本（可能为空、过短，或已被判定为乱码）。';
+        const rejectedSummary = rejectedPages.length > 0
+          ? rejectedPages
+              .map((item) => `page_${item.page}: ${item.reason || 'unknown_reason'}`)
+              .join('\n')
+          : '';
+
+        setOcrPreviewResult({
+          ocrUsed: parseJson.normalizedDocument.sourceMeta.ocrUsed ?? false,
+          parseWarning: parseJson.normalizedDocument.sourceMeta.parseWarning,
+          ocrDebug,
+          acceptedText,
+          rejectedSummary,
+        });
+        setTimingMarks((prev) => ({ ...prev, completedAt: Date.now() }));
+        setStatus('PDF OCR 预览完成（测试模式）');
+        return;
+      }
+
       const streamStartedAt = Date.now();
       setTimingMarks((prev) => ({
         ...prev,
@@ -350,12 +433,21 @@ export function GenerateForm() {
         )}
 
         {mode === 'url' && (
-          <input
-            className="url-input"
-            placeholder="https://example.com/article"
-            value={urlInput}
-            onChange={(event) => setUrlInput(event.target.value)}
-          />
+          <div className="url-input-wrap">
+            <input
+              className="url-input"
+              placeholder="https://example.com/article"
+              value={urlInput}
+              onChange={(event) => setUrlInput(event.target.value)}
+              aria-invalid={urlValidation.hint?.startsWith('链接') || urlValidation.hint?.startsWith('仅支持') || urlValidation.hint?.startsWith('请输入')}
+              aria-describedby="url-hint"
+            />
+            {urlValidation.hint && (
+              <p id="url-hint" className={urlValidation.hint.startsWith('提示') ? 'url-hint-info' : 'url-hint-error'}>
+                {urlValidation.hint}
+              </p>
+            )}
+          </div>
         )}
 
         {mode === 'pdf' && (
@@ -389,6 +481,14 @@ export function GenerateForm() {
                 onChange={() => setDebugMode((prev) => (prev === 'mindmapJson' ? 'none' : 'mindmapJson'))}
               />
               <span>测试模式：仅生成思维导图 JSON（不跳转导图）</span>
+            </label>
+            <label className="debug-toggle">
+              <input
+                type="checkbox"
+                checked={debugMode === 'ocrPreview'}
+                onChange={() => setDebugMode((prev) => (prev === 'ocrPreview' ? 'none' : 'ocrPreview'))}
+              />
+              <span>测试模式：仅查看 PDF OCR 导出文本（不跳转导图）</span>
             </label>
           </div>
           <button type="button" className="primary-button" onClick={submitGenerate} disabled={!canSubmit}>
@@ -425,6 +525,26 @@ export function GenerateForm() {
           <pre className="markdown-debug-content">
             {JSON.stringify(mindMapJsonDebugResult.json ?? {}, null, 2)}
           </pre>
+        </div>
+      )}
+      {ocrPreviewResult && (
+        <div className="markdown-debug-box">
+          <p className="markdown-debug-meta">
+            OCR 启用：{ocrPreviewResult.ocrDebug?.enabled ? '是' : '否'} / OCR 实际执行：
+            {ocrPreviewResult.ocrDebug?.attempted ? '是' : '否'} / 采集有效页数：
+            {ocrPreviewResult.ocrDebug?.acceptedPages ?? 0} / 尝试页数：
+            {ocrPreviewResult.ocrDebug?.attemptedPages ?? 0} / 最终采用 OCR：
+            {ocrPreviewResult.ocrUsed ? '是' : '否'} / 引擎：
+            {ocrPreviewResult.ocrDebug?.provider || 'unknown'} / 模型：
+            {ocrPreviewResult.ocrDebug?.model || 'unknown'}
+          </p>
+          {ocrPreviewResult.rejectedSummary && (
+            <pre className="markdown-debug-content">{ocrPreviewResult.rejectedSummary}</pre>
+          )}
+          <pre className="markdown-debug-content">{ocrPreviewResult.acceptedText}</pre>
+          {ocrPreviewResult.parseWarning && (
+            <p className="markdown-debug-meta">解析警告：{ocrPreviewResult.parseWarning}</p>
+          )}
         </div>
       )}
       {warning && <p className="warning-line">{warning}</p>}

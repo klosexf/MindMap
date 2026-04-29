@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const SOURCE_TYPES = ['text', 'url', 'pdf', 'prompt'] as const;
+export const SOURCE_TYPES = ['text', 'url', 'pdf', 'prompt', 'wechat'] as const;
 export type SourceType = (typeof SOURCE_TYPES)[number];
 
 export const sourceReferenceSchema = z.object({
@@ -171,6 +171,22 @@ export interface NormalizedDocument {
     sourceUrl?: string;
     sourceFileName?: string;
     ocrUsed?: boolean;
+    ocrDebug?: {
+      enabled: boolean;
+      attempted: boolean;
+      provider?: string;
+      model?: string;
+      attemptedPages: number;
+      acceptedPages: number;
+      errorMessages: string[];
+      pages: Array<{
+        page: number;
+        rawText: string;
+        cleanedText: string;
+        accepted: boolean;
+        reason?: string;
+      }>;
+    };
     parseWarning?: string;
   };
 }

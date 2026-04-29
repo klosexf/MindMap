@@ -19,7 +19,7 @@ const normalizedDocSchema = z.object({
     )
     .min(1),
   sourceMeta: z.object({
-    type: z.enum(['text', 'url', 'pdf', 'prompt']),
+    type: z.enum(['text', 'url', 'pdf', 'prompt', 'wechat']),
     title: z.string().optional(),
     sourceUrl: z.string().url().optional(),
     sourceFileName: z.string().optional(),

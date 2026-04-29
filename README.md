@@ -32,3 +32,22 @@ npm run test
 npm run typecheck
 npm run lint
 ```
+
+## PaddleOCR (Minimal)
+
+Install Python dependencies:
+
+```bash
+python3 -m pip install paddleocr paddlepaddle
+```
+
+Enable PaddleOCR engine in `.env`:
+
+```bash
+PDF_OCR_ENGINE=paddle
+PADDLE_OCR_PYTHON_BIN=python3
+PADDLE_OCR_LANG=ch
+PADDLE_PDX_CACHE_HOME=.cache/paddlex
+```
+
+Note: the first run downloads PaddleOCR model files from official model hosts.
