@@ -2,6 +2,7 @@
 const nextConfig = {
   reactStrictMode: false,
   experimental: {
+    serverComponentsExternalPackages: ['pdfjs-dist'],
     serverActions: {
       bodySizeLimit: '10mb',
     },

@@ -33,7 +33,25 @@ npm run typecheck
 npm run lint
 ```
 
-## PaddleOCR (Minimal)
+## MinerU OCR (Official Free API, Recommended)
+
+Enable MinerU OCR in `.env`:
+
+```bash
+PDF_OCR_ENGINE=mineru
+MINERU_BASE_URL=https://mineru.net/api/v1/agent
+MINERU_LANGUAGE=ch
+MINERU_IS_OCR=true
+MINERU_ENABLE_TABLE=false
+MINERU_ENABLE_FORMULA=false
+MINERU_RETRY_TIMES=2
+PDF_OCR_CA_CERT_PATH=/etc/ssl/cert.pem
+```
+
+The Agent API is free and, by default, does not require an Authorization header.
+When MinerU is temporarily unavailable, the parser will automatically fall back to local OCR engines.
+
+## PaddleOCR (Optional Local Fallback)
 
 Install Python dependencies:
 

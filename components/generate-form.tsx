@@ -32,6 +32,7 @@ interface MindMapJsonDebugPayload {
   json: unknown;
   parsedJson?: string;
   rawText?: string;
+  warning?: string;
   proof?: {
     source?: string;
     provider?: string;
@@ -233,7 +234,10 @@ export function GenerateForm() {
           type: 'pdf',
           content: base64,
           fileName: pdfFile.name,
-          pdfOptions: debugMode === 'ocrPreview' ? { forceOcr: true } : undefined,
+          pdfOptions:
+            debugMode === 'ocrPreview' || debugMode === 'mindmapJson'
+              ? { forceOcr: true }
+              : undefined,
         };
       }
 
@@ -324,6 +328,9 @@ export function GenerateForm() {
         }
 
         setMindMapJsonDebugResult(jsonPayload);
+        if (jsonPayload.warning) {
+          setWarning(`导图 JSON 已降级：${jsonPayload.warning}`);
+        }
         setTimingMarks((prev) => ({ ...prev, completedAt: Date.now() }));
         setStatus('导图 JSON 生成完成（测试模式）');
         return;

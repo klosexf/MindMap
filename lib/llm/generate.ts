@@ -1226,6 +1226,23 @@ function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '- 语义聚合：关联紧密的信息合并到同一节点下',
     '- 逻辑清晰：层级关系明确，形成完整知识脉络',
     '',
+    '## 约束条件',
+    `- 最大层级：${MAX_TREE_DEPTH}`,
+    `- 最大节点数：${MAX_TREE_NODES}`,
+    '- 节点文本控制在 35 字以内',
+    '- 一级节点数量由文档实际内容决定（2-8 个均可），不凑数',
+    '',
+    '## 节点组织原则',
+    '1. 关联紧密的信息合并为一个节点，其 children 是具体细节',
+    '2. 某类别下有多个独立子项时，每个子项作为独立节点',
+    '3. 禁止空标签节点（仅写分类名称而无实质内容）',
+    '4. 同一维度的信息归入同一父节点',
+    '',
+    '## 输出要求',
+    '1. 基于文档核心内容重组结构，而非复述原文顺序',
+    '2. 专业名词、人名、公司名、数据等原样保留',
+    '3. 如果某个维度文档中没有相关信息，就不创建该节点',
+    '',
     '## 输出规则',
     '1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释',
     '2. JSON 结构：{"title":"...","root":{"content":"...","children":[...]}}',
@@ -1596,7 +1613,16 @@ export async function* generateMindMapStream(
   const llmConfig = resolveLLMConfig();
   const hasApiKey = Boolean(llmConfig.apiKey);
 
+  console.log('[MindMap Debug] LLM配置:', {
+    provider: llmConfig.provider,
+    resolvedProvider: llmConfig.resolvedProvider,
+    supported: llmConfig.supported,
+    hasApiKey,
+    model: llmConfig.model,
+  });
+
   if (!llmConfig.supported || !hasApiKey) {
+    console.log('[MindMap Debug] 走路径1: 启发式生成（无API Key或provider不支持）');
     const fallback = buildHeuristicMindMapTree(doc);
     yield { type: 'skeleton', data: { tree: fallback } };
 
@@ -1702,6 +1728,8 @@ export async function* generateMindMapStream(
   let latestStableTree = workingTree;
 
   if (llmConfig.resolvedProvider && llmConfig.resolvedProvider !== 'openai') {
+    console.log('[MindMap Debug] 走路径3: 非OpenAI Provider -', llmConfig.resolvedProvider);
+    console.log('[MindMap Debug] 使用提示词: buildCompatJsonPrompt()');
     skeletonSent = true;
     yield {
       type: 'skeleton',
@@ -1756,6 +1784,10 @@ export async function* generateMindMapStream(
   const modelProvider = createProviderClient(llmConfig);
 
   try {
+    console.log('[MindMap Debug] 走路径2: OpenAI Provider');
+    console.log('[MindMap Debug] 使用提示词: buildPrompt()');
+    console.log('[MindMap Debug] 提示词长度:', prompt.length, '字符');
+    
     // Most non-OpenAI providers expose Chat Completions compatible endpoints, not Responses API.
     const languageModel =
       llmConfig.resolvedProvider === 'openai'

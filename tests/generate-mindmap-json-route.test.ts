@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const generateMindMapJsonPreviewMock = vi.hoisted(() => vi.fn());
+const buildHeuristicMindMapTreeMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@/lib/llm/generate', () => ({
   generateMindMapJsonPreview: generateMindMapJsonPreviewMock,
+  buildHeuristicMindMapTree: buildHeuristicMindMapTreeMock,
 }));
 
 import { POST } from '../app/api/generate/mindmap-json/route';
@@ -29,6 +31,7 @@ const demoDoc: NormalizedDocument = {
 describe('POST /api/generate/mindmap-json', () => {
   beforeEach(() => {
     generateMindMapJsonPreviewMock.mockReset();
+    buildHeuristicMindMapTreeMock.mockReset();
   });
 
   it('returns mindmap json and llm proof metadata', async () => {
@@ -64,8 +67,33 @@ describe('POST /api/generate/mindmap-json', () => {
     });
   });
 
-  it('returns 502 when llm json generation fails', async () => {
+  it('falls back to heuristic json when llm json generation fails', async () => {
     generateMindMapJsonPreviewMock.mockRejectedValue(new Error('LLM timeout'));
+    buildHeuristicMindMapTreeMock.mockReturnValue({
+      id: 'fallback-tree-id',
+      root: {
+        id: 'fallback-root',
+        content: '候选人画像',
+        collapsed: false,
+        meta: {
+          sourceRef: { type: 'pdf', page: 1, location: 'page:1', text: '这是测试内容。' },
+          type: 'main',
+          confidence: 0.7,
+          createdAt: 1,
+          createdBy: 'ai',
+        },
+        children: [],
+      },
+      meta: {
+        title: '候选人画像',
+        sourceType: 'pdf',
+        sourceFileName: 'demo.pdf',
+        createdAt: 1,
+        updatedAt: 1,
+        version: 1,
+        truncated: false,
+      },
+    });
 
     const req = new Request('http://localhost/api/generate/mindmap-json', {
       method: 'POST',
@@ -76,8 +104,13 @@ describe('POST /api/generate/mindmap-json', () => {
     const res = await POST(req);
     const json = await res.json();
 
-    expect(res.status).toBe(502);
-    expect(json.error).toContain('LLM timeout');
-    expect(json.proof).toEqual({ source: 'llm' });
+    expect(res.status).toBe(200);
+    expect(json.warning).toContain('LLM timeout');
+    expect(json.json?.root?.content).toBe('候选人画像');
+    expect(json.proof).toEqual({
+      source: 'heuristic-fallback',
+      provider: 'local',
+      model: 'heuristic-v1',
+    });
   });
 });

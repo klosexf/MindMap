@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { Agent } from 'undici';
 
 import { chunkMarkdown } from '@/lib/utils/chunk';
 import { createSourceRefFallback } from '@/lib/utils/tree';
@@ -17,7 +18,11 @@ const PDF_OCR_TIMEOUT_MS_DEFAULT = 120_000;
 const PDF_SIPS_TIMEOUT_MS_DEFAULT = 20_000;
 const PDF_VLM_OCR_TIMEOUT_MS_DEFAULT = 30_000;
 const PADDLE_OCR_PAGE_TIMEOUT_MS_DEFAULT = 120_000;
+const MINERU_POLL_INTERVAL_MS_DEFAULT = 2_000;
+const MINERU_POLL_TIMEOUT_MS_DEFAULT = 240_000;
+const MINERU_RETRY_TIMES_DEFAULT = 2;
 const execFileAsync = promisify(execFile);
+const CA_CERT_FALLBACK_PATHS = ['/etc/ssl/cert.pem', '/etc/ssl/certs/ca-certificates.crt'];
 const CJK_CHAR_RE = /[\u3400-\u9fff]/;
 const KNOWN_UPPERCASE_TOKENS = new Set([
   'AI', 'API', 'APP', 'B2B', 'B2C', 'CEO', 'CFO', 'CIO', 'CTO', 'COO',
@@ -265,6 +270,17 @@ interface PaddleOcrConfig {
   pageTimeoutMs: number;
 }
 
+interface MineruOcrConfig {
+  baseUrl: string;
+  language: string;
+  enableTable: boolean;
+  enableFormula: boolean;
+  isOcr: boolean;
+  pollIntervalMs: number;
+  pollTimeoutMs: number;
+  retryTimes: number;
+}
+
 export interface PdfParseOptions {
   forceOcr?: boolean;
   forceOcrMaxPages?: number;
@@ -290,10 +306,57 @@ function getVlmOcrTimeoutMs(): number {
   return Math.floor(raw);
 }
 
-function getOcrEngine(): 'auto' | 'tesseract' | 'vlm' | 'paddle' {
-  const raw = (process.env.PDF_OCR_ENGINE || 'paddle').trim().toLowerCase();
-  if (raw === 'tesseract' || raw === 'vlm' || raw === 'paddle') return raw;
-  return 'paddle';
+function getOcrEngine(): 'auto' | 'tesseract' | 'vlm' | 'paddle' | 'mineru' {
+  const raw = (process.env.PDF_OCR_ENGINE || 'mineru').trim().toLowerCase();
+  if (raw === 'tesseract' || raw === 'vlm' || raw === 'paddle' || raw === 'mineru') return raw;
+  return 'mineru';
+}
+
+function resolveCaCertPathForOcr(): string | null {
+  const explicitPath = process.env.PDF_OCR_CA_CERT_PATH?.trim();
+  if (explicitPath) {
+    return existsSync(explicitPath) ? explicitPath : null;
+  }
+
+  const nodeExtraCaPath = process.env.NODE_EXTRA_CA_CERTS?.trim();
+  if (nodeExtraCaPath && existsSync(nodeExtraCaPath)) {
+    return nodeExtraCaPath;
+  }
+
+  const fallbackPath = CA_CERT_FALLBACK_PATHS.find((item) => existsSync(item));
+  return fallbackPath || null;
+}
+
+function getMineruFetchWithLocalCA(): typeof fetch {
+  const certPath = resolveCaCertPathForOcr();
+  if (!certPath) return fetch;
+
+  try {
+    const ca = readFileSync(certPath, 'utf8');
+    const dispatcher = new Agent({ connect: { ca } });
+    return ((input: RequestInfo | URL, init?: RequestInit) => {
+      const nextInit = (init || {}) as RequestInit & { dispatcher?: unknown };
+      if (nextInit.dispatcher) {
+        return fetch(input, nextInit);
+      }
+      return fetch(input, { ...nextInit, dispatcher } as RequestInit & { dispatcher: Agent });
+    }) as typeof fetch;
+  } catch {
+    return fetch;
+  }
+}
+
+function formatFetchError(error: unknown): string {
+  if (!(error instanceof Error)) return 'unknown_fetch_error';
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause && typeof cause === 'object') {
+    const code = (cause as { code?: unknown }).code;
+    const message = (cause as { message?: unknown }).message;
+    if (code && message) return `${error.message}:${String(code)}:${String(message)}`;
+    if (code) return `${error.message}:${String(code)}`;
+    if (message) return `${error.message}:${String(message)}`;
+  }
+  return error.message || 'fetch_failed';
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -410,15 +473,22 @@ function getSipsTimeoutMs(): number {
 }
 
 async function renderPdfFirstPageWithSips(buffer: Uint8Array): Promise<Buffer> {
-  const workDir = await mkdtemp(path.join(tmpdir(), 'mindmap-pdf-'));
+  const tempRoot = path.join(process.cwd(), '.cache', 'pdf-tmp');
+  await mkdir(tempRoot, { recursive: true });
+  const workDir = await mkdtemp(path.join(tempRoot, 'mindmap-pdf-'));
   const inputPdfPath = path.join(workDir, 'input.pdf');
   const outputPngPath = path.join(workDir, 'page-1.png');
 
   try {
     await writeFile(inputPdfPath, Buffer.from(buffer));
-    await execFileAsync('sips', ['-s', 'format', 'png', inputPdfPath, '--out', outputPngPath], {
+    const { stdout, stderr } = await execFileAsync('sips', ['-s', 'format', 'png', inputPdfPath, '--out', outputPngPath], {
       timeout: getSipsTimeoutMs(),
     });
+    if (!existsSync(outputPngPath)) {
+      throw new Error(
+        `sips_output_missing:${outputPngPath}:stdout=${String(stdout || '').slice(0, 160)}:stderr=${String(stderr || '').slice(0, 160)}`,
+      );
+    }
     return await readFile(outputPngPath);
   } finally {
     await rm(workDir, { recursive: true, force: true });
@@ -429,6 +499,28 @@ function getOcrMaxPages(): number {
   const raw = Number(process.env.PDF_OCR_MAX_PAGES ?? PDF_OCR_MAX_PAGES_DEFAULT);
   if (!Number.isFinite(raw) || raw < 1) return PDF_OCR_MAX_PAGES_DEFAULT;
   return Math.floor(raw);
+}
+
+function resolveMineruOcrConfig(): MineruOcrConfig {
+  const pollIntervalRaw = Number(process.env.MINERU_POLL_INTERVAL_MS ?? MINERU_POLL_INTERVAL_MS_DEFAULT);
+  const pollTimeoutRaw = Number(process.env.MINERU_POLL_TIMEOUT_MS ?? MINERU_POLL_TIMEOUT_MS_DEFAULT);
+  const retryTimesRaw = Number(process.env.MINERU_RETRY_TIMES ?? MINERU_RETRY_TIMES_DEFAULT);
+  return {
+    baseUrl: (process.env.MINERU_BASE_URL?.trim() || 'https://mineru.net/api/v1/agent').replace(/\/$/, ''),
+    language: process.env.MINERU_LANGUAGE?.trim() || 'ch',
+    enableTable: process.env.MINERU_ENABLE_TABLE === 'true',
+    enableFormula: process.env.MINERU_ENABLE_FORMULA === 'true',
+    isOcr: process.env.MINERU_IS_OCR !== 'false',
+    pollIntervalMs: Number.isFinite(pollIntervalRaw) && pollIntervalRaw > 0
+      ? Math.floor(pollIntervalRaw)
+      : MINERU_POLL_INTERVAL_MS_DEFAULT,
+    pollTimeoutMs: Number.isFinite(pollTimeoutRaw) && pollTimeoutRaw > 0
+      ? Math.floor(pollTimeoutRaw)
+      : MINERU_POLL_TIMEOUT_MS_DEFAULT,
+    retryTimes: Number.isFinite(retryTimesRaw) && retryTimesRaw >= 0
+      ? Math.floor(retryTimesRaw)
+      : MINERU_RETRY_TIMES_DEFAULT,
+  };
 }
 
 function resolvePaddleOcrConfig(): PaddleOcrConfig | null {
@@ -527,6 +619,160 @@ function normalizeVlmOcrText(text: string): string {
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+interface MineruSubmitResponse {
+  code?: number;
+  msg?: string;
+  data?: {
+    task_id?: string;
+    file_url?: string;
+  };
+}
+
+interface MineruTaskStatusResponse {
+  code?: number;
+  msg?: string;
+  data?: {
+    state?: string;
+    full_zip_url?: string;
+    markdown_url?: string;
+    err_msg?: string;
+    err_code?: number;
+  };
+}
+
+function normalizeMineruMarkdown(markdown: string): string {
+  return markdown
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function ensurePdfFileName(fileName: string): string {
+  const safe = fileName.replace(/[^\w.\-\u3400-\u9fff]+/g, '_');
+  return safe.toLowerCase().endsWith('.pdf') ? safe : `${safe || 'document'}.pdf`;
+}
+
+async function submitMineruTask(
+  buffer: Uint8Array,
+  fileName: string,
+  maxPages: number,
+  config: MineruOcrConfig,
+): Promise<string> {
+  const requestFetch = getMineruFetchWithLocalCA();
+  let submitRes: Response;
+  try {
+    submitRes = await requestFetch(`${config.baseUrl}/parse/file`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file_name: ensurePdfFileName(fileName),
+        is_ocr: config.isOcr,
+        language: config.language,
+        page_range: maxPages > 1 ? `1-${maxPages}` : '1',
+        enable_table: config.enableTable,
+        enable_formula: config.enableFormula,
+      }),
+      signal: AbortSignal.timeout(getOcrTimeoutMs()),
+    });
+  } catch (error) {
+    throw new Error(`mineru_submit_fetch_failed:${formatFetchError(error)}`);
+  }
+
+  if (!submitRes.ok) {
+    throw new Error(`mineru_submit_http_${submitRes.status}`);
+  }
+
+  const submitJson = (await submitRes.json().catch(() => ({}))) as MineruSubmitResponse;
+  if (submitJson.code !== 0) {
+    throw new Error(`mineru_submit_failed:${submitJson.msg || 'unknown_error'}`);
+  }
+  const taskId = submitJson.data?.task_id?.trim();
+  const uploadUrl = submitJson.data?.file_url?.trim();
+  if (!taskId || !uploadUrl) {
+    throw new Error('mineru_submit_invalid_response');
+  }
+
+  let uploadRes: Response;
+  try {
+    uploadRes = await requestFetch(uploadUrl, {
+      method: 'PUT',
+      body: Buffer.from(buffer),
+      signal: AbortSignal.timeout(getOcrTimeoutMs()),
+    });
+  } catch (error) {
+    throw new Error(`mineru_upload_fetch_failed:${formatFetchError(error)}`);
+  }
+  if (!uploadRes.ok) {
+    throw new Error(`mineru_upload_http_${uploadRes.status}`);
+  }
+
+  return taskId;
+}
+
+async function pollMineruMarkdown(taskId: string, config: MineruOcrConfig): Promise<string> {
+  const requestFetch = getMineruFetchWithLocalCA();
+  const deadline = Date.now() + config.pollTimeoutMs;
+
+  while (Date.now() < deadline) {
+    let statusRes: Response;
+    try {
+      statusRes = await requestFetch(`${config.baseUrl}/parse/${taskId}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(Math.max(5_000, Math.min(config.pollIntervalMs * 2, 30_000))),
+      });
+    } catch (error) {
+      throw new Error(`mineru_status_fetch_failed:${formatFetchError(error)}`);
+    }
+
+    if (!statusRes.ok) {
+      throw new Error(`mineru_status_http_${statusRes.status}`);
+    }
+
+    const statusJson = (await statusRes.json().catch(() => ({}))) as MineruTaskStatusResponse;
+    if (statusJson.code !== 0) {
+      throw new Error(`mineru_status_failed:${statusJson.msg || 'unknown_error'}`);
+    }
+
+    const state = (statusJson.data?.state || '').toLowerCase();
+    if (state === 'done') {
+      const markdownUrl = statusJson.data?.markdown_url?.trim();
+      if (!markdownUrl) {
+        throw new Error('mineru_markdown_url_missing');
+      }
+      let markdownRes: Response;
+      try {
+        markdownRes = await requestFetch(markdownUrl, {
+          method: 'GET',
+          signal: AbortSignal.timeout(getOcrTimeoutMs()),
+        });
+      } catch (error) {
+        throw new Error(`mineru_markdown_fetch_failed:${formatFetchError(error)}`);
+      }
+      if (!markdownRes.ok) {
+        throw new Error(`mineru_markdown_http_${markdownRes.status}`);
+      }
+      return normalizeMineruMarkdown(await markdownRes.text());
+    }
+    if (state === 'failed') {
+      const errCode = statusJson.data?.err_code;
+      const errMsg = statusJson.data?.err_msg?.trim();
+      throw new Error(
+        `mineru_task_failed${errCode != null ? `:${errCode}` : ''}${errMsg ? `:${errMsg}` : ''}`,
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
+  }
+
+  throw new Error(`mineru_poll_timeout_${config.pollTimeoutMs}ms`);
 }
 
 interface ParsedPaddleOcrResult {
@@ -807,6 +1053,97 @@ async function ocrPdfPagesWithPaddle(
   };
 }
 
+async function ocrPdfPagesWithMineru(
+  buffer: Uint8Array,
+  maxPages: number,
+  fileName: string,
+  config: MineruOcrConfig,
+): Promise<OcrPagesResult> {
+  const isRetryableError = (message: string): boolean => {
+    if (!message) return false;
+    return (
+      message.includes('mineru_task_failed:-60010') ||
+      message.includes('mineru_submit_http_429') ||
+      message.includes('mineru_status_http_429') ||
+      message.includes('mineru_submit_fetch_failed') ||
+      message.includes('mineru_status_fetch_failed') ||
+      message.includes('mineru_markdown_fetch_failed')
+    );
+  };
+
+  let lastError = '';
+  for (let attempt = 0; attempt <= config.retryTimes; attempt += 1) {
+    try {
+      const taskId = await submitMineruTask(buffer, fileName, maxPages, config);
+      const rawText = await pollMineruMarkdown(taskId, config);
+      const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
+      const hasMeaningfulText = cleanedText.length >= 12;
+
+      return {
+        pageTexts: hasMeaningfulText ? [{ page: 1, text: cleanedText }] : [],
+        pageDebugs: [
+          {
+            page: 1,
+            rawText,
+            cleanedText,
+            accepted: hasMeaningfulText,
+            ...(hasMeaningfulText ? {} : { reason: 'mineru_ocr_text_too_short' }),
+          },
+        ],
+        attemptedPages: maxPages,
+        errorMessages: hasMeaningfulText ? [] : ['page_1:mineru_ocr_text_too_short'],
+        provider: 'mineru',
+        model: 'agent',
+      };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : 'unknown_mineru_ocr_error';
+      const canRetry = attempt < config.retryTimes && isRetryableError(lastError);
+      if (canRetry) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * (attempt + 1), 8000)));
+        continue;
+      }
+      break;
+    }
+  }
+
+  try {
+    const message = lastError || 'unknown_mineru_ocr_error';
+    return {
+      pageTexts: [],
+      pageDebugs: [
+        {
+          page: 1,
+          rawText: '',
+          cleanedText: '',
+          accepted: false,
+          reason: message,
+        },
+      ],
+      attemptedPages: maxPages,
+      errorMessages: [`page_1:${message}`],
+      provider: 'mineru',
+      model: 'agent',
+    };
+  } catch {
+    return {
+      pageTexts: [],
+      pageDebugs: [
+        {
+          page: 1,
+          rawText: '',
+          cleanedText: '',
+          accepted: false,
+          reason: 'unknown_mineru_ocr_error',
+        },
+      ],
+      attemptedPages: maxPages,
+      errorMessages: ['page_1:unknown_mineru_ocr_error'],
+      provider: 'mineru',
+      model: 'agent',
+    };
+  }
+}
+
 async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): Promise<OcrPagesResult> {
   const Tesseract = await import('tesseract.js');
   const langPath = process.env.TESSERACT_LANG_PATH?.trim();
@@ -838,7 +1175,17 @@ async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): P
       attemptedPages += 1;
       try {
         const pageImage = await renderPdfPageToPng(buffer, page);
-        const result = await worker.recognize(pageImage);
+        const tempRoot = path.join(process.cwd(), '.cache', 'ocr-tmp');
+        await mkdir(tempRoot, { recursive: true });
+        const workDir = await mkdtemp(path.join(tempRoot, `mindmap-ocr-page-${page}-`));
+        const imagePath = path.join(workDir, `page-${page}.png`);
+        let result: Awaited<ReturnType<typeof worker.recognize>>;
+        try {
+          await writeFile(imagePath, Buffer.isBuffer(pageImage) ? pageImage : Buffer.from(pageImage));
+          result = await worker.recognize(imagePath);
+        } finally {
+          await rm(workDir, { recursive: true, force: true });
+        }
         const rawText = result.data.text?.replace(/\s+/g, ' ').trim() ?? '';
         const cleanedText = rawText ? sanitizeOcrText(rawText) : '';
 
@@ -910,10 +1257,48 @@ async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): P
   }
 }
 
-async function ocrPdfPages(buffer: Uint8Array, maxPages: number): Promise<OcrPagesResult> {
+async function ocrPdfPages(
+  buffer: Uint8Array,
+  maxPages: number,
+  fileName: string,
+  options?: { allowLocalFallback?: boolean },
+): Promise<OcrPagesResult> {
   const engine = getOcrEngine();
   const paddleConfig = resolvePaddleOcrConfig();
   const vlmConfig = resolveVlmOcrConfig();
+  const mineruConfig = resolveMineruOcrConfig();
+  const allowLocalFallback = options?.allowLocalFallback !== false;
+
+  if (engine === 'mineru') {
+    const mineruResult = await ocrPdfPagesWithMineru(buffer, maxPages, fileName, mineruConfig);
+    if (mineruResult.pageTexts.length > 0) {
+      return mineruResult;
+    }
+    if (!allowLocalFallback) {
+      return mineruResult;
+    }
+
+    if (paddleConfig) {
+      const paddleResult = await ocrPdfPagesWithPaddle(buffer, maxPages, paddleConfig);
+      if (paddleResult.pageTexts.length > 0) {
+        return {
+          ...paddleResult,
+          errorMessages: [...mineruResult.errorMessages, ...paddleResult.errorMessages],
+        };
+      }
+      const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+      return {
+        ...tesseractResult,
+        errorMessages: [...mineruResult.errorMessages, ...paddleResult.errorMessages, ...tesseractResult.errorMessages],
+      };
+    }
+
+    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+    return {
+      ...tesseractResult,
+      errorMessages: [...mineruResult.errorMessages, ...tesseractResult.errorMessages],
+    };
+  }
 
   if (engine === 'paddle') {
     if (!paddleConfig) {
@@ -951,6 +1336,13 @@ async function ocrPdfPages(buffer: Uint8Array, maxPages: number): Promise<OcrPag
     };
   }
 
+  if (engine === 'auto') {
+    const mineruResult = await ocrPdfPagesWithMineru(buffer, maxPages, fileName, mineruConfig);
+    if (mineruResult.pageTexts.length > 0) {
+      return mineruResult;
+    }
+  }
+
   if (paddleConfig) {
     const paddleResult = await ocrPdfPagesWithPaddle(buffer, maxPages, paddleConfig);
     if (paddleResult.pageTexts.length > 0) {
@@ -979,7 +1371,7 @@ export async function parsePdfInput(
   let parseWarning: string | undefined;
   let extractionErrorMessage: string | undefined;
   let ocrErrorMessage: string | undefined;
-  let pdfPageCountHint = 1;
+  let pdfPageCountHint = Math.max(1, getOcrMaxPages());
   let ocrAttemptedPages = 0;
   let ocrErrorMessages: string[] = [];
   let ocrPageDebugs: OcrPageDebug[] = [];
@@ -1005,7 +1397,7 @@ export async function parsePdfInput(
   } catch (error) {
     extracted = '';
     extractionErrorMessage = error instanceof Error ? error.message : 'unknown_error';
-    pdfPageCountHint = (await getPdfPageCount(rawBytes)) ?? 1;
+    pdfPageCountHint = (await getPdfPageCount(rawBytes)) ?? Math.max(1, getOcrMaxPages());
   }
 
   let mergedText = extracted;
@@ -1023,7 +1415,11 @@ export async function parsePdfInput(
       const maxPages = forceOcr
         ? Math.max(1, Math.min(forceMaxPages, pdfPageCountHint))
         : Math.max(1, Math.min(getOcrMaxPages(), pdfPageCountHint));
-      const ocrResult = await withTimeout(ocrPdfPages(rawBytes, maxPages), getOcrTimeoutMs(), 'pdf_ocr');
+      const ocrResult = await withTimeout(
+        ocrPdfPages(rawBytes, maxPages, fileName, { allowLocalFallback: !forceOcr }),
+        getOcrTimeoutMs(),
+        'pdf_ocr',
+      );
       ocrAttemptedPages = ocrResult.attemptedPages;
       ocrErrorMessages = ocrResult.errorMessages;
       ocrPageDebugs = ocrResult.pageDebugs;

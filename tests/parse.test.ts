@@ -71,6 +71,7 @@ afterEach(() => {
   delete process.env.PADDLE_OCR_TIMEOUT_MS;
   delete process.env.PADDLE_PDX_CACHE_HOME;
   delete process.env.PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK;
+  delete process.env.MINERU_RETRY_TIMES;
   delete process.env.ZHIPU_API_KEY;
   delete process.env.ZHIPU_BASE_URL;
   delete process.env.LLM_PROVIDER;
@@ -105,6 +106,7 @@ describe('parseInput', () => {
   });
 
   it('parses pdf input to normalized document', async () => {
+    process.env.ENABLE_PDF_OCR = 'false';
     const base64 = createSimplePdfBase64();
     const doc = await parseInput({ type: 'pdf', content: base64, fileName: 'demo.pdf' });
     expect(doc.sourceMeta.type).toBe('pdf');
@@ -113,6 +115,7 @@ describe('parseInput', () => {
   });
 
   it('splits pdf text into page-level chunks with page source refs', async () => {
+    process.env.ENABLE_PDF_OCR = 'false';
     const base64 = createMultiPagePdfBase64([
       'First PDF page about account verification and approval reminders.',
       'Second PDF page about enterprise certification and signing QR codes.',
@@ -319,6 +322,80 @@ describe('parseInput', () => {
       expect(doc.sourceMeta.ocrDebug?.acceptedPages).toBe(3);
     } else {
       expect(doc.sourceMeta.ocrDebug?.attemptedPages).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('uses MinerU official agent API when PDF_OCR_ENGINE=mineru', async () => {
+    process.env.PDF_OCR_ENGINE = 'mineru';
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          code: 0,
+          data: {
+            task_id: 'task-123',
+            file_url: 'https://upload.example.com/file',
+          },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          code: 0,
+          data: {
+            state: 'done',
+            markdown_url: 'https://result.example.com/out.md',
+          },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => '求职目标：产品经理\n工作经历：9年',
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const doc = await parseInput({
+      type: 'pdf',
+      content: createSimplePdfBase64(''),
+      fileName: 'scan.pdf',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(doc.sourceMeta.ocrDebug?.provider).toBe('mineru');
+    expect(doc.sourceMeta.ocrUsed).toBe(true);
+    expect(doc.markdown).toContain('求职目标：产品经理');
+  });
+
+  it('falls back to local OCR when MinerU fetch fails', async () => {
+    process.env.PDF_OCR_ENGINE = 'mineru';
+    process.env.MINERU_RETRY_TIMES = '0';
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('fetch failed')));
+
+    tesseractMocks.createWorker.mockResolvedValue({
+      recognize: tesseractMocks.recognize,
+      terminate: tesseractMocks.terminate,
+    });
+    tesseractMocks.recognize.mockResolvedValue({
+      data: { text: 'Fallback OCR text from local engine after MinerU failure.' },
+    });
+    tesseractMocks.terminate.mockResolvedValue(undefined);
+
+    const doc = await parseInput({
+      type: 'pdf',
+      content: createSimplePdfBase64(''),
+      fileName: 'scan.pdf',
+    });
+
+    expect((doc.sourceMeta.ocrDebug?.errorMessages || []).some((msg) => msg.includes('mineru_submit_fetch_failed'))).toBe(true);
+    if (tesseractMocks.recognize.mock.calls.length > 0) {
+      expect(doc.sourceMeta.ocrUsed).toBe(true);
+      expect(doc.markdown).toContain('Fallback OCR text from local engine');
+    } else {
+      expect(doc.sourceMeta.ocrDebug?.attempted).toBe(true);
     }
   });
 
