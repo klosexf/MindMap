@@ -1,4 +1,5 @@
 import { GenerateForm } from '@/components/generate-form';
+import { SavedMindMaps } from '@/components/saved-mindmaps';
 
 export default function HomePage() {
   return (
@@ -9,10 +10,13 @@ export default function HomePage() {
             <span className="brand-mark">M</span>
             <span className="brand-name">MindMap AI</span>
           </a>
-          <nav className="home-nav-links">
-            <a href="#features">功能特性</a>
-            <a href="#stats">用户口碑</a>
-          </nav>
+          <div className="home-nav-right">
+            <nav className="home-nav-links">
+              <a href="#features">功能特性</a>
+              <a href="#stats">用户口碑</a>
+            </nav>
+            <SavedMindMaps />
+          </div>
         </div>
       </header>
 

@@ -143,6 +143,23 @@ export function applyTreePatch(tree: MindMapTree, patch: TreePatch): MindMapTree
       removeFrom(nextTree.root);
       break;
     }
+    case 'move': {
+      if (patch.nodeId === patch.newParentId) return nextTree;
+      if (nextTree.root.id === patch.nodeId) return nextTree;
+
+      if (isDescendant(nextTree.root, patch.nodeId, patch.newParentId)) return nextTree;
+
+      const movedNode = removeNode(nextTree.root, patch.nodeId);
+      if (!movedNode) return nextTree;
+
+      const newParent = findNode(nextTree.root, patch.newParentId);
+      if (!newParent) return nextTree;
+
+      newParent.children = newParent.children ?? [];
+      const safeIndex = Math.max(0, Math.min(patch.newIndex, newParent.children.length));
+      newParent.children.splice(safeIndex, 0, movedNode);
+      break;
+    }
     default:
       return nextTree;
   }
@@ -260,4 +277,55 @@ export function normalizeNodeIds(root: MindMapNode, sourceRef: SourceReference):
 
   walk(next);
   return next;
+}
+
+export function isDescendant(root: MindMapNode, ancestorId: string, targetId: string): boolean {
+  const ancestor = findNode(root, ancestorId);
+  if (!ancestor?.children?.length) return false;
+
+  for (const child of ancestor.children) {
+    if (child.id === targetId) return true;
+    if (isDescendant(child, child.id, targetId)) return true;
+  }
+  return false;
+}
+
+export function removeNode(root: MindMapNode, nodeId: string): MindMapNode | null {
+  if (!root.children?.length) return null;
+
+  const idx = root.children.findIndex((child) => child.id === nodeId);
+  if (idx >= 0) {
+    const [removed] = root.children.splice(idx, 1);
+    return removed;
+  }
+
+  for (const child of root.children) {
+    const removed = removeNode(child, nodeId);
+    if (removed) return removed;
+  }
+  return null;
+}
+
+export function balanceChildren(tree: MindMapTree): MindMapTree {
+  const nextTree = structuredClone(tree);
+  const root = nextTree.root;
+
+  if (!root.children?.length) return nextTree;
+
+  const leftGroup: MindMapNode[] = [];
+  const rightGroup: MindMapNode[] = [];
+
+  root.children.forEach((child, index) => {
+    if (index % 2 === 0) {
+      leftGroup.push(child);
+    } else {
+      rightGroup.push(child);
+    }
+  });
+
+  root.children = [...leftGroup, ...rightGroup.reverse()];
+
+  nextTree.meta.updatedAt = Date.now();
+  nextTree.meta.version += 1;
+  return nextTree;
 }

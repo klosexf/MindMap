@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { mindMapTreeSchema, treePatchListSchema, type MindMapTree } from '@/lib/types/mindmap';
+import { mindMapTreeSchema, treePatchListSchema, type MindMapTree, type TreeMeta } from '@/lib/types/mindmap';
 import { applyTreePatch } from '@/lib/utils/tree';
 
 const DATA_DIR = path.join(process.cwd(), 'data', 'mindmaps');
@@ -27,6 +27,53 @@ export async function getMindMap(id: string): Promise<MindMapTree | null> {
     return mindMapTreeSchema.parse(JSON.parse(raw));
   } catch {
     return null;
+  }
+}
+
+export interface MindMapSummary {
+  id: string;
+  meta: TreeMeta;
+  rootContent: string;
+}
+
+export async function listMindMaps(): Promise<MindMapSummary[]> {
+  await ensureDataDir();
+
+  let entries: string[];
+  try {
+    entries = await fs.readdir(DATA_DIR);
+  } catch {
+    return [];
+  }
+
+  const summaries: MindMapSummary[] = [];
+
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    try {
+      const raw = await fs.readFile(path.join(DATA_DIR, entry), 'utf8');
+      const tree = mindMapTreeSchema.parse(JSON.parse(raw));
+      summaries.push({
+        id: tree.id,
+        meta: tree.meta,
+        rootContent: tree.root.content,
+      });
+    } catch {
+      // Skip corrupted files
+    }
+  }
+
+  // Sort by updatedAt descending (most recent first)
+  summaries.sort((a, b) => b.meta.updatedAt - a.meta.updatedAt);
+  return summaries;
+}
+
+export async function deleteMindMap(id: string): Promise<boolean> {
+  try {
+    await fs.unlink(treePath(id));
+    return true;
+  } catch {
+    return false;
   }
 }
 

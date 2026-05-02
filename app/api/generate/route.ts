@@ -86,12 +86,22 @@ export async function POST(req: Request) {
             const event = iteration.value;
             if (event.type === 'complete') {
               completedTree = mindMapTreeSchema.parse(event.data.tree);
+              // 先保存再发送 complete 事件，确保客户端跳转时文件已存在
+              try {
+                await saveMindMap(completedTree);
+                controller.enqueue(encoder.encode(sseMessage(event.type, event.data)));
+              } catch (saveErr) {
+                controller.enqueue(
+                  encoder.encode(
+                    sseMessage('error', {
+                      message: saveErr instanceof Error ? `导图保存失败: ${saveErr.message}` : '导图保存失败',
+                    }),
+                  ),
+                );
+              }
+              continue;
             }
             controller.enqueue(encoder.encode(sseMessage(event.type, event.data)));
-          }
-
-          if (completedTree) {
-            await saveMindMap(completedTree);
           }
 
           controller.close();
@@ -100,7 +110,18 @@ export async function POST(req: Request) {
             const fallback = buildHeuristicMindMapTree(normalizedDocument);
             completedTree = fallback;
             controller.enqueue(encoder.encode(sseMessage('skeleton', { tree: fallback })));
-            controller.enqueue(encoder.encode(sseMessage('complete', { tree: fallback })));
+            try {
+              await saveMindMap(completedTree);
+              controller.enqueue(encoder.encode(sseMessage('complete', { tree: fallback })));
+            } catch (saveErr) {
+              controller.enqueue(
+                encoder.encode(
+                  sseMessage('error', {
+                    message: saveErr instanceof Error ? `导图保存失败: ${saveErr.message}` : '导图保存失败',
+                  }),
+                ),
+              );
+            }
           } else {
             controller.enqueue(
               encoder.encode(
@@ -109,10 +130,21 @@ export async function POST(req: Request) {
                 }),
               ),
             );
-          }
 
-          if (completedTree) {
-            await saveMindMap(completedTree);
+            if (completedTree) {
+              try {
+                await saveMindMap(completedTree);
+                controller.enqueue(encoder.encode(sseMessage('complete', { tree: completedTree })));
+              } catch (saveErr) {
+                controller.enqueue(
+                  encoder.encode(
+                    sseMessage('error', {
+                      message: saveErr instanceof Error ? `导图保存失败: ${saveErr.message}` : '导图保存失败',
+                    }),
+                  ),
+                );
+              }
+            }
           }
 
           controller.close();

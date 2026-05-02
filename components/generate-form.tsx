@@ -386,15 +386,20 @@ export function GenerateForm() {
         }
       }
 
-      if (!finalTree) {
+      if (!finalTree || !finalTree.id) {
         throw new Error('未收到完整导图数据');
       }
 
-      await fetch(`/api/mindmaps/${finalTree.id}`, {
+      const saveRes = await fetch(`/api/mindmaps/${finalTree.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tree: finalTree }),
       });
+
+      if (!saveRes.ok) {
+        const saveBody = await saveRes.json().catch(() => ({}));
+        throw new Error(saveBody.error || '导图保存失败，请重试');
+      }
 
       router.push(`/g/${finalTree.id}`);
     } catch (err) {

@@ -1113,7 +1113,8 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
 
     const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
     const sanitized = sanitizeMindMapTreeForOutput(clamped, title);
-    return ensureFirstLayerDetails(sanitized, doc);
+    const result = ensureFirstLayerDetails(sanitized, doc);
+    return mindMapTreeSchema.parse(result);
   }
 
   const sentences = extractSentences(doc.markdown, 12);
@@ -1157,7 +1158,8 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
 
   const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
   const sanitized = sanitizeMindMapTreeForOutput(clamped, title);
-  return ensureFirstLayerDetails(sanitized, doc);
+  const result = ensureFirstLayerDetails(sanitized, doc);
+  return mindMapTreeSchema.parse(result);
 }
 
 const ANTI_HALLUCINATION_SYSTEM = [

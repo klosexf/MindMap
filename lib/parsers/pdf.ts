@@ -6,7 +6,9 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { Agent } from 'undici';
 
-import { chunkMarkdown } from '@/lib/utils/chunk';
+import { nanoid } from 'nanoid';
+
+import { chunkMarkdown, estimateTokens } from '@/lib/utils/chunk';
 import { createSourceRefFallback } from '@/lib/utils/tree';
 import type { NormalizedDocument } from '@/lib/types/mindmap';
 
@@ -1493,9 +1495,19 @@ export async function parsePdfInput(
     return chunkMarkdown(`# ${fileName}\n\n## ${heading || `Page ${page}`}\n\n${text}`, pageSourceRef);
   });
 
+  const validChunks = chunks.length > 0 ? chunks : chunkMarkdown(markdown, sourceRef);
+  const nonEmptyChunks = validChunks.filter((c) => c.text.trim().length > 0);
+
   return {
     markdown,
-    chunks: chunks.length > 0 ? chunks : chunkMarkdown(markdown, sourceRef),
+    chunks: nonEmptyChunks.length > 0 ? nonEmptyChunks : [
+      {
+        id: nanoid(),
+        text: mergedText.trim() || `${fileName} 内容摘要`,
+        tokenEstimate: estimateTokens(mergedText.trim() || `${fileName} 内容摘要`),
+        sourceRef,
+      },
+    ],
     sourceMeta: {
       type: 'pdf',
       title: fileName.replace(/\.pdf$/i, ''),

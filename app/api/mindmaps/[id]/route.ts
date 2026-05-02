@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
-import { getMindMap, patchMindMap, saveMindMap } from '@/lib/storage/mindmap-store';
+import { deleteMindMap, getMindMap, patchMindMap, saveMindMap } from '@/lib/storage/mindmap-store';
 import { mindMapTreeSchema, treePatchListSchema } from '@/lib/types/mindmap';
 
 export const runtime = 'nodejs';
@@ -52,4 +52,14 @@ export async function PATCH(req: Request, { params }: Params) {
       { status: 400 },
     );
   }
+}
+
+export async function DELETE(_: Request, { params }: Params) {
+  const deleted = await deleteMindMap(params.id);
+
+  if (!deleted) {
+    return NextResponse.json({ error: 'Mindmap not found' }, { status: 404 });
+  }
+
+  return NextResponse.json({ success: true });
 }

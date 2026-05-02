@@ -93,6 +93,8 @@ export const llmTreeSchema = z.object({
 
 export type LLMMindMapTree = z.infer<typeof llmTreeSchema>;
 
+export type LayoutDirection = 'LR' | 'RL' | 'TB' | 'BT';
+
 export type TreePatch =
   | {
       type: 'add';
@@ -116,6 +118,13 @@ export type TreePatch =
   | {
       type: 'toggleCollapse';
       nodeId: string;
+      timestamp: number;
+    }
+  | {
+      type: 'move';
+      nodeId: string;
+      newParentId: string;
+      newIndex: number;
       timestamp: number;
     };
 
@@ -149,6 +158,13 @@ export const treePatchSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('toggleCollapse'),
     nodeId: z.string().min(1),
+    timestamp: z.number().int(),
+  }),
+  z.object({
+    type: z.literal('move'),
+    nodeId: z.string().min(1),
+    newParentId: z.string().min(1),
+    newIndex: z.number().int().min(0),
     timestamp: z.number().int(),
   }),
 ]);

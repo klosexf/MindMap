@@ -28,9 +28,13 @@ export function EditorPage({ id }: EditorPageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const savedVersionRef = useRef<number>(0);
 
   const tree = useMindMapStore((s) => s.tree);
   const selectedNodeId = useMindMapStore((s) => s.selectedNodeId);
+  const layoutDirection = useMindMapStore((s) => s.layoutDirection);
   const setTree = useMindMapStore((s) => s.setTree);
   const setSelectedNode = useMindMapStore((s) => s.setSelectedNode);
   const updateNodeContent = useMindMapStore((s) => s.updateNodeContent);
@@ -38,6 +42,9 @@ export function EditorPage({ id }: EditorPageProps) {
   const addSiblingNode = useMindMapStore((s) => s.addSiblingNode);
   const deleteNode = useMindMapStore((s) => s.deleteNode);
   const toggleNodeCollapse = useMindMapStore((s) => s.toggleNodeCollapse);
+  const setLayoutDirection = useMindMapStore((s) => s.setLayoutDirection);
+  const moveNode = useMindMapStore((s) => s.moveNode);
+  const balanceLayout = useMindMapStore((s) => s.balanceLayout);
 
   const loadTree = useCallback(async () => {
     setLoading(true);
@@ -45,11 +52,19 @@ export function EditorPage({ id }: EditorPageProps) {
 
     try {
       const res = await fetch(`/api/mindmaps/${id}`);
-      if (!res.ok) throw new Error('导图不存在或加载失败');
+      if (!res.ok) {
+        const statusText = res.status === 404 ? '导图不存在' : `加载失败 (HTTP ${res.status})`;
+        throw new Error(statusText);
+      }
 
       const json = (await res.json()) as { tree: MindMapTree };
+      if (!json.tree) {
+        throw new Error('服务器返回的导图数据为空');
+      }
       setTree(json.tree);
       setSelectedNode(json.tree.root.id);
+      savedVersionRef.current = json.tree.meta.version;
+      setDirty(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载失败');
     } finally {
@@ -62,16 +77,92 @@ export function EditorPage({ id }: EditorPageProps) {
     return () => setTree(null);
   }, [loadTree, setTree]);
 
+  // Track dirty state when tree changes
+  useEffect(() => {
+    if (tree && tree.meta.version !== savedVersionRef.current) {
+      setDirty(true);
+    }
+  }, [tree]);
+
+  // Inline add node helpers
+  const addNodeAndEdit = useCallback(
+    (mode: 'child' | 'sibling') => {
+      if (!selectedNodeId || !tree) return;
+
+      const newId =
+        mode === 'child'
+          ? addChildNode(selectedNodeId, '')
+          : addSiblingNode(selectedNodeId, '');
+      if (!newId) return;
+
+      setSelectedNode(newId);
+
+      // Wait for React to commit tree changes and G6 to render the new node
+      setTimeout(() => {
+        editorRef.current?.startEditingNode(newId);
+      }, 150);
+    },
+    [selectedNodeId, tree, addChildNode, addSiblingNode, setSelectedNode],
+  );
+
+  const handleAddChild = useCallback(() => addNodeAndEdit('child'), [addNodeAndEdit]);
+  const handleAddSibling = useCallback(() => addNodeAndEdit('sibling'), [addNodeAndEdit]);
+
+  // Clean up newly created empty nodes when inline editing ends.
+  // Only deletes the node when both original AND final text are empty,
+  // so clearing an existing node's content does not accidentally delete it.
+  const handleEditEnd = useCallback(
+    (nodeId: string, _committed: boolean, finalText: string, originalText: string) => {
+      if (!finalText.trim() && !originalText.trim()) {
+        deleteNode(nodeId);
+      }
+    },
+    [deleteNode],
+  );
+
+  const saveTree = useCallback(async () => {
+    if (!tree || saving) return;
+    setSaving(true);
+    setNotice('保存中...');
+
+    try {
+      const res = await fetch(`/api/mindmaps/${tree.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tree }),
+      });
+
+      if (!res.ok) {
+        setNotice('保存失败');
+        return;
+      }
+
+      savedVersionRef.current = tree.meta.version;
+      setDirty(false);
+      setNotice('已保存');
+      setTimeout(() => setNotice(null), 1500);
+    } catch {
+      setNotice('保存失败');
+    } finally {
+      setSaving(false);
+    }
+  }, [saving, tree]);
+
+  // Keyboard shortcuts
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent): void {
+      // Ctrl+S / Cmd+S to save
+      if ((event.ctrlKey || event.metaKey) && event.key === 's') {
+        event.preventDefault();
+        if (tree) saveTree();
+        return;
+      }
+
       if (!tree || !selectedNodeId) return;
 
       if (event.key === 'Tab') {
         event.preventDefault();
-        const value = window.prompt('子节点内容');
-        if (value?.trim()) {
-          addChildNode(selectedNodeId, value.trim());
-        }
+        addNodeAndEdit('child');
       }
 
       if (event.key === 'Enter' && !event.shiftKey && !event.metaKey && !event.ctrlKey) {
@@ -79,10 +170,7 @@ export function EditorPage({ id }: EditorPageProps) {
         if (activeTag === 'input' || activeTag === 'textarea') return;
 
         event.preventDefault();
-        const value = window.prompt('兄弟节点内容');
-        if (value?.trim()) {
-          addSiblingNode(selectedNodeId, value.trim());
-        }
+        addNodeAndEdit('sibling');
       }
 
       if (event.key === 'Delete' || event.key === 'Backspace') {
@@ -97,26 +185,7 @@ export function EditorPage({ id }: EditorPageProps) {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [addChildNode, addSiblingNode, deleteNode, selectedNodeId, tree]);
-
-  async function saveTree() {
-    if (!tree) return;
-    setNotice('保存中...');
-
-    const res = await fetch(`/api/mindmaps/${tree.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tree }),
-    });
-
-    if (!res.ok) {
-      setNotice('保存失败');
-      return;
-    }
-
-    setNotice('已保存');
-    setTimeout(() => setNotice(null), 1500);
-  }
+  }, [addNodeAndEdit, deleteNode, saveTree, selectedNodeId, tree]);
 
   async function exportMarkdown() {
     if (!tree) return;
@@ -194,7 +263,9 @@ export function EditorPage({ id }: EditorPageProps) {
           <h1>{tree.meta.title || '未命名导图'}</h1>
         </div>
         <div className="editor-topbar-right">
-          <span className={`save-state ${notice ? 'active' : ''}`}>{notice || '编辑中'}</span>
+          <span className={`save-state ${notice ? 'active' : ''} ${dirty ? 'dirty' : ''}`}>
+            {notice || (dirty ? '未保存' : '已保存')}
+          </span>
         </div>
       </header>
 
@@ -205,6 +276,7 @@ export function EditorPage({ id }: EditorPageProps) {
             <li>快捷键：`Tab` 添加子节点</li>
             <li>快捷键：`Enter` 添加兄弟节点</li>
             <li>快捷键：`Delete` 删除非根节点</li>
+            <li>快捷键：`Ctrl+S` 保存导图</li>
             <li>当前选中：{selectedNodeId || '未选择'}</li>
           </ul>
         </aside>
@@ -212,17 +284,12 @@ export function EditorPage({ id }: EditorPageProps) {
         <div className="editor-canvas-area">
           <EditorToolbar
             selectedNodeId={selectedNodeId}
+            layoutDirection={layoutDirection}
+            dirty={dirty}
+            saving={saving}
             onRename={renameNode}
-            onAddChild={() => {
-              if (!selectedNodeId) return;
-              const value = window.prompt('子节点内容');
-              if (value?.trim()) addChildNode(selectedNodeId, value.trim());
-            }}
-            onAddSibling={() => {
-              if (!selectedNodeId) return;
-              const value = window.prompt('兄弟节点内容');
-              if (value?.trim()) addSiblingNode(selectedNodeId, value.trim());
-            }}
+            onAddChild={handleAddChild}
+            onAddSibling={handleAddSibling}
             onToggleCollapse={() => {
               if (!selectedNodeId) return;
               toggleNodeCollapse(selectedNodeId);
@@ -234,6 +301,8 @@ export function EditorPage({ id }: EditorPageProps) {
             onSave={saveTree}
             onExportMarkdown={exportMarkdown}
             onExportPng={exportPng}
+            onLayoutChange={setLayoutDirection}
+            onBalance={balanceLayout}
           />
 
           <MindMapEditor
@@ -242,21 +311,12 @@ export function EditorPage({ id }: EditorPageProps) {
             selectedNodeId={selectedNodeId}
             onSelectNode={setSelectedNode}
             onUpdateNodeContent={updateNodeContent}
+            layoutDirection={layoutDirection}
+            onMoveNode={moveNode}
+            onEditEnd={handleEditEnd}
           />
         </div>
       </section>
     </main>
   );
-}
-
-function findNodeById(node: MindMapTree['root'], id: string): MindMapTree['root'] | null {
-  if (node.id === id) return node;
-
-  if (!node.children?.length) return null;
-  for (const child of node.children) {
-    const found = findNodeById(child, id);
-    if (found) return found;
-  }
-
-  return null;
 }

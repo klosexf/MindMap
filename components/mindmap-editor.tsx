@@ -3,8 +3,8 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Graph } from '@antv/g6';
 
-import type { MindMapTree } from '@/lib/types/mindmap';
-import { toG6GraphData } from '@/lib/utils/g6';
+import type { LayoutDirection, MindMapTree } from '@/lib/types/mindmap';
+import { getLayoutConfig, getNodeSize, toG6GraphData } from '@/lib/utils/g6';
 import { countNodes } from '@/lib/utils/tree';
 import { createLayerRenderer, selectRenderMode } from '@/lib/utils/renderer';
 
@@ -18,17 +18,9 @@ interface MindMapEditorProps {
   selectedNodeId: string | null;
   onSelectNode: (id: string | null) => void;
   onUpdateNodeContent: (id: string, content: string) => void;
-}
-
-const _canvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
-const MAX_NODE_WIDTH = 420;
-
-function measureTextWidth(text: string, fontSize: number, fontWeight: number): number {
-  if (!_canvas) return text.length * fontSize * 0.6;
-  const ctx = _canvas.getContext('2d');
-  if (!ctx) return text.length * fontSize * 0.6;
-  ctx.font = `${fontWeight} ${fontSize}px system-ui, sans-serif`;
-  return ctx.measureText(text).width;
+  layoutDirection: LayoutDirection;
+  onMoveNode: (nodeId: string, newParentId: string, index: number) => void;
+  onEditEnd?: (nodeId: string, committed: boolean, finalText: string, originalText: string) => void;
 }
 
 interface NodeTextMetrics {
@@ -41,53 +33,21 @@ interface NodeTextMetrics {
   lineHeight: number;
 }
 
-function wrapTextByWidth(text: string, maxWidth: number, fontSize: number, fontWeight: number): string[] {
-  const rows: string[] = [];
-
-  for (const paragraph of text.split(/\r?\n/)) {
-    const value = paragraph.length > 0 ? paragraph : ' ';
-    let line = '';
-
-    for (const char of value) {
-      const next = line + char;
-      if (line.length === 0 || measureTextWidth(next, fontSize, fontWeight) <= maxWidth) {
-        line = next;
-        continue;
-      }
-
-      rows.push(line);
-      line = char;
-    }
-
-    rows.push(line || ' ');
-  }
-
-  return rows.length > 0 ? rows : [' '];
-}
-
-function getNodeTextMetrics(datum: { id?: string; data?: { label?: string } }, rootId: string): NodeTextMetrics {
-  const text = datum.data?.label || '';
+function getNodeTextMetrics(datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }, rootId: string): NodeTextMetrics {
+  const size = getNodeSize(datum.id || '', datum.data?.label || '', rootId);
   const isRoot = datum.id === rootId;
   const fontSize = isRoot ? 14 : 12;
   const fontWeight = isRoot ? 600 : 500;
   const lineHeight = fontSize * 1.6;
   const horizontalPadding = 24;
-  const verticalPadding = 16;
-  const minNodeWidth = isRoot ? 180 : 120;
-  const minNodeHeight = isRoot ? 44 : 36;
-  const singleLineWidth = measureTextWidth(text || ' ', fontSize, fontWeight);
-  const preferredWidth = singleLineWidth + horizontalPadding;
-  const nodeWidth = Math.max(Math.min(preferredWidth, MAX_NODE_WIDTH), minNodeWidth);
-  const labelMaxWidth = Math.max(nodeWidth - horizontalPadding, 1);
-  const wrappedLines = wrapTextByWidth(text || ' ', labelMaxWidth, fontSize, fontWeight);
-  const contentHeight = wrappedLines.length * lineHeight;
-  const nodeHeight = Math.max(contentHeight + verticalPadding, minNodeHeight);
+  const labelMaxWidth = Math.max(size.width - horizontalPadding, 1);
+  const lineCount = Math.round((size.height - 16) / lineHeight);
 
   return {
-    width: nodeWidth,
-    height: nodeHeight,
+    width: size.width,
+    height: size.height,
     labelMaxWidth,
-    lineCount: wrappedLines.length,
+    lineCount: Math.max(lineCount, 1),
     fontSize,
     fontWeight,
     lineHeight,
@@ -95,7 +55,7 @@ function getNodeTextMetrics(datum: { id?: string; data?: { label?: string } }, r
 }
 
 export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(function MindMapEditor(
-  { tree, selectedNodeId, onSelectNode, onUpdateNodeContent },
+  { tree, selectedNodeId, onSelectNode, onUpdateNodeContent, layoutDirection, onMoveNode, onEditEnd },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -109,23 +69,34 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
   const [editValue, setEditValue] = useState('');
   const [editRect, setEditRect] = useState<DOMRect | null>(null);
 
+  const originalEditValueRef = useRef('');
+
   const commitEdit = useCallback(
     (value: string) => {
-      if (editingNodeId && value.trim()) {
-        onUpdateNodeContent(editingNodeId, value.trim());
+      const nodeId = editingNodeId;
+      const originalText = originalEditValueRef.current;
+      if (nodeId && value.trim()) {
+        onUpdateNodeContent(nodeId, value.trim());
       }
       setEditingNodeId(null);
       setEditValue('');
       setEditRect(null);
+      originalEditValueRef.current = '';
+      if (nodeId) onEditEnd?.(nodeId, true, value, originalText);
     },
-    [editingNodeId, onUpdateNodeContent],
+    [editingNodeId, onUpdateNodeContent, onEditEnd],
   );
 
   const cancelEdit = useCallback(() => {
+    const nodeId = editingNodeId;
+    const originalText = originalEditValueRef.current;
+    const currentValue = editValue;
     setEditingNodeId(null);
     setEditValue('');
     setEditRect(null);
-  }, []);
+    originalEditValueRef.current = '';
+    if (nodeId) onEditEnd?.(nodeId, false, currentValue, originalText);
+  }, [editingNodeId, editValue, onEditEnd]);
 
   /** Compute the screen position of a node and open the inline editor */
   const startEditingNode = useCallback(
@@ -138,6 +109,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
 
       const label = (nodeData.data?.label as string) || '';
       setEditValue(label);
+      originalEditValueRef.current = label;
       setEditingNodeId(nodeId);
 
       // Strategy 1: getElementRenderBounds + getClientByCanvas
@@ -216,6 +188,18 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
           );
         }
 
+        // Ensure minimum dimensions for comfortable editing
+        const minW = 180;
+        const minH = 44;
+        if (rect.width < minW || rect.height < minH) {
+          rect = new DOMRect(
+            rect.left - (minW - rect.width) / 2,
+            rect.top - (minH - rect.height) / 2,
+            Math.max(rect.width, minW),
+            Math.max(rect.height, minH),
+          );
+        }
+
         setEditRect(rect);
       });
     },
@@ -239,19 +223,12 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       container,
       autoResize: true,
       data: toG6GraphData(tree),
-      layout: {
-        type: 'mindmap',
-        direction: 'H',
-        getHeight: () => 36,
-        getWidth: () => 160,
-        getVGap: () => 16,
-        getHGap: () => 60,
-      },
+      layout: getLayoutConfig(layoutDirection),
       renderer: createLayerRenderer(renderMode),
       node: {
         type: 'rect',
         style: {
-          size: (datum: { data?: { label?: string }; id?: string }) => {
+          size: (datum: { data?: { label?: string; _width?: number; _height?: number }; id?: string }) => {
             const metrics = getNodeTextMetrics(datum, tree.root.id);
             return [metrics.width, metrics.height];
           },
@@ -265,21 +242,21 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
           labelTextBaseline: 'middle',
           labelText: (datum: { data?: { label?: string } }) => datum.data?.label || '',
           labelFill: '#1A1A1A',
-          labelFontSize: (datum: { id?: string; data?: { label?: string } }) =>
+          labelFontSize: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
             getNodeTextMetrics(datum, tree.root.id).fontSize,
-          labelFontWeight: (datum: { id?: string; data?: { label?: string } }) =>
+          labelFontWeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
             getNodeTextMetrics(datum, tree.root.id).fontWeight,
           labelWordWrap: true,
-          labelMaxWidth: (datum: { id?: string; data?: { label?: string } }) => {
+          labelMaxWidth: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) => {
             const metrics = getNodeTextMetrics(datum, tree.root.id);
             return metrics.labelMaxWidth;
           },
-          labelMaxLines: (datum: { id?: string; data?: { label?: string } }) => {
+          labelMaxLines: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) => {
             const metrics = getNodeTextMetrics(datum, tree.root.id);
             return metrics.lineCount;
           },
           labelTextOverflow: 'clip',
-          labelLineHeight: (datum: { id?: string; data?: { label?: string } }) =>
+          labelLineHeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
             getNodeTextMetrics(datum, tree.root.id).lineHeight,
         },
       },
@@ -291,7 +268,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
           radius: 14,
         },
       },
-      behaviors: ['drag-canvas', 'zoom-canvas', 'click-select'],
+      behaviors: ['drag-canvas', 'zoom-canvas', 'click-select', 'drag-node'],
       animation: false,
     });
 
@@ -307,40 +284,87 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       }
     });
 
-    graph.render();
-    graph.fitView();
+    graph.on('node:dragend', (evt: any) => {
+      const draggedNodeId = evt?.target?.id;
+      const dropTargetId = evt?.dropTarget?.id;
+
+      if (
+        draggedNodeId &&
+        dropTargetId &&
+        draggedNodeId !== dropTargetId &&
+        draggedNodeId !== tree.root.id
+      ) {
+        onMoveNode(draggedNodeId, dropTargetId, 0);
+      }
+    });
+
     graphRef.current = graph;
 
     return () => {
-      const current = graph as Graph & { destroyed?: boolean };
-      if (!current.destroyed) {
-        current.destroy();
+      try {
+        graph.destroy();
+      } catch {
+        // ignore
       }
       graphRef.current = null;
     };
-  }, [onSelectNode, renderMode, tree, startEditingNode]);
+  }, [onSelectNode, renderMode, tree, startEditingNode, layoutDirection, onMoveNode]);
 
+  // Update graph data when tree changes
   useEffect(() => {
     const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
-    if (!graph || graph.destroyed || !selectedNodeId) return;
+    if (!graph || graph.destroyed) return;
 
-    graph.focusElement(selectedNodeId, true);
+    graph.setData(toG6GraphData(tree));
+    graph.render().catch(() => {});
+  }, [tree]);
+
+  // Update layout when direction changes
+  useEffect(() => {
+    const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
+    if (!graph || graph.destroyed) return;
+
+    const applyLayout = async () => {
+      try {
+        graph.setLayout(getLayoutConfig(layoutDirection));
+        await graph.layout();
+      } catch {
+        // ignore layout errors during rapid switching
+      }
+    };
+
+    applyLayout();
+  }, [layoutDirection]);
+
+  // Highlight selected node
+  useEffect(() => {
+    const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
+    if (!graph || graph.destroyed) return;
+
+    if (selectedNodeId) {
+      graph.setElementState(selectedNodeId, ['selected']).catch(() => {});
+    }
   }, [selectedNodeId]);
 
-  const isRoot = editingNodeId === tree.root.id;
-  const metrics = editingNodeId
-    ? getNodeTextMetrics({ id: editingNodeId, data: { label: editValue } }, tree.root.id)
-    : null;
-
   return (
-    <div className="editor-wrap">
-      <div className="editor-meta">
-        <span>节点数: {nodeCount}</span>
-        <span>渲染模式: {renderMode.toUpperCase()}</span>
-      </div>
-      <div ref={containerRef} className="editor-canvas" />
+    <div ref={containerRef} className="mindmap-canvas">
       {editingNodeId && editRect && (
-        <div
+        <textarea
+          ref={textareaRef}
+          autoFocus
+          value={editValue}
+          onChange={(e) => setEditValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              commitEdit(editValue);
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              cancelEdit();
+            }
+          }}
+          onBlur={() => commitEdit(editValue)}
           className="node-inline-editor"
           style={{
             position: 'fixed',
@@ -348,36 +372,20 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
             top: editRect.top,
             width: editRect.width,
             height: editRect.height,
-            zIndex: 100,
+            zIndex: 1000,
+            border: '2px solid #1A1A1A',
+            borderRadius: 12,
+            padding: '8px 12px',
+            fontSize: 14,
+            lineHeight: 1.5,
+            resize: 'none',
+            outline: 'none',
+            background: '#FFFFFFFE',
+            color: '#1A1A1A',
+            fontFamily: 'system-ui, sans-serif',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.12)',
           }}
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <textarea
-            ref={textareaRef}
-            className="node-inline-textarea"
-            value={editValue}
-            onChange={(e) => setEditValue(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                commitEdit(editValue);
-              }
-              if (e.key === 'Escape') {
-                e.preventDefault();
-                cancelEdit();
-              }
-              // Prevent G6 keyboard handlers from interfering
-              e.stopPropagation();
-            }}
-            onBlur={() => commitEdit(editValue)}
-            style={{
-              fontSize: metrics?.fontSize ?? (isRoot ? 14 : 12),
-              fontWeight: metrics?.fontWeight ?? (isRoot ? 600 : 500),
-              lineHeight: `${metrics?.lineHeight ?? (isRoot ? 22 : 19)}px`,
-            }}
-            autoFocus
-          />
-        </div>
+        />
       )}
     </div>
   );
