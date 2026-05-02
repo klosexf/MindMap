@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -414,7 +415,7 @@ async function extractPdfText(buffer: Uint8Array): Promise<{
     }
 
     return {
-      text: pageTexts.map(({ page, text }) => `## Page ${page}\n\n${text}`).join('\n\n'),
+      text: pageTexts.map(({ page, text }) => `---\n[page:${page}]\n\n${text}`).join('\n\n'),
       pages: pdf.numPages,
       pageTexts,
     };
@@ -922,60 +923,67 @@ async function getPdfPageCount(buffer: Uint8Array): Promise<number | undefined> 
   }
 }
 
+async function asyncPool<T>(concurrency: number, items: T[], fn: (item: T) => Promise<void>): Promise<void> {
+  const executing = new Set<Promise<void>>();
+  for (const item of items) {
+    const p = fn(item).finally(() => { executing.delete(p); });
+    executing.add(p);
+    if (executing.size >= concurrency) {
+      await Promise.race(executing);
+    }
+  }
+  await Promise.all(executing);
+}
+
 async function ocrPdfPagesWithVlm(
   buffer: Uint8Array,
   maxPages: number,
   config: VlmOcrConfig,
 ): Promise<OcrPagesResult> {
-  const pageTexts: Array<{ page: number; text: string }> = [];
-  const pageDebugs: OcrPageDebug[] = [];
-  const errorMessages: string[] = [];
-  let attemptedPages = 0;
+  const pages = Array.from({ length: maxPages }, (_, i) => i + 1);
+  const results: Array<{
+    page: number;
+    rawText: string;
+    cleanedText: string;
+    accepted: boolean;
+    reason?: string;
+  }> = [];
 
-  for (let page = 1; page <= maxPages; page += 1) {
-    attemptedPages += 1;
-    try {
-      const pageImage = await renderPdfPageToPng(buffer, page);
-      const rawText = await recognizeImageWithVlmOcr(pageImage, config);
-      const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
+  await Promise.all(
+    pages.map((page) =>
+      (async () => {
+        try {
+          const pageImage = await renderPdfPageToPng(buffer, page);
+          const rawText = await recognizeImageWithVlmOcr(pageImage, config);
+          const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
 
-      if (cleanedText.length >= 12) {
-        pageTexts.push({ page, text: cleanedText });
-        pageDebugs.push({
-          page,
-          rawText,
-          cleanedText,
-          accepted: true,
-        });
-      } else {
-        const reason = 'vlm_ocr_text_too_short';
-        errorMessages.push(`page_${page}:${reason}`);
-        pageDebugs.push({
-          page,
-          rawText,
-          cleanedText,
-          accepted: false,
-          reason,
-        });
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'unknown_vlm_ocr_page_error';
-      errorMessages.push(`page_${page}:${message}`);
-      pageDebugs.push({
-        page,
-        rawText: '',
-        cleanedText: '',
-        accepted: false,
-        reason: message,
-      });
-    }
-  }
+          if (cleanedText.length >= 12) {
+            results.push({ page, rawText, cleanedText, accepted: true });
+          } else {
+            results.push({ page, rawText, cleanedText, accepted: false, reason: 'vlm_ocr_text_too_short' });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'unknown_vlm_ocr_page_error';
+          results.push({ page, rawText: '', cleanedText: '', accepted: false, reason: message });
+        }
+      })(),
+    ),
+  );
+
+  // Sort results by page number to maintain order
+  results.sort((a, b) => a.page - b.page);
 
   return {
-    pageTexts,
-    pageDebugs,
-    attemptedPages,
-    errorMessages,
+    pageTexts: results.filter((r) => r.accepted).map((r) => ({ page: r.page, text: r.cleanedText })),
+    pageDebugs: results.map((r) => ({
+      page: r.page,
+      rawText: r.rawText,
+      cleanedText: r.cleanedText,
+      accepted: r.accepted,
+      ...(r.reason ? { reason: r.reason } : {}),
+    })),
+    attemptedPages: maxPages,
+    errorMessages: results.filter((r) => !r.accepted).map((r) => `page_${r.page}:${r.reason}`),
     provider: config.provider,
     model: config.model,
   };
@@ -986,70 +994,55 @@ async function ocrPdfPagesWithPaddle(
   maxPages: number,
   config: PaddleOcrConfig,
 ): Promise<OcrPagesResult> {
-  const pageTexts: Array<{ page: number; text: string }> = [];
-  const pageDebugs: OcrPageDebug[] = [];
-  const errorMessages: string[] = [];
-  let attemptedPages = 0;
+  const pages = Array.from({ length: maxPages }, (_, i) => i + 1);
+  const results: Array<{
+    page: number;
+    rawText: string;
+    cleanedText: string;
+    accepted: boolean;
+    reason?: string;
+  }> = [];
 
-  for (let page = 1; page <= maxPages; page += 1) {
-    attemptedPages += 1;
-    try {
-      const pageImage = await renderPdfPageToPng(buffer, page);
-      const { rawText } = await recognizeImageWithPaddleOcr(pageImage, page, config);
-      const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
+  await Promise.all(
+    pages.map((page) =>
+      (async () => {
+        try {
+          const pageImage = await renderPdfPageToPng(buffer, page);
+          const { rawText } = await recognizeImageWithPaddleOcr(pageImage, page, config);
+          const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
 
-      if (cleanedText.length >= 12) {
-        const maybeGarbled = isPdfTextGarbled(cleanedText);
-        const recoverable = hasRecoverableTextSignals(cleanedText);
-        if (maybeGarbled && !recoverable) {
-          const reason = 'paddle_ocr_text_appears_garbled';
-          errorMessages.push(`page_${page}:${reason}`);
-          pageDebugs.push({
-            page,
-            rawText,
-            cleanedText,
-            accepted: false,
-            reason,
-          });
-          continue;
+          if (cleanedText.length >= 12) {
+            const maybeGarbled = isPdfTextGarbled(cleanedText);
+            const recoverable = hasRecoverableTextSignals(cleanedText);
+            if (maybeGarbled && !recoverable) {
+              results.push({ page, rawText, cleanedText, accepted: false, reason: 'paddle_ocr_text_appears_garbled' });
+              return;
+            }
+            results.push({ page, rawText, cleanedText, accepted: true });
+          } else {
+            results.push({ page, rawText, cleanedText, accepted: false, reason: 'paddle_ocr_text_too_short' });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'unknown_paddle_ocr_page_error';
+          results.push({ page, rawText: '', cleanedText: '', accepted: false, reason: message });
         }
+      })(),
+    ),
+  );
 
-        pageTexts.push({ page, text: cleanedText });
-        pageDebugs.push({
-          page,
-          rawText,
-          cleanedText,
-          accepted: true,
-        });
-      } else {
-        const reason = 'paddle_ocr_text_too_short';
-        errorMessages.push(`page_${page}:${reason}`);
-        pageDebugs.push({
-          page,
-          rawText,
-          cleanedText,
-          accepted: false,
-          reason,
-        });
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'unknown_paddle_ocr_page_error';
-      errorMessages.push(`page_${page}:${message}`);
-      pageDebugs.push({
-        page,
-        rawText: '',
-        cleanedText: '',
-        accepted: false,
-        reason: message,
-      });
-    }
-  }
+  results.sort((a, b) => a.page - b.page);
 
   return {
-    pageTexts,
-    pageDebugs,
-    attemptedPages,
-    errorMessages,
+    pageTexts: results.filter((r) => r.accepted).map((r) => ({ page: r.page, text: r.cleanedText })),
+    pageDebugs: results.map((r) => ({
+      page: r.page,
+      rawText: r.rawText,
+      cleanedText: r.cleanedText,
+      accepted: r.accepted,
+      ...(r.reason ? { reason: r.reason } : {}),
+    })),
+    attemptedPages: maxPages,
+    errorMessages: results.filter((r) => !r.accepted).map((r) => `page_${r.page}:${r.reason}`),
     provider: 'paddleocr',
     model: `lang:${config.lang}`,
   };
@@ -1152,111 +1145,93 @@ async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): P
   const cachePath = process.env.TESSERACT_CACHE_PATH?.trim();
   const gzip = process.env.TESSERACT_GZIP === 'false' ? false : undefined;
   const workerPath = process.env.TESSERACT_WORKER_PATH?.trim() || tesseractWorkerPath();
-  const worker = await Tesseract.createWorker('eng+chi_sim', undefined, {
-    workerPath,
-    ...(langPath ? { langPath } : {}),
-    ...(cachePath ? { cachePath } : {}),
-    ...(gzip !== undefined ? { gzip } : {}),
-  });
 
-  const pageTexts: Array<{ page: number; text: string }> = [];
-  const pageDebugs: OcrPageDebug[] = [];
-  const errorMessages: string[] = [];
-  let attemptedPages = 0;
+  const results: Array<{
+    page: number;
+    rawText: string;
+    cleanedText: string;
+    accepted: boolean;
+    reason?: string;
+  }> = [];
 
-  try {
-    if (typeof worker.setParameters === 'function') {
-      await worker.setParameters({
-        tessedit_pageseg_mode: Tesseract.PSM.AUTO,
-        preserve_interword_spaces: '1',
-        user_defined_dpi: '300',
-      });
-    }
-
-    for (let page = 1; page <= maxPages; page += 1) {
-      attemptedPages += 1;
-      try {
-        const pageImage = await renderPdfPageToPng(buffer, page);
-        const tempRoot = path.join(process.cwd(), '.cache', 'ocr-tmp');
-        await mkdir(tempRoot, { recursive: true });
-        const workDir = await mkdtemp(path.join(tempRoot, `mindmap-ocr-page-${page}-`));
-        const imagePath = path.join(workDir, `page-${page}.png`);
-        let result: Awaited<ReturnType<typeof worker.recognize>>;
-        try {
-          await writeFile(imagePath, Buffer.isBuffer(pageImage) ? pageImage : Buffer.from(pageImage));
-          result = await worker.recognize(imagePath);
-        } finally {
-          await rm(workDir, { recursive: true, force: true });
-        }
-        const rawText = result.data.text?.replace(/\s+/g, ' ').trim() ?? '';
-        const cleanedText = rawText ? sanitizeOcrText(rawText) : '';
-
-        if (rawText.length > PDF_OCR_MIN_LENGTH) {
-          const candidate = cleanedText.length >= 12 ? cleanedText : rawText;
-          const maybeGarbled = isPdfTextGarbled(candidate);
-          const recoverable = hasRecoverableTextSignals(candidate);
-
-          if (maybeGarbled && !recoverable) {
-            const reason = 'ocr_text_appears_garbled';
-            errorMessages.push(`page_${page}:${reason}`);
-            pageDebugs.push({
-              page,
-              rawText,
-              cleanedText,
-              accepted: false,
-              reason,
-            });
-            continue;
-          }
-
-          const minLength = recoverable ? 12 : PDF_OCR_MIN_LENGTH;
-          if (candidate.length >= minLength) {
-            pageTexts.push({ page, text: candidate });
-            pageDebugs.push({
-              page,
-              rawText,
-              cleanedText: candidate,
-              accepted: true,
-            });
-          } else {
-            const reason = 'ocr_text_too_short';
-            errorMessages.push(`page_${page}:${reason}`);
-            pageDebugs.push({
-              page,
-              rawText,
-              cleanedText,
-              accepted: false,
-              reason,
-            });
-          }
-        } else {
-          const reason = 'ocr_text_too_short';
-          errorMessages.push(`page_${page}:${reason}`);
-          pageDebugs.push({
-            page,
-            rawText,
-            cleanedText,
-            accepted: false,
-            reason,
-          });
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'unknown_ocr_page_error';
-        errorMessages.push(`page_${page}:${message}`);
-        pageDebugs.push({
-          page,
-          rawText: '',
-          cleanedText: '',
-          accepted: false,
-          reason: message,
+  const processPage = async (page: number) => {
+    const worker = await Tesseract.createWorker('eng+chi_sim', undefined, {
+      workerPath,
+      ...(langPath ? { langPath } : {}),
+      ...(cachePath ? { cachePath } : {}),
+      ...(gzip !== undefined ? { gzip } : {}),
+    });
+    try {
+      if (typeof worker.setParameters === 'function') {
+        await worker.setParameters({
+          tessedit_pageseg_mode: Tesseract.PSM.AUTO,
+          preserve_interword_spaces: '1',
+          user_defined_dpi: '300',
         });
       }
-    }
 
-    return { pageTexts, pageDebugs, attemptedPages, errorMessages, provider: 'tesseract', model: 'eng+chi_sim' };
-  } finally {
-    await worker.terminate();
-  }
+      const pageImage = await renderPdfPageToPng(buffer, page);
+      const tempRoot = path.join(process.cwd(), '.cache', 'ocr-tmp');
+      await mkdir(tempRoot, { recursive: true });
+      const workDir = await mkdtemp(path.join(tempRoot, `mindmap-ocr-page-${page}-`));
+      const imagePath = path.join(workDir, `page-${page}.png`);
+      let recognizeResult: Awaited<ReturnType<typeof worker.recognize>>;
+      try {
+        await writeFile(imagePath, Buffer.isBuffer(pageImage) ? pageImage : Buffer.from(pageImage));
+        recognizeResult = await worker.recognize(imagePath);
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
+      const rawText = recognizeResult.data.text?.replace(/\s+/g, ' ').trim() ?? '';
+      const cleanedText = rawText ? sanitizeOcrText(rawText) : '';
+
+      if (rawText.length > PDF_OCR_MIN_LENGTH) {
+        const candidate = cleanedText.length >= 12 ? cleanedText : rawText;
+        const maybeGarbled = isPdfTextGarbled(candidate);
+        const recoverable = hasRecoverableTextSignals(candidate);
+
+        if (maybeGarbled && !recoverable) {
+          results.push({ page, rawText, cleanedText, accepted: false, reason: 'ocr_text_appears_garbled' });
+          return;
+        }
+
+        const minLength = recoverable ? 12 : PDF_OCR_MIN_LENGTH;
+        if (candidate.length >= minLength) {
+          results.push({ page, rawText, cleanedText: candidate, accepted: true });
+        } else {
+          results.push({ page, rawText, cleanedText, accepted: false, reason: 'ocr_text_too_short' });
+        }
+      } else {
+        results.push({ page, rawText, cleanedText, accepted: false, reason: 'ocr_text_too_short' });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown_ocr_page_error';
+      results.push({ page, rawText: '', cleanedText: '', accepted: false, reason: message });
+    } finally {
+      await worker.terminate();
+    }
+  };
+
+  // Run pages in parallel with concurrency limit of 3 to avoid excessive Tesseract memory
+  const pages = Array.from({ length: maxPages }, (_, i) => i + 1);
+  await asyncPool(3, pages, processPage);
+
+  results.sort((a, b) => a.page - b.page);
+
+  return {
+    pageTexts: results.filter((r) => r.accepted).map((r) => ({ page: r.page, text: r.cleanedText })),
+    pageDebugs: results.map((r) => ({
+      page: r.page,
+      rawText: r.rawText,
+      cleanedText: r.cleanedText,
+      accepted: r.accepted,
+      ...(r.reason ? { reason: r.reason } : {}),
+    })),
+    attemptedPages: maxPages,
+    errorMessages: results.filter((r) => !r.accepted).map((r) => `page_${r.page}:${r.reason}`),
+    provider: 'tesseract',
+    model: 'eng+chi_sim',
+  };
 }
 
 async function ocrPdfPages(
@@ -1361,6 +1336,42 @@ async function ocrPdfPages(
   return ocrPdfPagesWithTesseract(buffer, maxPages);
 }
 
+const PDF_TEXT_CACHE_DIR = path.join(process.cwd(), '.cache', 'pdf-text');
+
+interface CachedPdfText {
+  text: string;
+  pages: number;
+  pageTexts: Array<{ page: number; text: string }>;
+}
+
+function getPdfCacheKey(rawBytes: Uint8Array): string {
+  return createHash('sha256').update(rawBytes).digest('hex');
+}
+
+async function getCachedPdfText(hash: string): Promise<CachedPdfText | null> {
+  try {
+    const filePath = path.join(PDF_TEXT_CACHE_DIR, `${hash}.json`);
+    const raw = await readFile(filePath, 'utf-8');
+    const data = JSON.parse(raw) as CachedPdfText & { v?: number };
+    if (typeof data.text === 'string' && typeof data.pages === 'number' && Array.isArray(data.pageTexts)) {
+      return { text: data.text, pages: data.pages, pageTexts: data.pageTexts };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function setCachedPdfText(hash: string, data: CachedPdfText): Promise<void> {
+  try {
+    await mkdir(PDF_TEXT_CACHE_DIR, { recursive: true });
+    const filePath = path.join(PDF_TEXT_CACHE_DIR, `${hash}.json`);
+    await writeFile(filePath, JSON.stringify({ ...data, v: 1 }), 'utf-8');
+  } catch {
+    // cache write failure is non-fatal
+  }
+}
+
 export async function parsePdfInput(
   base64Data: string,
   fileName = 'document.pdf',
@@ -1381,25 +1392,39 @@ export async function parsePdfInput(
   let ocrModel: string | undefined;
 
   let textIsGarbled = false;
+  const pdfHash = getPdfCacheKey(rawBytes);
 
-  try {
-    const { text, pages, pageTexts: extractedPageTexts } = await extractPdfText(rawBytes);
-    extracted = text;
-    pdfPageCountHint = pages;
-    pageTexts = extractedPageTexts;
+  // Try cache first — skip expensive pdfjs text extraction on repeat visits
+  const cached = await getCachedPdfText(pdfHash);
+  if (cached) {
+    extracted = cached.text;
+    pdfPageCountHint = cached.pages;
+    pageTexts = cached.pageTexts.map(({ page, text }) => ({ page, text }));
+  } else {
+    try {
+      const { text, pages, pageTexts: extractedPageTexts } = await extractPdfText(rawBytes);
+      extracted = text;
+      pdfPageCountHint = pages;
+      pageTexts = extractedPageTexts;
 
-    // Detect garbled text from missing ToUnicode CMap — treat as no valid text
-    const extractedBody = extracted.replace(/## Page \d+\n\n/g, '');
-    if (extracted && isPdfTextGarbled(extractedBody) && !hasRecoverableTextSignals(extractedBody)) {
-      textIsGarbled = true;
-      extractionErrorMessage = 'extracted_text_appears_garbled';
+      // Cache the raw extraction result before garbled-detection cleanup
+      if (text) {
+        setCachedPdfText(pdfHash, { text, pages, pageTexts: extractedPageTexts }).catch(() => {});
+      }
+
+      // Detect garbled text from missing ToUnicode CMap — treat as no valid text
+      const extractedBody = extracted.replace(/---\n\[page:\d+\]\n\n/g, '');
+      if (extracted && isPdfTextGarbled(extractedBody) && !hasRecoverableTextSignals(extractedBody)) {
+        textIsGarbled = true;
+        extractionErrorMessage = 'extracted_text_appears_garbled';
+        extracted = '';
+        pageTexts = [];
+      }
+    } catch (error) {
       extracted = '';
-      pageTexts = [];
+      extractionErrorMessage = error instanceof Error ? error.message : 'unknown_error';
+      pdfPageCountHint = (await getPdfPageCount(rawBytes)) ?? Math.max(1, getOcrMaxPages());
     }
-  } catch (error) {
-    extracted = '';
-    extractionErrorMessage = error instanceof Error ? error.message : 'unknown_error';
-    pdfPageCountHint = (await getPdfPageCount(rawBytes)) ?? Math.max(1, getOcrMaxPages());
   }
 
   let mergedText = extracted;
@@ -1429,8 +1454,8 @@ export async function parsePdfInput(
       ocrModel = ocrResult.model;
 
       if (ocrResult.pageTexts.length > 0) {
-        const ocrPageTexts = ocrResult.pageTexts.map(({ page, text }) => ({ page, heading: `OCR Page ${page}`, text }));
-        const ocrText = ocrPageTexts.map(({ page, text }) => `## OCR Page ${page}\n\n${text}`).join('\n\n');
+        const ocrPageTexts = ocrResult.pageTexts.map(({ page, text }) => ({ page, heading: `OCR 第${page}页`, text }));
+        const ocrText = ocrPageTexts.map(({ page, text }) => `---\n[ocr-page:${page}]\n\n${text}`).join('\n\n');
         ocrUsed = true;
 
         // Keep extracted text as primary when it already has readable content.
@@ -1492,7 +1517,7 @@ export async function parsePdfInput(
       location: `page:${page}`,
       text: text.slice(0, 240),
     });
-    return chunkMarkdown(`# ${fileName}\n\n## ${heading || `Page ${page}`}\n\n${text}`, pageSourceRef);
+    return chunkMarkdown(`# ${fileName}\n\n---\n[${heading || `page:${page}`}]\n\n${text}`, pageSourceRef);
   });
 
   const validChunks = chunks.length > 0 ? chunks : chunkMarkdown(markdown, sourceRef);
@@ -1533,6 +1558,6 @@ export function encodeFileToBase64(fileBuffer: ArrayBuffer): string {
 }
 
 export function getPdfStats(doc: NormalizedDocument): { pagesHint: number } {
-  const matches = doc.markdown.match(/## Page /g);
+  const matches = doc.markdown.match(/\[page:\d+\]/g);
   return { pagesHint: matches?.length ?? 1 };
 }

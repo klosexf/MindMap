@@ -126,8 +126,8 @@ describe('parseInput', () => {
     expect(doc.chunks).toHaveLength(2);
     expect(doc.chunks[0].sourceRef.page).toBe(1);
     expect(doc.chunks[1].sourceRef.page).toBe(2);
-    expect(doc.chunks[0].text).toContain('## Page 1');
-    expect(doc.chunks[1].text).toContain('## Page 2');
+    expect(doc.chunks[0].text).toContain('[page:1]');
+    expect(doc.chunks[1].text).toContain('[page:2]');
   });
 
   it('runs OCR by default for low-text pdf files', async () => {

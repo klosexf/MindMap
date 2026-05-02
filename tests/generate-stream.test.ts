@@ -52,25 +52,27 @@ describe('generateMindMapStream', () => {
       markdown: [
         '# Demo PDF',
         '',
-        '## Page 1',
+        '---',
+        '[page:1]',
         '',
         'Authentication flow changes. Users receive progress reminders.',
         '',
-        '## Page 2',
+        '---',
+        '[page:2]',
         '',
         'Enterprise certification changes. Signing QR codes are simplified.',
       ].join('\n'),
       chunks: [
         {
           id: 'page_1',
-          text: '## Page 1\n\nAuthentication flow changes. Users receive progress reminders.',
-          tokenEstimate: 18,
+          text: '# Demo PDF\n\n---\n[page:1]\n\nAuthentication flow changes. Users receive progress reminders.',
+          tokenEstimate: 22,
           sourceRef: { type: 'pdf', page: 1, location: 'page:1', text: 'Authentication flow changes.' },
         },
         {
           id: 'page_2',
-          text: '## Page 2\n\nEnterprise certification changes. Signing QR codes are simplified.',
-          tokenEstimate: 18,
+          text: '# Demo PDF\n\n---\n[page:2]\n\nEnterprise certification changes. Signing QR codes are simplified.',
+          tokenEstimate: 22,
           sourceRef: { type: 'pdf', page: 2, location: 'page:2', text: 'Enterprise certification changes.' },
         },
       ],
@@ -105,7 +107,9 @@ describe('generateMindMapStream', () => {
     }
 
     const branchTitles = completeTree?.root.children?.map((child) => child.content);
-    expect(branchTitles).toEqual(['Page 1', 'Page 2']);
+    expect(branchTitles).not.toContain('Page 1');
+    expect(branchTitles).not.toContain('Page 2');
+    expect(branchTitles?.length).toBeGreaterThanOrEqual(2);
     expect(completeTree?.root.children?.[0].children?.[0].content).toContain('Authentication flow changes');
     expect(completeTree?.root.children?.[1].meta.sourceRef.page).toBe(2);
   });
@@ -115,7 +119,8 @@ describe('generateMindMapStream', () => {
       markdown: [
         '# 【产品经理_深圳 15-20K】谭艳丽 9年.pdf',
         '',
-        '## OCR Page 1',
+        '---',
+        '[ocr-page:1]',
         '',
         '5czbz0scfs6d91271XB639m_EFZUxoz:WPqaWOWnfrwWMFaA 一 REE 1993.07.04 | 13352824120 |',
         '求职 目标 : 产品 经 理 自我 评价 ETTOOIROTTOEYTSOTCORTOT GTR, SRR, REE, MPSSRRILH, SESBUR 25% RS: PEROT',
@@ -128,7 +133,8 @@ describe('generateMindMapStream', () => {
         {
           id: 'ocr_page_1',
           text: [
-            '## OCR Page 1',
+            '---',
+            '[ocr-page:1]',
             '',
             '5czbz0scfs6d91271XB639m_EFZUxoz:WPqaWOWnfrwWMFaA 一 REE 1993.07.04 | 13352824120 |',
             '求职 目标 : 产品 经 理 自我 评价 ETTOOIROTTOEYTSOTCORTOT GTR, SRR, REE, MPSSRRILH, SESBUR 25% RS: PEROT',
@@ -193,7 +199,8 @@ describe('generateMindMapStream', () => {
       markdown: [
         '# 简历',
         '',
-        '## Page 1',
+        '---',
+        '[page:1]',
         '',
         '2019 年 6 月-2024 年 11 月 产品经理 深圳市也觉有限公司。',
         'Sit 产品再 28 天 ii Ao 关机 os 年 6 有 2024 年 1 月 aon Git 10 Pe Re Rrra Frome mpe 9。',
@@ -202,7 +209,8 @@ describe('generateMindMapStream', () => {
         {
           id: 'page_1',
           text: [
-            '## Page 1',
+            '---',
+            '[page:1]',
             '',
             '2019 年 6 月-2024 年 11 月 产品经理 深圳市也觉有限公司。',
             'Sit 产品再 28 天 ii Ao 关机 os 年 6 有 2024 年 1 月 aon Git 10 Pe Re Rrra Frome mpe 9。',

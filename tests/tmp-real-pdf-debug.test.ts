@@ -25,8 +25,8 @@ describe('real pdf debug', () => {
     const payload = {
       markdownLength: doc.markdown.length,
       markdownPreview: doc.markdown.slice(0, 1200),
-      pageHeadingCount: (doc.markdown.match(/## Page \d+/g) || []).length,
-      ocrPageHeadingCount: (doc.markdown.match(/## OCR Page \d+/g) || []).length,
+      pageHeadingCount: (doc.markdown.match(/\[page:\d+\]/g) || []).length,
+      ocrPageHeadingCount: (doc.markdown.match(/\[ocr-page:\d+\]/g) || []).length,
       chunkCount: doc.chunks.length,
       chunkMeta: doc.chunks.map((c) => ({
         id: c.id,

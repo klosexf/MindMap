@@ -292,7 +292,15 @@ function cleanMarkdownForLLM(markdown: string): string {
 
     // Keep markdown headings
     if (/^#{1,6}\s+/.test(trimmed)) {
+      const headingText = trimmed.replace(/^#{1,6}\s+/, '').trim();
+      if (PAGE_LABEL_RE.test(headingText)) {
+        continue;
+      }
       result.push(trimmed);
+      continue;
+    }
+
+    if (/^---$/.test(trimmed) || /^\[(?:page|ocr-page):\d+\]$/.test(trimmed)) {
       continue;
     }
 
@@ -461,9 +469,17 @@ function lightCleanMarkdown(markdown: string): string {
       continue;
     }
 
-    // Always keep headings
+    // Always keep headings (except page-label headings)
     if (/^#{1,6}\s+/.test(trimmed)) {
+      const headingText = trimmed.replace(/^#{1,6}\s+/, '').trim();
+      if (PAGE_LABEL_RE.test(headingText)) {
+        continue;
+      }
       result.push(trimmed);
+      continue;
+    }
+
+    if (/^---$/.test(trimmed) || /^\[(?:page|ocr-page):\d+\]$/.test(trimmed)) {
       continue;
     }
 
@@ -740,6 +756,10 @@ function sanitizeTreeNodeForOutput(node: MindMapNode): MindMapNode[] {
     return sanitizedChildren;
   }
 
+  if (PAGE_LABEL_RE.test(trimmed)) {
+    return sanitizedChildren;
+  }
+
   // Filter out nodes that look like a mix of numbers and fragments with no coherent meaning
   // e.g. "04 13352824120 92188547600 求职目标产品经理自我评价 25 20007"
   if (/^\d{2,}\s/.test(trimmed) && trimmed.split(/\s+/).filter(t => /^\d{4,}$/.test(t)).length >= 2) {
@@ -880,7 +900,7 @@ function extractSmartTitle(markdown: string, fileName?: string): string {
   for (const line of lines.slice(0, 10)) {
     if (/^#\s+/.test(line)) {
       const title = line.replace(/^#\s+/, '').trim();
-      if (title.length >= 2 && title.length <= 80 && !isGarbledText(title)) {
+      if (title.length >= 2 && title.length <= 80 && !isGarbledText(title) && !PAGE_LABEL_RE.test(title)) {
         return title;
       }
     }
@@ -889,7 +909,7 @@ function extractSmartTitle(markdown: string, fileName?: string): string {
   for (const line of lines.slice(0, 15)) {
     if (/^#{2,6}\s+/.test(line)) {
       const title = line.replace(/^#{2,6}\s+/, '').trim();
-      if (title.length >= 2 && title.length <= 80 && !isGarbledText(title)) {
+      if (title.length >= 2 && title.length <= 80 && !isGarbledText(title) && !PAGE_LABEL_RE.test(title)) {
         return title;
       }
     }
@@ -938,6 +958,8 @@ function extractSmartTitle(markdown: string, fileName?: string): string {
   return '思维导图';
 }
 
+const PAGE_LABEL_RE = /^(Page\s+\d+|OCR\s+Page\s+\d+|OCR\s+第\d+页|page:\d+|ocr-page:\d+|第\d+页)$/i;
+
 function titleFromChunk(text: string, index: number): string {
   const heading = text
     .split(/\n+/)
@@ -946,8 +968,20 @@ function titleFromChunk(text: string, index: number): string {
 
   if (heading) {
     const title = heading.replace(/^#{2,6}\s+/, '').trim();
-    if (title.length >= 2 && !isGarbledText(title)) {
+    if (title.length >= 2 && !isGarbledText(title) && !PAGE_LABEL_RE.test(title)) {
       return title.slice(0, 80);
+    }
+  }
+
+  const nonPageLines = text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line && !PAGE_LABEL_RE.test(line) && !/^---$/.test(line) && !/^\[.*:.*\]$/.test(line));
+
+  for (const line of nonPageLines.slice(0, 5)) {
+    const cleaned = line.replace(/^#{1,6}\s+/, '').trim();
+    if (cleaned.length >= 4 && cleaned.length <= 80 && !isGarbledText(cleaned) && !PAGE_LABEL_RE.test(cleaned)) {
+      return cleaned.slice(0, 80);
     }
   }
 

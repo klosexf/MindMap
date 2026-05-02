@@ -12,12 +12,12 @@ import { POST } from '../app/api/generate/mindmap-json/route';
 import type { NormalizedDocument } from '../lib/types/mindmap';
 
 const demoDoc: NormalizedDocument = {
-  markdown: '# Demo PDF\n\n## Page 1\n\n这是测试内容。',
+  markdown: '# Demo PDF\n\n---\n[page:1]\n\n这是测试内容。',
   chunks: [
     {
       id: 'chunk_1',
-      text: '## Page 1\n\n这是测试内容。',
-      tokenEstimate: 12,
+      text: '# Demo PDF\n\n---\n[page:1]\n\n这是测试内容。',
+      tokenEstimate: 16,
       sourceRef: { type: 'pdf', page: 1, location: 'page:1', text: '这是测试内容。' },
     },
   ],
