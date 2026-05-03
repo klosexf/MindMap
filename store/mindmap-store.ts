@@ -2,8 +2,8 @@
 
 import { create } from 'zustand';
 
-import type { LayoutDirection, MindMapTree, TreePatch } from '@/lib/types/mindmap';
-import { applyTreePatch, balanceChildren, findNode } from '@/lib/utils/tree';
+import type { LayoutDirection, MindMapTree, NodePosition, TreePatch } from '@/lib/types/mindmap';
+import { applyTreePatch, balanceChildren, findNode, findParentInfo } from '@/lib/utils/tree';
 
 interface MindMapState {
   tree: MindMapTree | null;
@@ -21,6 +21,7 @@ interface MindMapState {
   deleteNode: (nodeId: string) => void;
   setLayoutDirection: (direction: LayoutDirection) => void;
   moveNode: (nodeId: string, newParentId: string, index?: number) => void;
+  updateNodePosition: (nodeId: string, position: NodePosition) => void;
   balanceLayout: () => void;
 }
 
@@ -97,19 +98,6 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
     const tree = get().tree;
     if (!tree || tree.root.id === nodeId) return;
 
-    function findParentInfo(node: MindMapTree['root'], targetId: string): { parentId: string; index: number } | null {
-      if (!node.children?.length) return null;
-      const idx = node.children.findIndex((child) => child.id === targetId);
-      if (idx >= 0) return { parentId: node.id, index: idx + 1 };
-
-      for (const child of node.children) {
-        const found = findParentInfo(child, targetId);
-        if (found) return found;
-      }
-
-      return null;
-    }
-
     const parentInfo = findParentInfo(tree.root, nodeId);
     if (!parentInfo) return;
 
@@ -119,7 +107,7 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
       type: 'add',
       nodeId: newId,
       parentId: parentInfo.parentId,
-      index: parentInfo.index,
+      index: parentInfo.index + 1,
       node: {
         id: newId,
         content,
@@ -174,6 +162,14 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
       nodeId,
       newParentId,
       newIndex: index,
+      timestamp: Date.now(),
+    });
+  },
+  updateNodePosition: (nodeId, position) => {
+    get().applyPatch({
+      type: 'position',
+      nodeId,
+      position,
       timestamp: Date.now(),
     });
   },

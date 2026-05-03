@@ -38,12 +38,20 @@ export const nodeStyleSchema = z.object({
 
 export type NodeStyle = z.infer<typeof nodeStyleSchema>;
 
+export const nodePositionSchema = z.object({
+  x: z.number().finite(),
+  y: z.number().finite(),
+});
+
+export type NodePosition = z.infer<typeof nodePositionSchema>;
+
 export type MindMapNode = {
   id: string;
   content: string;
   children?: MindMapNode[];
   collapsed?: boolean;
   style?: NodeStyle;
+  position?: NodePosition;
   meta: NodeMeta;
 };
 
@@ -54,6 +62,7 @@ export const mindMapNodeSchema: z.ZodType<MindMapNode> = z.lazy(() =>
     children: z.array(mindMapNodeSchema).optional(),
     collapsed: z.boolean().optional(),
     style: nodeStyleSchema.optional(),
+    position: nodePositionSchema.optional(),
     meta: nodeMetaSchema,
   }),
 );
@@ -107,7 +116,7 @@ export type TreePatch =
   | {
       type: 'update';
       nodeId: string;
-      node: Partial<Pick<MindMapNode, 'content' | 'collapsed' | 'style' | 'meta'>>;
+      node: Partial<Pick<MindMapNode, 'content' | 'collapsed' | 'style' | 'position' | 'meta'>>;
       timestamp: number;
     }
   | {
@@ -125,6 +134,12 @@ export type TreePatch =
       nodeId: string;
       newParentId: string;
       newIndex: number;
+      timestamp: number;
+    }
+  | {
+      type: 'position';
+      nodeId: string;
+      position: NodePosition;
       timestamp: number;
     };
 
@@ -145,6 +160,7 @@ export const treePatchSchema = z.discriminatedUnion('type', [
         content: z.string().min(1).max(500).optional(),
         collapsed: z.boolean().optional(),
         style: nodeStyleSchema.optional(),
+        position: nodePositionSchema.optional(),
         meta: nodeMetaSchema.optional(),
       })
       .refine((v) => Object.keys(v).length > 0, 'update patch requires at least one field'),
@@ -165,6 +181,12 @@ export const treePatchSchema = z.discriminatedUnion('type', [
     nodeId: z.string().min(1),
     newParentId: z.string().min(1),
     newIndex: z.number().int().min(0),
+    timestamp: z.number().int(),
+  }),
+  z.object({
+    type: z.literal('position'),
+    nodeId: z.string().min(1),
+    position: nodePositionSchema,
     timestamp: z.number().int(),
   }),
 ]);

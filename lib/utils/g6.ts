@@ -7,6 +7,10 @@ interface HierarchyNode {
   id: string;
   content: string;
   collapsed: boolean;
+  position?: {
+    x: number;
+    y: number;
+  };
   children: HierarchyNode[];
 }
 
@@ -15,6 +19,7 @@ function toHierarchyNode(node: MindMapNode): HierarchyNode {
     id: node.id,
     content: node.content,
     collapsed: node.collapsed ?? false,
+    position: node.position,
     children: (node.children || []).map((child) => toHierarchyNode(child)),
   };
 }
@@ -84,7 +89,13 @@ export function toG6GraphData(tree: MindMapTree): GraphData {
   const hierarchy = toHierarchyNode(tree.root);
   const graph = treeToGraphData(hierarchy, {
     getNodeData: (node, depth) => {
-      const data = node as { id: string; content?: string; collapsed?: boolean; children?: string[] };
+      const data = node as {
+        id: string;
+        content?: string;
+        collapsed?: boolean;
+        position?: { x: number; y: number };
+        children?: string[];
+      };
       const size = getNodeSize(data.id, data.content || '', tree.root.id);
       const nodeData: NodeData = {
         id: data.id,
@@ -98,6 +109,7 @@ export function toG6GraphData(tree: MindMapTree): GraphData {
         },
         style: {
           collapsed: Boolean(data.collapsed),
+          ...(data.position ? { x: data.position.x, y: data.position.y } : {}),
         },
       };
       return nodeData;

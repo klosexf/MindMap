@@ -81,4 +81,43 @@ describe('applyTreePatch', () => {
 
     expect(countNodes(deleted.root)).toBe(1);
   });
+
+  it('stores node position patches without changing node content or children', () => {
+    const tree = sampleTree();
+    const added = applyTreePatch(tree, {
+      type: 'add',
+      nodeId: 'child1',
+      parentId: 'root',
+      index: 0,
+      node: {
+        id: 'child1',
+        content: 'Child 1',
+        children: [],
+        collapsed: false,
+        meta: {
+          sourceRef: { type: 'text', text: 'child' },
+          createdAt: Date.now(),
+          createdBy: 'user',
+          type: 'detail',
+        },
+      },
+      timestamp: Date.now(),
+    });
+
+    const positioned = applyTreePatch(added, {
+      type: 'position',
+      nodeId: 'child1',
+      position: { x: 320.5, y: -140.25 },
+      timestamp: Date.now(),
+    });
+
+    expect(positioned.root.children?.[0]).toMatchObject({
+      id: 'child1',
+      content: 'Child 1',
+      position: { x: 320.5, y: -140.25 },
+      children: [],
+    });
+    expect(positioned.meta.version).toBe(added.meta.version + 1);
+    expect(positioned.root.children?.[0].meta.editedBy).toBe('user');
+  });
 });

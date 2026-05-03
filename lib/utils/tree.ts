@@ -8,6 +8,27 @@ import {
 
 export const MAX_TREE_DEPTH = 3;
 export const MAX_TREE_NODES = 500;
+const DROP_CENTER_ZONE_WIDTH = 80;
+
+export type DropMoveMode = 'child' | 'sibling';
+export type DropSiblingPlacement = 'before' | 'after';
+
+export interface ParentInfo {
+  parentId: string;
+  index: number;
+}
+
+export interface PointLike {
+  x: number;
+  y: number;
+}
+
+export interface RectLike {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
 
 export function createSourceRefFallback(sourceRef: Partial<SourceReference>): SourceReference {
   return {
@@ -90,6 +111,77 @@ export function findNode(root: MindMapNode, nodeId: string): MindMapNode | undef
   return undefined;
 }
 
+export function findParentInfo(root: MindMapNode, nodeId: string): ParentInfo | null {
+  if (!root.children?.length) return null;
+
+  const index = root.children.findIndex((child) => child.id === nodeId);
+  if (index >= 0) {
+    return {
+      parentId: root.id,
+      index,
+    };
+  }
+
+  for (const child of root.children) {
+    const found = findParentInfo(child, nodeId);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+export function resolveDropMoveTarget(
+  root: MindMapNode,
+  movingNodeId: string,
+  targetNodeId: string,
+  mode: DropMoveMode,
+  siblingPlacement: DropSiblingPlacement = 'after',
+): { newParentId: string; newIndex: number } | null {
+  if (!movingNodeId || !targetNodeId) return null;
+  if (movingNodeId === targetNodeId) return null;
+  if (root.id === movingNodeId) return null;
+
+  const movingNode = findNode(root, movingNodeId);
+  const targetNode = findNode(root, targetNodeId);
+  if (!movingNode || !targetNode) return null;
+
+  if (mode === 'child') {
+    if (isDescendant(root, movingNodeId, targetNodeId)) return null;
+    const childCount = targetNode.children?.length ?? 0;
+    return {
+      newParentId: targetNodeId,
+      newIndex: childCount,
+    };
+  }
+
+  const targetParent = findParentInfo(root, targetNodeId);
+  if (!targetParent) return null;
+  if (movingNodeId === targetParent.parentId) return null;
+  if (isDescendant(root, movingNodeId, targetParent.parentId)) return null;
+
+  let newIndex = siblingPlacement === 'before' ? targetParent.index : targetParent.index + 1;
+  const movingParent = findParentInfo(root, movingNodeId);
+  if (movingParent && movingParent.parentId === targetParent.parentId && movingParent.index < newIndex) {
+    newIndex -= 1;
+  }
+
+  return {
+    newParentId: targetParent.parentId,
+    newIndex: Math.max(0, newIndex),
+  };
+}
+
+export function inferDropModeFromPoint(point: PointLike, rect: RectLike): DropMoveMode {
+  const centerX = rect.left + rect.width / 2;
+  const centerHalfWidth = Math.max(
+    16,
+    Math.min(DROP_CENTER_ZONE_WIDTH / 2, rect.width / 2),
+  );
+  const centerLeft = centerX - centerHalfWidth;
+  const centerRight = centerX + centerHalfWidth;
+  return point.x >= centerLeft && point.x <= centerRight ? 'child' : 'sibling';
+}
+
 export function applyTreePatch(tree: MindMapTree, patch: TreePatch): MindMapTree {
   const nextTree = structuredClone(tree);
 
@@ -158,6 +250,15 @@ export function applyTreePatch(tree: MindMapTree, patch: TreePatch): MindMapTree
       newParent.children = newParent.children ?? [];
       const safeIndex = Math.max(0, Math.min(patch.newIndex, newParent.children.length));
       newParent.children.splice(safeIndex, 0, movedNode);
+      break;
+    }
+    case 'position': {
+      const target = findNode(nextTree.root, patch.nodeId);
+      if (!target) return nextTree;
+
+      target.position = patch.position;
+      target.meta.editedAt = Date.now();
+      target.meta.editedBy = 'user';
       break;
     }
     default:

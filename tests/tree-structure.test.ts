@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import type { MindMapTree } from '../lib/types/mindmap';
-import { applyTreePatch, balanceChildren, isDescendant, removeNode } from '../lib/utils/tree';
+import {
+  applyTreePatch,
+  balanceChildren,
+  findParentInfo,
+  inferDropModeFromPoint,
+  isDescendant,
+  removeNode,
+  resolveDropMoveTarget,
+} from '../lib/utils/tree';
 
 function makeNode(id: string, content: string, children: MindMapTree['root']['children'] = []) {
   const now = Date.now();
@@ -274,5 +282,102 @@ describe('balanceChildren', () => {
     const originalIds = tree.root.children?.map((c) => c.id);
     balanceChildren(tree);
     expect(tree.root.children?.map((c) => c.id)).toEqual(originalIds);
+  });
+});
+
+describe('findParentInfo', () => {
+  it('returns parent id and index for direct child', () => {
+    const tree = sampleTree();
+    expect(findParentInfo(tree.root, 'c')).toEqual({ parentId: 'root', index: 2 });
+  });
+
+  it('returns parent id and index for nested child', () => {
+    const tree = sampleTree();
+    expect(findParentInfo(tree.root, 'a2')).toEqual({ parentId: 'a', index: 1 });
+  });
+
+  it('returns null for root and unknown node', () => {
+    const tree = sampleTree();
+    expect(findParentInfo(tree.root, 'root')).toBeNull();
+    expect(findParentInfo(tree.root, 'missing')).toBeNull();
+  });
+});
+
+describe('resolveDropMoveTarget', () => {
+  it('resolves child mode to append under target node', () => {
+    const tree = sampleTree();
+    expect(resolveDropMoveTarget(tree.root, 'b', 'a', 'child')).toEqual({
+      newParentId: 'a',
+      newIndex: 2,
+    });
+  });
+
+  it('resolves sibling mode after target with same parent index adjustment', () => {
+    const tree = sampleTree();
+    const target = resolveDropMoveTarget(tree.root, 'a', 'c', 'sibling');
+    expect(target).toEqual({ newParentId: 'root', newIndex: 2 });
+
+    const moved = applyTreePatch(tree, {
+      type: 'move',
+      nodeId: 'a',
+      newParentId: target!.newParentId,
+      newIndex: target!.newIndex,
+      timestamp: Date.now(),
+    });
+
+    expect(moved.root.children?.map((n) => n.id)).toEqual(['b', 'c', 'a', 'd']);
+  });
+
+  it('resolves sibling mode for move from later index to earlier target', () => {
+    const tree = sampleTree();
+    const target = resolveDropMoveTarget(tree.root, 'd', 'b', 'sibling');
+    expect(target).toEqual({ newParentId: 'root', newIndex: 2 });
+
+    const moved = applyTreePatch(tree, {
+      type: 'move',
+      nodeId: 'd',
+      newParentId: target!.newParentId,
+      newIndex: target!.newIndex,
+      timestamp: Date.now(),
+    });
+
+    expect(moved.root.children?.map((n) => n.id)).toEqual(['a', 'b', 'd', 'c']);
+  });
+
+  it('supports sibling insertion before target', () => {
+    const tree = sampleTree();
+    const target = resolveDropMoveTarget(tree.root, 'd', 'b', 'sibling', 'before');
+    expect(target).toEqual({ newParentId: 'root', newIndex: 1 });
+
+    const moved = applyTreePatch(tree, {
+      type: 'move',
+      nodeId: 'd',
+      newParentId: target!.newParentId,
+      newIndex: target!.newIndex,
+      timestamp: Date.now(),
+    });
+
+    expect(moved.root.children?.map((n) => n.id)).toEqual(['a', 'd', 'b', 'c']);
+  });
+
+  it('rejects invalid sibling/child moves', () => {
+    const tree = sampleTree();
+    expect(resolveDropMoveTarget(tree.root, 'a', 'a1', 'child')).toBeNull();
+    expect(resolveDropMoveTarget(tree.root, 'a', 'a1', 'sibling')).toBeNull();
+    expect(resolveDropMoveTarget(tree.root, 'b', 'root', 'sibling')).toBeNull();
+    expect(resolveDropMoveTarget(tree.root, 'b', 'b', 'child')).toBeNull();
+  });
+});
+
+describe('inferDropModeFromPoint', () => {
+  const rect = { left: 100, top: 100, width: 200, height: 80 };
+
+  it('treats center area as child mode', () => {
+    expect(inferDropModeFromPoint({ x: 200, y: 140 }, rect)).toBe('child');
+  });
+
+  it('treats side areas as sibling mode', () => {
+    expect(inferDropModeFromPoint({ x: 110, y: 140 }, rect)).toBe('sibling');
+    expect(inferDropModeFromPoint({ x: 290, y: 140 }, rect)).toBe('sibling');
   });
 });

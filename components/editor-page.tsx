@@ -4,8 +4,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 
 import { EditorToolbar } from '@/components/editor-toolbar';
+import { AiSummaryPanel } from '@/components/ai-summary-panel';
 import { MindMapEditor, type MindMapEditorRef } from '@/components/mindmap-editor';
-import type { MindMapTree } from '@/lib/types/mindmap';
+import type { MindMapTree, NodePosition } from '@/lib/types/mindmap';
 import { useMindMapStore } from '@/store/mindmap-store';
 
 interface EditorPageProps {
@@ -31,6 +32,8 @@ export function EditorPage({ id }: EditorPageProps) {
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const savedVersionRef = useRef<number>(0);
+  const queuedSaveRef = useRef<MindMapTree | null>(null);
+  const saveInFlightRef = useRef(false);
 
   const tree = useMindMapStore((s) => s.tree);
   const selectedNodeId = useMindMapStore((s) => s.selectedNodeId);
@@ -44,6 +47,7 @@ export function EditorPage({ id }: EditorPageProps) {
   const toggleNodeCollapse = useMindMapStore((s) => s.toggleNodeCollapse);
   const setLayoutDirection = useMindMapStore((s) => s.setLayoutDirection);
   const moveNode = useMindMapStore((s) => s.moveNode);
+  const updateNodePosition = useMindMapStore((s) => s.updateNodePosition);
   const balanceLayout = useMindMapStore((s) => s.balanceLayout);
 
   const loadTree = useCallback(async () => {
@@ -120,33 +124,58 @@ export function EditorPage({ id }: EditorPageProps) {
     [deleteNode],
   );
 
-  const saveTree = useCallback(async () => {
-    if (!tree || saving) return;
+  const saveTreeSnapshot = useCallback(async (treeToSave: MindMapTree) => {
+    queuedSaveRef.current = treeToSave;
+    if (saveInFlightRef.current) return;
+
+    saveInFlightRef.current = true;
     setSaving(true);
     setNotice('保存中...');
-
     try {
-      const res = await fetch(`/api/mindmaps/${tree.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tree }),
-      });
+      while (queuedSaveRef.current) {
+        const nextTree = queuedSaveRef.current;
+        queuedSaveRef.current = null;
 
-      if (!res.ok) {
-        setNotice('保存失败');
-        return;
+        const res = await fetch(`/api/mindmaps/${nextTree.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tree: nextTree }),
+        });
+
+        if (!res.ok) {
+          setNotice('保存失败');
+          return;
+        }
+
+        savedVersionRef.current = nextTree.meta.version;
       }
 
-      savedVersionRef.current = tree.meta.version;
       setDirty(false);
       setNotice('已保存');
       setTimeout(() => setNotice(null), 1500);
     } catch {
       setNotice('保存失败');
     } finally {
+      saveInFlightRef.current = false;
       setSaving(false);
     }
-  }, [saving, tree]);
+  }, []);
+
+  const saveTree = useCallback(async () => {
+    if (!tree) return;
+    await saveTreeSnapshot(tree);
+  }, [saveTreeSnapshot, tree]);
+
+  const handleUpdateNodePosition = useCallback(
+    (nodeId: string, position: NodePosition) => {
+      updateNodePosition(nodeId, position);
+      const nextTree = useMindMapStore.getState().tree;
+      if (nextTree) {
+        void saveTreeSnapshot(nextTree);
+      }
+    },
+    [saveTreeSnapshot, updateNodePosition],
+  );
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -313,9 +342,12 @@ export function EditorPage({ id }: EditorPageProps) {
             onUpdateNodeContent={updateNodeContent}
             layoutDirection={layoutDirection}
             onMoveNode={moveNode}
+            onUpdateNodePosition={handleUpdateNodePosition}
             onEditEnd={handleEditEnd}
           />
         </div>
+
+        <AiSummaryPanel tree={tree} />
       </section>
     </main>
   );
