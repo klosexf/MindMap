@@ -171,15 +171,34 @@ export function resolveDropMoveTarget(
   };
 }
 
-export function inferDropModeFromPoint(point: PointLike, rect: RectLike): DropMoveMode {
-  const centerX = rect.left + rect.width / 2;
-  const centerHalfWidth = Math.max(
+export function inferDropModeFromPoint(
+  point: PointLike,
+  rect: RectLike,
+  direction: 'LR' | 'RL' | 'TB' | 'BT' = 'LR',
+): DropMoveMode {
+  const isHorizontalLayout = direction === 'LR' || direction === 'RL';
+
+  if (isHorizontalLayout) {
+    // For left↔right layouts: center horizontal zone = child, edges = sibling
+    const centerX = rect.left + rect.width / 2;
+    const centerHalfWidth = Math.max(
+      16,
+      Math.min(DROP_CENTER_ZONE_WIDTH / 2, rect.width / 2),
+    );
+    const centerLeft = centerX - centerHalfWidth;
+    const centerRight = centerX + centerHalfWidth;
+    return point.x >= centerLeft && point.x <= centerRight ? 'child' : 'sibling';
+  }
+
+  // For top↔bottom layouts: center vertical zone = child, edges = sibling
+  const centerY = rect.top + rect.height / 2;
+  const centerHalfHeight = Math.max(
     16,
-    Math.min(DROP_CENTER_ZONE_WIDTH / 2, rect.width / 2),
+    Math.min(DROP_CENTER_ZONE_WIDTH / 2, rect.height / 2),
   );
-  const centerLeft = centerX - centerHalfWidth;
-  const centerRight = centerX + centerHalfWidth;
-  return point.x >= centerLeft && point.x <= centerRight ? 'child' : 'sibling';
+  const centerTop = centerY - centerHalfHeight;
+  const centerBottom = centerY + centerHalfHeight;
+  return point.y >= centerTop && point.y <= centerBottom ? 'child' : 'sibling';
 }
 
 export function applyTreePatch(tree: MindMapTree, patch: TreePatch): MindMapTree {

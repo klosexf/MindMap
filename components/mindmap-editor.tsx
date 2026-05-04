@@ -5,6 +5,7 @@ import { Graph } from '@antv/g6';
 
 import type { LayoutDirection, MindMapTree, MindMapNode, NodePosition } from '@/lib/types/mindmap';
 import { getLayoutConfig, getNodeSize, toG6GraphData } from '@/lib/utils/g6';
+import { readGraphViewportState, restoreGraphViewportState } from '@/lib/utils/g6-viewport';
 import {
   countNodes,
   inferDropModeFromPoint,
@@ -66,7 +67,7 @@ function isPointInRect(point: { x: number; y: number }, rect: NodeClientRect): b
   );
 }
 
-const TRANSIENT_DRAG_STATES = ['dragging', 'drop-child', 'drop-sibling'] as const;
+const TRANSIENT_DRAG_STATES = ['dragging', 'drop-child', 'drop-sibling-before', 'drop-sibling-after'] as const;
 
 function getNodeTextMetrics(datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }, rootId: string): NodeTextMetrics {
   const size = getNodeSize(datum.id || '', datum.data?.label || '', rootId);
@@ -129,6 +130,8 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
   const onSelectNodeRef = useRef(onSelectNode);
   const onMoveNodeRef = useRef(onMoveNode);
   const onUpdateNodePositionRef = useRef(onUpdateNodePosition);
+  const skipNextLayoutRef = useRef(false);
+  const focusNodeIdOnNextRenderRef = useRef<string | null>(null);
 
   const commitEdit = useCallback(
     (value: string) => {
@@ -348,23 +351,38 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
             lineWidth: 2.4,
           },
           dragging: {
-            opacity: 0.82,
-            shadowColor: 'rgba(26,26,26,0.2)',
-            shadowBlur: 18,
-          },
-          'drop-child': {
-            stroke: '#1A1A1A',
-            lineWidth: 3,
-            fill: '#FFFDF4',
-            shadowColor: 'rgba(26,26,26,0.16)',
+            // Position-only: neutral gray — "just repositioning, no relationship change"
+            opacity: 0.88,
+            stroke: '#8B8B83',
+            lineWidth: 2,
+            shadowColor: 'rgba(107,114,128,0.25)',
             shadowBlur: 16,
           },
-          'drop-sibling': {
-            stroke: '#A06A00',
-            lineWidth: 2.4,
-            fill: '#FFF7E2',
-            shadowColor: 'rgba(160,106,0,0.18)',
-            shadowBlur: 12,
+          'drop-child': {
+            // Hierarchy change: blue — "will become a child of this node"
+            stroke: '#2563EB',
+            lineWidth: 3,
+            fill: '#EFF6FF',
+            shadowColor: 'rgba(37,99,235,0.28)',
+            shadowBlur: 22,
+          },
+          'drop-sibling-before': {
+            // Peer reorder before: amber with left/top accent
+            stroke: '#D97706',
+            lineWidth: 2.6,
+            fill: '#FFF7ED',
+            shadowColor: 'rgba(217,119,6,0.22)',
+            shadowBlur: 14,
+            shadowOffsetX: -4,
+          },
+          'drop-sibling-after': {
+            // Peer reorder after: amber with right/bottom accent
+            stroke: '#D97706',
+            lineWidth: 2.6,
+            fill: '#FFF7ED',
+            shadowColor: 'rgba(217,119,6,0.22)',
+            shadowBlur: 14,
+            shadowOffsetX: 4,
           },
         },
       },
@@ -378,7 +396,10 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       },
       behaviors: [
         'drag-canvas',
-        'zoom-canvas',
+        {
+          type: 'zoom-canvas',
+          trigger: ['Control'],
+        },
         'click-select',
         {
           type: 'drag-element',
@@ -393,8 +414,9 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     });
 
     const DROP_CHILD_STATE = 'drop-child';
-    const DROP_SIBLING_STATE = 'drop-sibling';
-    const DROP_STATES = [DROP_CHILD_STATE, DROP_SIBLING_STATE] as const;
+    const DROP_SIBLING_BEFORE_STATE = 'drop-sibling-before';
+    const DROP_SIBLING_AFTER_STATE = 'drop-sibling-after';
+    const DROP_STATES = [DROP_CHILD_STATE, DROP_SIBLING_BEFORE_STATE, DROP_SIBLING_AFTER_STATE] as const;
 
     const setNodeState = (nodeId: string, state: string, enabled: boolean) => {
       const currentStates = graph.getElementState(nodeId);
@@ -566,7 +588,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       const targetRect = readNodeClientRect(targetNodeId);
       let mode: DropMoveMode = 'child';
       if (targetRect && point) {
-        mode = inferDropModeFromPoint(point, targetRect);
+        mode = inferDropModeFromPoint(point, targetRect, layoutDirectionRef.current);
       }
 
       let siblingPlacement: DropSiblingPlacement = 'after';
@@ -600,29 +622,59 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       };
 
       const nodeData = graph.getNodeData() as Array<{ id?: string }>;
-      let nearest: { id: string; distance: number } | null = null;
+
+      // Phase 1: exact hit — dragging center is inside a target node
+      for (const node of nodeData) {
+        const nodeId = node?.id;
+        if (!nodeId || nodeId === draggingNodeId) continue;
+        const rect = readNodeClientRect(nodeId);
+        if (!rect) continue;
+        if (isPointInRect(draggingCenter, rect)) {
+          return buildDropPreviewForTarget(draggingNodeId, nodeId, draggingCenter);
+        }
+      }
+
+      // Phase 2: overlap-based detection — require ≥30% area overlap
+      // between the dragged node and a candidate target. This prevents
+      // accidental reparenting when nodes are merely near each other.
+      const draggedArea = draggingRect.width * draggingRect.height;
+      let bestOverlap: { id: string; ratio: number } | null = null;
 
       for (const node of nodeData) {
         const nodeId = node?.id;
         if (!nodeId || nodeId === draggingNodeId) continue;
-
         const rect = readNodeClientRect(nodeId);
         if (!rect) continue;
 
-        if (isPointInRect(draggingCenter, rect)) {
-          return buildDropPreviewForTarget(draggingNodeId, nodeId, draggingCenter);
-        }
+        const overlapLeft = Math.max(draggingRect.left, rect.left);
+        const overlapRight = Math.min(
+          draggingRect.left + draggingRect.width,
+          rect.left + rect.width,
+        );
+        const overlapTop = Math.max(draggingRect.top, rect.top);
+        const overlapBottom = Math.min(
+          draggingRect.top + draggingRect.height,
+          rect.top + rect.height,
+        );
 
-        const centerX = rect.left + rect.width / 2;
-        const centerY = rect.top + rect.height / 2;
-        const distance = Math.hypot(draggingCenter.x - centerX, draggingCenter.y - centerY);
-        if (!nearest || distance < nearest.distance) {
-          nearest = { id: nodeId, distance };
+        const overlapW = overlapRight - overlapLeft;
+        const overlapH = overlapBottom - overlapTop;
+        if (overlapW <= 0 || overlapH <= 0) continue;
+
+        const overlapArea = overlapW * overlapH;
+        const targetArea = rect.width * rect.height;
+        const ratio = overlapArea / Math.min(draggedArea, targetArea);
+
+        if (ratio >= 0.3 && (!bestOverlap || ratio > bestOverlap.ratio)) {
+          bestOverlap = { id: nodeId, ratio };
         }
       }
 
-      if (!nearest || nearest.distance > 180) return null;
-      return buildDropPreviewForTarget(draggingNodeId, nearest.id, draggingCenter);
+      if (bestOverlap) {
+        return buildDropPreviewForTarget(draggingNodeId, bestOverlap.id, draggingCenter);
+      }
+
+      return null; // Pure position move — no reparenting target
     };
 
     const clearDropPreview = () => {
@@ -666,7 +718,12 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       }
 
       clearDropStates(nextPreview.targetNodeId);
-      const previewState = nextPreview.mode === 'child' ? DROP_CHILD_STATE : DROP_SIBLING_STATE;
+      const previewState =
+        nextPreview.mode === 'child'
+          ? DROP_CHILD_STATE
+          : nextPreview.siblingPlacement === 'before'
+            ? DROP_SIBLING_BEFORE_STATE
+            : DROP_SIBLING_AFTER_STATE;
       setNodeState(nextPreview.targetNodeId, previewState, true);
       dropPreviewRef.current = nextPreview;
     };
@@ -728,10 +785,12 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       }
 
       if (preview) {
+        // Structural change: reparent the node, then focus viewport on it after render
+        focusNodeIdOnNextRenderRef.current = draggedNodeId;
         onMoveNodeRef.current(draggedNodeId, preview.moveTarget.newParentId, preview.moveTarget.newIndex);
-      }
-
-      if (finalPosition) {
+      } else if (finalPosition) {
+        // Position-only drag: skip full render, just persist position in place
+        skipNextLayoutRef.current = true;
         onUpdateNodePositionRef.current(draggedNodeId, finalPosition);
       }
 
@@ -753,16 +812,79 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     };
   }, [renderMode, startEditingNode]);
 
+  // Custom trackpad two-finger pan via native wheel events
+  // Replaces scroll-canvas behavior for consistent drag-direction mapping across browsers
+  useEffect(() => {
+    const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
+    if (!graph || graph.destroyed) return;
+
+    const container = containerRef.current;
+    if (!container) return;
+
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) return;
+
+      e.preventDefault();
+      graph.translateBy([e.deltaX, e.deltaY], false);
+    };
+
+    container.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      container.removeEventListener('wheel', onWheel);
+    };
+  }, [renderMode]);
+
+  const focusViewportOnNode = useCallback(async (graph: Graph, nodeId: string) => {
+    try {
+      const pos = graph.getElementPosition(nodeId);
+      if (!Array.isArray(pos) || pos.length < 2) return;
+      const [nx, ny] = pos;
+      if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
+
+      const canvasSize = graph.getSize();
+      const [cw, ch] = canvasSize;
+      const zoom = graph.getZoom();
+
+      const targetX = cw / 2 - nx * zoom;
+      const targetY = ch / 2 - ny * zoom;
+
+      await graph.translateTo([targetX, targetY], { duration: 300 });
+    } catch {
+      // Best-effort viewport focus
+    }
+  }, []);
+
   // Update graph data when tree changes
   useEffect(() => {
     const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
     if (!graph || graph.destroyed) return;
 
+    // Position-only updates (e.g. after a node drag with no reparenting)
+    // should not trigger a full setData+render cycle, because G6's render()
+    // resets the canvas viewport and the async restore races with G6 internals.
+    // Instead we only re-apply the persisted positions directly.
+    if (skipNextLayoutRef.current) {
+      skipNextLayoutRef.current = false;
+      applyPersistedNodePositions(graph, tree.root).catch(() => {});
+      return;
+    }
+
+    const focusNodeId = focusNodeIdOnNextRenderRef.current;
+    focusNodeIdOnNextRenderRef.current = null;
+
+    const viewportState = readGraphViewportState(graph);
     graph.setData(toG6GraphData(tree));
     graph
       .render()
       .then(async () => {
         await applyPersistedNodePositions(graph, tree.root);
+
+        if (focusNodeId) {
+          // After structural drag, center the viewport on the dragged node
+          await focusViewportOnNode(graph, focusNodeId);
+        } else {
+          await restoreGraphViewportState(graph, viewportState);
+        }
 
         const nodeData = graph.getNodeData() as Array<{ id?: string }>;
         const edgeData = graph.getEdgeData() as Array<{ id?: string }>;
@@ -792,7 +914,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
         }
       })
       .catch(() => {});
-  }, [tree]);
+  }, [tree, focusViewportOnNode]);
 
   // Update layout when direction changes
   useEffect(() => {
@@ -801,9 +923,11 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
 
     const applyLayout = async () => {
       try {
+        const viewportState = readGraphViewportState(graph);
         graph.setLayout(getLayoutConfig(layoutDirection));
         await graph.layout();
         await applyPersistedNodePositions(graph, treeRef.current.root);
+        await restoreGraphViewportState(graph, viewportState);
       } catch {
         // ignore layout errors during rapid switching
       }

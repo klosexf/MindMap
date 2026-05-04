@@ -817,13 +817,33 @@ function collectChunkSentences(doc: NormalizedDocument): Array<{ sentence: strin
 }
 
 function scoreSentenceForBranch(branchLabel: string, sentence: string): number {
-  const branchKeywords = branchLabel.match(/[\u3400-\u9fff]{2,6}|[A-Za-z]{3,}/g) || [];
-  if (branchKeywords.length === 0) return 0;
+  const branchKeywords = branchLabel.match(/[\u3400-\u9fff]{3,6}|[A-Za-z]{3,}/g) || [];
+  if (branchKeywords.length === 0) {
+    const shortKeywords = branchLabel.match(/[\u3400-\u9fff]{2}/g) || [];
+    if (shortKeywords.length === 0) return 0;
+    let shortScore = 0;
+    for (const kw of shortKeywords) {
+      if (sentence.includes(kw)) shortScore += 1;
+    }
+    return shortScore;
+  }
   let score = 0;
   for (const keyword of branchKeywords) {
-    if (sentence.includes(keyword)) score += 1;
+    if (sentence.includes(keyword)) {
+      score += keyword.length >= 4 ? 3 : 2;
+    }
   }
-  return score;
+  const conflictWords = [
+    '运营指标', '项目成果', '营收增长', '转化率提升', '成本降低', '周期缩短', '团队规模', '活跃度', '留存率', '送礼',
+    '交易结算', '结算', '对账', '清算', '报销', '审批', '付款', '收款', '发票', '税务',
+    '采购', '库存', '物流', '客服', '工单', '招聘', '考勤', '绩效', '预算', '合同',
+  ];
+  for (const conflictWord of conflictWords) {
+    if (sentence.includes(conflictWord)) {
+      score -= 1;
+    }
+  }
+  return Math.max(0, score);
 }
 
 function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): MindMapTree {
@@ -839,6 +859,9 @@ function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): Mi
   if (pool.length === 0) return tree;
   const usedSentences = new Set<string>();
 
+  const MIN_SCORE_THRESHOLD = 2;
+  const MAX_DETAILS_PER_BRANCH = 3;
+
   const nextRootChildren = topChildren.map((child) => {
     if ((child.children?.length || 0) > 0) return child;
     if (!isCategoryLikeLabel(child.content)) return child;
@@ -848,13 +871,13 @@ function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): Mi
         ...item,
         score: scoreSentenceForBranch(child.content, item.sentence),
       }))
+      .filter((item) => item.score >= MIN_SCORE_THRESHOLD)
       .sort((a, b) => b.score - a.score);
 
-    const selected = ranked.filter((item) => item.score > 0 && !usedSentences.has(item.sentence)).slice(0, 2);
-    if (selected.length === 0) {
-      const fallback = ranked.find((item) => !usedSentences.has(item.sentence));
-      if (fallback) selected.push(fallback);
-    }
+    const selected = ranked
+      .filter((item) => !usedSentences.has(item.sentence))
+      .slice(0, MAX_DETAILS_PER_BRANCH);
+
     if (selected.length === 0) return child;
 
     for (const item of selected) usedSentences.add(item.sentence);
@@ -880,7 +903,274 @@ function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): Mi
 export function repairSparseFirstLayerForDoc(tree: MindMapTree, doc: NormalizedDocument): MindMapTree {
   const fallbackTitle = tree.meta.title || doc.sourceMeta.title || '思维导图';
   const sanitized = sanitizeMindMapTreeForOutput(tree, fallbackTitle);
-  return ensureFirstLayerDetails(sanitized, doc);
+  const result = ensureFirstLayerDetails(sanitized, doc);
+  const validated = validateSemanticHierarchy(result);
+  const restructured = restructureOversizedBranches(validated);
+  return deduplicateNodeTitles(restructured);
+}
+
+export function validateSemanticHierarchy(tree: MindMapTree): MindMapTree {
+  const topChildren = tree.root.children;
+  if (!topChildren || topChildren.length === 0) return tree;
+
+  const SKILL_PARENT_KEYWORDS = ['技能', '技术', '能力', '专长', '工具'];
+  const NON_SKILL_CHILD_PATTERNS: Array<[RegExp, string]> = [
+    [/结算|清算|对账|报销|付款|收款|发票|税务/, '财务操作'],
+    [/审批|审核|流程|合规|监管|稽查|审计/, '审批/合规流程'],
+    [/运营|拉新|促活|留存|转化|活跃|增长|DAU|MAU/, '运营指标'],
+    [/采购|库存|物流|供应链|仓储|配送/, '供应链操作'],
+    [/客服|投诉|售后|工单|咨询|热线/, '客服操作'],
+    [/销售|拜访|签单|回款|客户开发|渠道/, '销售活动'],
+    [/招聘|面试|入职|离职|考勤|绩效|薪酬|培训/, 'HR操作'],
+    [/合同|法务|诉讼|仲裁|知识产权|商标/, '法务操作'],
+    [/预算|成本|费用|利润|营收|亏损|毛利/, '财务指标'],
+    [/市场|推广|投放|广告|品牌|PR|公关/, '市场活动'],
+  ];
+
+  const isSkillParent = (label: string): boolean => {
+    return SKILL_PARENT_KEYWORDS.some((kw) => label.includes(kw));
+  };
+
+  const isNonSkillChild = (childLabel: string): boolean => {
+    for (const [pattern, category] of NON_SKILL_CHILD_PATTERNS) {
+      if (pattern.test(childLabel)) return true;
+    }
+    return false;
+  };
+
+  const nextTopChildren = topChildren.map((parent) => {
+    if (!isSkillParent(parent.content)) return parent;
+    const parentChildren = parent.children;
+    if (!parentChildren || parentChildren.length === 0) return parent;
+
+    const filteredChildren = parentChildren.filter((child) => {
+      if (isNonSkillChild(child.content)) {
+        return false;
+      }
+      return true;
+    });
+
+    if (filteredChildren.length === parentChildren.length) return parent;
+
+    return {
+      ...parent,
+      children: filteredChildren,
+    };
+  });
+
+  const changed = nextTopChildren.some(
+    (child, i) => (child.children?.length ?? 0) !== (topChildren[i]?.children?.length ?? 0),
+  );
+
+  if (!changed) return tree;
+
+  return {
+    ...tree,
+    root: {
+      ...tree.root,
+      children: nextTopChildren,
+    },
+  };
+}
+
+const MAX_CHILDREN_PER_PARENT = 8;
+
+export function restructureOversizedBranches(tree: MindMapTree): MindMapTree {
+  let needsRestructure = false;
+
+  function checkNeeded(node: { children?: MindMapNode[] }, depth: number): void {
+    const children = node.children;
+    if (!children) return;
+    if (children.length > MAX_CHILDREN_PER_PARENT && depth < MAX_TREE_DEPTH - 1) {
+      needsRestructure = true;
+      return;
+    }
+    for (const child of children) {
+      if (needsRestructure) return;
+      checkNeeded(child, depth + 1);
+    }
+  }
+  checkNeeded(tree.root, 0);
+  if (!needsRestructure) return tree;
+
+  function extractKeyword(text: string): string {
+    const m = text.match(/[\u3400-\u9fff]{2,4}|[A-Za-z]{3,}/);
+    return m ? m[0] : text.slice(0, 4);
+  }
+
+  function restructure(node: MindMapNode, depth: number): MindMapNode {
+    const children = node.children;
+    if (!children || children.length <= MAX_CHILDREN_PER_PARENT) {
+      return {
+        ...node,
+        children: children?.map((c) => restructure(c, depth + 1)),
+      };
+    }
+
+    if (depth >= MAX_TREE_DEPTH - 1) {
+      const truncated = children.slice(0, MAX_CHILDREN_PER_PARENT).map((c) => restructure(c, depth + 1));
+      return { ...node, children: truncated };
+    }
+
+    const keywordMap = new Map<string, MindMapNode[]>();
+    for (const child of children) {
+      const kw = extractKeyword(child.content);
+      const existing = keywordMap.get(kw) || [];
+      existing.push(child);
+      keywordMap.set(kw, existing);
+    }
+
+    const groups: MindMapNode[][] = [];
+    const merged = new Set<string>();
+    for (const [kw, items] of keywordMap) {
+      if (merged.has(kw)) continue;
+      if (items.length === 1) {
+        let bestMerge: string | null = null;
+        for (const [otherKw, otherItems] of keywordMap) {
+          if (otherKw === kw || merged.has(otherKw)) continue;
+          if (otherItems.length === 1 && otherKw.slice(0, 1) === kw.slice(0, 1)) {
+            bestMerge = otherKw;
+            break;
+          }
+        }
+        if (bestMerge) {
+          const otherItems = keywordMap.get(bestMerge)!;
+          groups.push([...items, ...otherItems]);
+          merged.add(kw);
+          merged.add(bestMerge);
+        } else {
+          groups.push(items);
+          merged.add(kw);
+        }
+      } else {
+        groups.push(items);
+        merged.add(kw);
+      }
+    }
+
+    groups.sort((a, b) => b.length - a.length);
+
+    while (groups.length > MAX_CHILDREN_PER_PARENT) {
+      const smallest = groups.pop()!;
+      const secondSmallest = groups.pop()!;
+      groups.push([...smallest, ...secondSmallest]);
+      groups.sort((a, b) => b.length - a.length);
+    }
+
+    if (groups.length < 2) {
+      const chunkSize = Math.ceil(children.length / Math.min(3, Math.ceil(children.length / MAX_CHILDREN_PER_PARENT)));
+      const chunked: MindMapNode[][] = [];
+      for (let i = 0; i < children.length; i += chunkSize) {
+        chunked.push(children.slice(i, i + chunkSize));
+      }
+      groups.length = 0;
+      groups.push(...chunked);
+    }
+
+    const sourceRef = children[0]?.meta.sourceRef || createSourceRefFallback({ type: 'text' });
+
+    const newChildren = groups.map((group, idx) => {
+      const keywords = group.map((c) => extractKeyword(c.content));
+      const freq: Record<string, number> = {};
+      for (const kw of keywords) {
+        if (kw.length >= 2) freq[kw] = (freq[kw] || 0) + 1;
+      }
+      const top = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 2);
+      const label = top.length > 0
+        ? top.map(([w]) => w).join(' / ')
+        : `分组 ${idx + 1}`;
+      const finalLabel = label.length > 24 ? label.slice(0, 24) : label;
+
+      const groupNode = createHeuristicNode(finalLabel, sourceRef, 'detail', 0.7);
+      groupNode.children = group.map((c) => restructure(c, depth + 2));
+      return groupNode;
+    });
+
+    return { ...node, children: newChildren };
+  }
+
+  return { ...tree, root: restructure(tree.root, 0) };
+}
+
+export function deduplicateNodeTitles(tree: MindMapTree): MindMapTree {
+  function normalize(text: string): string {
+    return text.replace(/\s+/g, '').replace(/[·\-\|\/\\]/g, '').toLowerCase();
+  }
+
+  function areSimilar(a: string, b: string): boolean {
+    const na = normalize(a);
+    const nb = normalize(b);
+    if (na === nb) return true;
+    if (na.length <= 4 && nb.length <= 4) return na === nb;
+    if (na.includes(nb) || nb.includes(na)) {
+      const shorter = na.length < nb.length ? na : nb;
+      const longer = na.length < nb.length ? nb : na;
+      return shorter.length >= Math.min(4, longer.length * 0.5);
+    }
+    return false;
+  }
+
+  function isRedundantChild(childContent: string, parentContent: string): boolean {
+    const nc = normalize(childContent);
+    const np = normalize(parentContent);
+    if (nc === np) return true;
+    if (nc.length <= np.length) return false;
+    if (nc.includes(np)) {
+      return nc.length - np.length <= 4;
+    }
+    return false;
+  }
+
+  function dedup(node: MindMapNode): MindMapNode {
+    let children = node.children;
+    if (!children || children.length === 0) {
+      return { ...node, children };
+    }
+
+    const nonRedundant = children.filter(
+      (child) => !isRedundantChild(child.content, node.content),
+    );
+
+    const allRedundant = nonRedundant.length === 0 && children.length > 0;
+    const effectiveChildren = nonRedundant.length > 0 ? nonRedundant : children;
+
+    const filtered: MindMapNode[] = [];
+    let siblingCollisionCount = 0;
+
+    for (let i = 0; i < effectiveChildren.length; i++) {
+      const child = effectiveChildren[i];
+      const dupIndex = filtered.findIndex((f) => areSimilar(f.content, child.content));
+      if (dupIndex >= 0) {
+        siblingCollisionCount += 1;
+        const suffix = `(${siblingCollisionCount})`;
+        const originalContent = child.content;
+        const newContent = originalContent.length + suffix.length > 35
+          ? originalContent.slice(0, 35 - suffix.length) + suffix
+          : originalContent + suffix;
+        filtered.push({ ...dedup(child), content: newContent });
+        continue;
+      }
+
+      if (allRedundant) {
+        siblingCollisionCount += 1;
+        const suffix = `(${siblingCollisionCount})`;
+        const newContent = child.content.length + suffix.length > 35
+          ? child.content.slice(0, 35 - suffix.length) + suffix
+          : child.content + suffix;
+        filtered.push({ ...dedup(child), content: newContent });
+        continue;
+      }
+
+      filtered.push(dedup(child));
+    }
+
+    return {
+      ...node,
+      children: filtered,
+    };
+  }
+
+  return { ...tree, root: dedup(tree.root) };
 }
 
 function extractSentences(text: string, limit: number): string[] {
@@ -1047,7 +1337,10 @@ function llmTreeToMindMapTree(llmTree: LLMMindMapTree, doc: NormalizedDocument):
   const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
   const parsed = mindMapTreeSchema.parse(clamped);
   const sanitized = sanitizeMindMapTreeForOutput(parsed, doc.sourceMeta.title || '思维导图');
-  return ensureFirstLayerDetails(sanitized, doc);
+  const result = ensureFirstLayerDetails(sanitized, doc);
+  const validated = validateSemanticHierarchy(result);
+  const restructured = restructureOversizedBranches(validated);
+  return deduplicateNodeTitles(restructured);
 }
 
 function buildDiffPatches(prevTree: MindMapTree, nextTree: MindMapTree): TreePatch[] {
@@ -1155,7 +1448,10 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
     const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
     const sanitized = sanitizeMindMapTreeForOutput(clamped, title);
     const result = ensureFirstLayerDetails(sanitized, doc);
-    return mindMapTreeSchema.parse(result);
+    const validated = validateSemanticHierarchy(result);
+    const restructured = restructureOversizedBranches(validated);
+    const deduped = deduplicateNodeTitles(restructured);
+    return mindMapTreeSchema.parse(deduped);
   }
 
   const sentences = extractSentences(doc.markdown, 12);
@@ -1200,7 +1496,10 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
   const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
   const sanitized = sanitizeMindMapTreeForOutput(clamped, title);
   const result = ensureFirstLayerDetails(sanitized, doc);
-  return mindMapTreeSchema.parse(result);
+  const validated = validateSemanticHierarchy(result);
+  const restructured = restructureOversizedBranches(validated);
+  const deduped = deduplicateNodeTitles(restructured);
+  return mindMapTreeSchema.parse(deduped);
 }
 
 const ANTI_HALLUCINATION_SYSTEM = [
@@ -1211,6 +1510,10 @@ const ANTI_HALLUCINATION_SYSTEM = [
   '文档中没有的分类维度，不要创建节点。',
   '同一信息多次出现时只保留一次，归入最相关父节点。',
   '文末被截断时以最后一个完整段落为准，不补全断尾。',
+  '每个子节点必须属于其父节点的语义范畴——禁止将不同类别的内容混入同一个父节点下（如"专业技能"下只能放技能相关内容，不能混入项目成果、运营指标、业务操作等）',
+  '输出前必须逐条自检：每个子节点的关键词能否直接推导出它属于父节点定义的范畴？若不能，立即删除或移到正确父节点。',
+  '任何父节点的直接子节点不得超过8个。当某节点下信息超过8条时，必须创建中间归纳节点（如"后端技术""前端技术"等分组名），将相关内容归入二级分组，核心信息作为三级节点。',
+  '节点标题必须唯一：任何父节点与其直接子节点的 content 不能完全相同或高度相似。同一父节点下的同级节点之间 content 也不能重复——每个节点必须表达该层级下独特的信息维度。',
 ].join('\n');
 
 function buildPrompt(doc: NormalizedDocument): string {
@@ -1219,10 +1522,13 @@ function buildPrompt(doc: NormalizedDocument): string {
     '你是一名结构化信息提炼专家。任务：从原文中精准提炼信息，组织为思维导图结构。',
     '',
     '## 第一步 · 内部规划（不输出，只用于自检）',
-    '1. 判断文档类型（论文 / 文章 / 博客 / 会议纪要 / 教程 / 其他）',
+    '1. 判断文档类型（论文 / 文章 / 博客 / 会议纪要 / 教程 / 简历 / 其他）',
     '2. 扫描全文，识别 2-8 个互斥的核心维度',
     '3. 自检：维度是否 MECE？粒度是否一致？父节点能否概括所有子节点？',
-    '4. 完成自检后再开始输出，思考过程不写入最终结果',
+    '4. 逐节点验证：每个子节点的语义范畴是否严格属于其父节点？',
+    '   - 例：如果父节点是"专业技能"，子节点只能放技能名称/水平/证书等',
+    '   - 反例：不可在"专业技能"下放"项目周期缩短""平台活跃度维持"等运营类内容',
+    '5. 完成自检后再开始输出，思考过程不写入最终结果',
     '',
     '## 绝对规则（违反任何一条即视为失败）',
     '1. 内容层须忠实：每个节点的字面信息必须源自原文',
@@ -1232,19 +1538,41 @@ function buildPrompt(doc: NormalizedDocument): string {
     '3. 文档中没有对应内容的维度，不创建节点',
     '4. 文末若被截断，以最后一个完整段落为准，不补全断尾',
     '5. 同一信息在原文多次出现时，只保留一次，归入最相关父节点',
+    '6. 分类边界不可逾越：每个父节点下的子节点必须属于同一语义类别',
+    '   - 禁止将操作指标（如"留存""转化率"）放入"技能"类节点',
+    '   - 禁止将项目成果（如"周期缩短""成本降低"）放入"技能"类节点',
+    '   - 禁止将业务操作（如"交易结算""对账""审批"）放入"技能"类节点',
+    '   - 如果某条信息无法归入任何已有父节点的语义范畴，不要强行放入',
+    '',
+    '## 语义归属判定规则（输出前必须逐条对照）',
+    '下面定义每类父节点"只能"包含的子节点类型。请严格对照执行：',
+    '- "技能"类父节点（含"专业技能""技术栈""能力"等）：只能放工具名、语言名、方法论、证书、能力名称，禁止放业务操作/运营指标/项目成果',
+    '- "项目/经历"类父节点（含"工作经历""项目经验"等）：只能放具体项目名称、项目描述、担任角色',
+    '- "成果/业绩"类父节点（含"工作成果""业绩"等）：只能放量化结果、关键产出',
+    '- "职责"类父节点：只能放具体职责描述',
+    '- "教育"类父节点：只能放学历、学校、专业',
+    '判定口诀：读子节点内容 → 问"这句话描述的是父节点定义的范畴吗？"→ 不是则删除或移到正确位置',
     '',
     '## 结构层可优化',
     '1. 层级、归类、合并、顺序均可重组，目标是"读者一眼看懂结构"',
     '2. 关联紧密的信息合并为一个节点（如"概念名 · 核心定义"合一），细节作 children',
     '3. 重组的依据是语义关联，而非原文章节顺序',
     '',
+    '## 子节点数量管理（重要）',
+    '- 任何节点的直接子节点数 ≤ 8 个，保持视觉清爽',
+    '- 当某节点下信息 > 8 条时：在父节点与叶子之间插入归纳节点（二级分组）',
+    '- 归纳方法：按语义相似度将子节点分为 2-4 组，每组用一个简洁词组命名（4-8 字）',
+    '- 示例："专业技能"下有 Python、Java、Spring Boot、React、Vue、Node.js、Docker、K8s、MySQL、Redis 时 → 分为"后端技术"和"前端与运维"两个中间节点',
+    '- 禁止为凑整而删除信息——信息多时用"增加层级"而非"减少节点"',
+    '',
     '## 好导图的判定标准（输出前自检）',
     '- 一级节点之间互斥不重叠（MECE）',
     '- 同层节点粒度一致（不能左边"模型架构"右边"某个超参的具体值"）',
-    '- 父节点能概括所有子节点（父子语义闭包）',
+    '- 父节点能概括所有子节点（父子语义闭包）：每个子节点抽取关键词后，能否直接回答"这属于父节点范畴吗？"',
     '- 叶子节点自含（脱离上下文也能读懂）',
     '- 无空标签节点（禁止只写分类名而无实质内容，如"特点 / 优点 / 其他"）',
     '- 节点语言与原文一致（中文文档输出中文，英文文档输出英文）',
+    '- 节点标题唯一：父节点与子节点 content 不能相同或高度相似（如父=专业技能 子不能=专业技能）；同级节点间 content 不可重复',
     '',
     '## 约束条件',
     `- 最大层级：${MAX_TREE_DEPTH}`,
@@ -1252,6 +1580,7 @@ function buildPrompt(doc: NormalizedDocument): string {
     '- 节点文本目标 15-25 字，上限 35 字',
     '- 超过 35 字必须拆为父子结构，严禁截断意思',
     '- 一级节点 2-8 个，由内容决定，不凑数，不为美观补足',
+    '- 每个节点的直接子节点数 ≤ 8 个，超过时自动创建中间归纳分组',
     '',
     '## 兜底规则',
     '- 原文 <100 字或无明显结构：输出"单根节点 + 1-2 个子节点"的最小合法结构，不强行拼凑',
@@ -1266,20 +1595,77 @@ function buildPrompt(doc: NormalizedDocument): string {
     '  {"content":"位置编码：正弦函数显式注入","children":[]}',
     ']}',
     '',
-    '✅ 正例 2 · 方法论文章风（松结构）：',
+    '✅ 正例 2 · 简历/技能风（分类边界清晰）：',
+    '{"content":"专业技能 · Python / Java / React","children":[',
+    '  {"content":"后端：Spring Boot微服务开发","children":[]},',
+    '  {"content":"前端：React + TypeScript组件库","children":[]},',
+    '  {"content":"数据：SQL优化与Redis缓存策略","children":[]}',
+    ']}',
+    '注意：此例中所有子节点都是技能名称/方向，不包含"项目周期""团队规模""营收增长"等非技能类信息',
+    '',
+    '✅ 正例 3 · 方法论文章风（松结构）：',
     '{"content":"PMF 验证信号 · 用户主动留存 + 自发传播","children":[',
     '  {"content":"留存：D30 留存率 >40%","children":[]},',
     '  {"content":"NPS >50 且自然增长占比 >60%","children":[]},',
     '  {"content":"反信号：主要靠付费投放维持增长","children":[]}',
     ']}',
     '',
-    '❌ 反例（空标签 + 粒度散 + 信息密度坍塌）：',
+    '❌ 反例 1（空标签 + 粒度散 + 信息密度坍塌）：',
     '{"content":"PMF","children":[',
     '  {"content":"信号","children":[{"content":"留存","children":[]}]},',
     '  {"content":"指标","children":[{"content":"NPS","children":[]}]},',
     '  {"content":"判断","children":[{"content":"自然增长","children":[]}]}',
     ']}',
     '反例错在：①"信号/指标/判断"语义重叠违反 MECE ②子节点丢失关键阈值 ③"留存/NPS"单独读不懂违反叶子自含',
+    '',
+    '❌ 反例 2（分类边界污染 · 不同语义类别的信息混入同一父节点）：',
+    '{"content":"专业技能","children":[',
+    '  {"content":"Python开发","children":[]},',
+    '  {"content":"平台活跃度维持","children":[]},',
+    '  {"content":"项目周期缩短30%","children":[]},',
+    '  {"content":"送礼策略优化","children":[]},',
+    '  {"content":"交易结算","children":[]}',
+    ']}',
+    '反例错在：①"平台活跃度维持"是运营指标 ②"项目周期缩短"是项目成果 ③"送礼策略优化"是业务手段 ④"交易结算"是业务操作——均不是技能，应分别归入"运营成果""项目成果""业务策略""工作职责"等对应父节点',
+    '',
+    '❌ 反例 3（子节点过度扁平 · 超过8个直接子节点未分组）：',
+    '{"content":"专业技能 · Python/Java/Spring Boot/React/Vue/Node.js/Docker/K8s/MySQL/Redis","children":[',
+    '  {"content":"Python","children":[]},',
+    '  {"content":"Java","children":[]},',
+    '  {"content":"Spring Boot","children":[]},',
+    '  {"content":"React","children":[]},',
+    '  {"content":"Vue","children":[]},',
+    '  {"content":"Node.js","children":[]},',
+    '  {"content":"Docker","children":[]},',
+    '  {"content":"Kubernetes","children":[]},',
+    '  {"content":"MySQL","children":[]},',
+    '  {"content":"Redis","children":[]}',
+    ']}',
+    '反例错在：1个父节点下直接挂了10个叶子，视觉拥挤、难以扫描。✅ 正确做法：应插入中间归纳层——',
+    '{"content":"专业技能 · Python/Java/.../Redis","children":[',
+    '  {"content":"后端技术 · Java / Python / Spring Boot","children":[',
+    '    {"content":"Java：Spring Boot微服务","children":[]},',
+    '    {"content":"Python：数据处理与API","children":[]},',
+    '    {"content":"Node.js：中间层服务","children":[]}',
+    '  ]},',
+    '  {"content":"前端技术 · React / Vue","children":[',
+    '    {"content":"React：组件库与状态管理","children":[]},',
+    '    {"content":"Vue：管理后台快速开发","children":[]}',
+    '  ]},',
+    '  {"content":"基础设施 · Docker / K8s / MySQL / Redis","children":[',
+    '    {"content":"Docker + K8s：容器化部署","children":[]},',
+    '    {"content":"MySQL：关系型数据存储","children":[]},',
+    '    {"content":"Redis：缓存与消息队列","children":[]}',
+    '  ]}',
+    ']}',
+    '',
+    '❌ 反例 4（节点标题重复 · 父子内容相同/同级内容相同）：',
+    '{"content":"专业技能","children":[',
+    '  {"content":"专业技能","children":[]},',
+    '  {"content":"Python开发","children":[]},',
+    '  {"content":"Python开发","children":[]}',
+    ']}',
+    '反例错在：①子节点"专业技能"与父节点 content 完全相同 ②两个"Python开发"同级重复——✅ 正确：删除重复子节点，合并去重为 {"content":"专业技能","children":[{"content":"Python开发","children":[]}]}',
     '',
     `## 文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
@@ -1294,10 +1680,13 @@ function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '你是一名结构化信息提炼专家。任务：从原文中精准提炼信息，组织为思维导图 JSON。',
     '',
     '## 第一步 · 内部规划（不输出，只用于自检）',
-    '1. 判断文档类型（论文 / 文章 / 博客 / 会议纪要 / 教程 / 其他）',
+    '1. 判断文档类型（论文 / 文章 / 博客 / 会议纪要 / 教程 / 简历 / 其他）',
     '2. 扫描全文，识别 2-8 个互斥的核心维度',
     '3. 自检：维度是否 MECE？粒度是否一致？父节点能否概括所有子节点？',
-    '4. 完成自检后再开始输出，思考过程不写入最终结果',
+    '4. 逐节点验证：每个子节点的语义范畴是否严格属于其父节点？',
+    '   - 例：如果父节点是"专业技能"，子节点只能放技能名称/水平/证书等',
+    '   - 反例：不可在"专业技能"下放"项目周期缩短""平台活跃度维持"等运营类内容',
+    '5. 完成自检后再开始输出，思考过程不写入最终结果',
     '',
     '## 绝对规则（违反任何一条即视为失败）',
     '1. 内容层须忠实：每个节点的字面信息必须源自原文',
@@ -1307,19 +1696,41 @@ function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '3. 文档中没有对应内容的维度，不创建节点',
     '4. 文末若被截断，以最后一个完整段落为准，不补全断尾',
     '5. 同一信息在原文多次出现时，只保留一次，归入最相关父节点',
+    '6. 分类边界不可逾越：每个父节点下的子节点必须属于同一语义类别',
+    '   - 禁止将操作指标（如"留存""转化率"）放入"技能"类节点',
+    '   - 禁止将项目成果（如"周期缩短""成本降低"）放入"技能"类节点',
+    '   - 禁止将业务操作（如"交易结算""对账""审批"）放入"技能"类节点',
+    '   - 如果某条信息无法归入任何已有父节点的语义范畴，不要强行放入',
+    '',
+    '## 语义归属判定规则（输出前必须逐条对照）',
+    '下面定义每类父节点"只能"包含的子节点类型。请严格对照执行：',
+    '- "技能"类父节点（含"专业技能""技术栈""能力"等）：只能放工具名、语言名、方法论、证书、能力名称，禁止放业务操作/运营指标/项目成果',
+    '- "项目/经历"类父节点（含"工作经历""项目经验"等）：只能放具体项目名称、项目描述、担任角色',
+    '- "成果/业绩"类父节点（含"工作成果""业绩"等）：只能放量化结果、关键产出',
+    '- "职责"类父节点：只能放具体职责描述',
+    '- "教育"类父节点：只能放学历、学校、专业',
+    '判定口诀：读子节点内容 → 问"这句话描述的是父节点定义的范畴吗？"→ 不是则删除或移到正确位置',
     '',
     '## 结构层可优化',
     '1. 层级、归类、合并、顺序均可重组，目标是"读者一眼看懂结构"',
     '2. 关联紧密的信息合并为一个节点（如"概念名 · 核心定义"合一），细节作 children',
     '3. 重组的依据是语义关联，而非原文章节顺序',
     '',
+    '## 子节点数量管理（重要）',
+    '- 任何节点的直接子节点数 ≤ 8 个，保持视觉清爽',
+    '- 当某节点下信息 > 8 条时：在父节点与叶子之间插入归纳节点（二级分组）',
+    '- 归纳方法：按语义相似度将子节点分为 2-4 组，每组用一个简洁词组命名（4-8 字）',
+    '- 示例："专业技能"下有 Python、Java、Spring Boot、React、Vue、Node.js、Docker、K8s、MySQL、Redis 时 → 分为"后端技术"和"前端与运维"两个中间节点',
+    '- 禁止为凑整而删除信息——信息多时用"增加层级"而非"减少节点"',
+    '',
     '## 好导图的判定标准（输出前自检）',
     '- 一级节点之间互斥不重叠（MECE）',
     '- 同层节点粒度一致（不能左边"模型架构"右边"某个超参的具体值"）',
-    '- 父节点能概括所有子节点（父子语义闭包）',
+    '- 父节点能概括所有子节点（父子语义闭包）：每个子节点抽取关键词后，能否直接回答"这属于父节点范畴吗？"',
     '- 叶子节点自含（脱离上下文也能读懂）',
     '- 无空标签节点（禁止只写分类名而无实质内容，如"特点 / 优点 / 其他"）',
     '- 节点语言与原文一致（中文文档输出中文，英文文档输出英文）',
+    '- 节点标题唯一：父节点与子节点 content 不能相同或高度相似；同级节点间 content 不可重复',
     '',
     '## 约束条件',
     `- 最大层级：${MAX_TREE_DEPTH}`,
@@ -1327,6 +1738,7 @@ function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '- 节点文本目标 15-25 字，上限 35 字',
     '- 超过 35 字必须拆为父子结构，严禁截断意思',
     '- 一级节点 2-8 个，由内容决定，不凑数，不为美观补足',
+    '- 每个节点的直接子节点数 ≤ 8 个，超过时自动创建中间归纳分组',
     '',
     '## 兜底规则',
     '- 原文 <100 字或无明显结构：输出"单根节点 + 1-2 个子节点"的最小合法结构，不强行拼凑',
@@ -1341,20 +1753,50 @@ function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '  {"content":"位置编码：正弦函数显式注入","children":[]}',
     ']}',
     '',
-    '✅ 正例 2 · 方法论文章风（松结构）：',
+    '✅ 正例 2 · 简历/技能风（分类边界清晰）：',
+    '{"content":"专业技能 · Python / Java / React","children":[',
+    '  {"content":"后端：Spring Boot微服务开发","children":[]},',
+    '  {"content":"前端：React + TypeScript组件库","children":[]},',
+    '  {"content":"数据：SQL优化与Redis缓存策略","children":[]}',
+    ']}',
+    '注意：此例中所有子节点都是技能名称/方向，不包含"项目周期""团队规模""营收增长"等非技能类信息',
+    '',
+    '✅ 正例 3 · 方法论文章风（松结构）：',
     '{"content":"PMF 验证信号 · 用户主动留存 + 自发传播","children":[',
     '  {"content":"留存：D30 留存率 >40%","children":[]},',
     '  {"content":"NPS >50 且自然增长占比 >60%","children":[]},',
     '  {"content":"反信号：主要靠付费投放维持增长","children":[]}',
     ']}',
     '',
-    '❌ 反例（空标签 + 粒度散 + 信息密度坍塌）：',
+    '❌ 反例 1（空标签 + 粒度散 + 信息密度坍塌）：',
     '{"content":"PMF","children":[',
     '  {"content":"信号","children":[{"content":"留存","children":[]}]},',
     '  {"content":"指标","children":[{"content":"NPS","children":[]}]},',
     '  {"content":"判断","children":[{"content":"自然增长","children":[]}]}',
     ']}',
     '反例错在：①"信号/指标/判断"语义重叠违反 MECE ②子节点丢失关键阈值 ③"留存/NPS"单独读不懂违反叶子自含',
+    '',
+    '❌ 反例 2（分类边界污染 · 不同语义类别的信息混入同一父节点）：',
+    '{"content":"专业技能","children":[',
+    '  {"content":"Python开发","children":[]},',
+    '  {"content":"平台活跃度维持","children":[]},',
+    '  {"content":"项目周期缩短30%","children":[]},',
+    '  {"content":"送礼策略优化","children":[]},',
+    '  {"content":"交易结算","children":[]}',
+    ']}',
+    '反例错在：①"平台活跃度维持"是运营指标 ②"项目周期缩短"是项目成果 ③"送礼策略优化"是业务手段 ④"交易结算"是业务操作——均不是技能，应分别归入"运营成果""项目成果""业务策略""工作职责"等对应父节点',
+    '',
+    '❌ 反例 3（子节点过度扁平 · 超过8个直接子节点未分组 · 应按语义分组为中间节点）：',
+    '{"content":"专业技能","children":[{"content":"Python","children":[]},{"content":"Java","children":[]},{"content":"Spring Boot","children":[]},{"content":"React","children":[]},{"content":"Vue","children":[]},{"content":"Node.js","children":[]},{"content":"Docker","children":[]},{"content":"Kubernetes","children":[]},{"content":"MySQL","children":[]},{"content":"Redis","children":[]}]}',
+    '✅ 正确做法应为：{"content":"专业技能","children":[',
+    '  {"content":"后端技术","children":[{"content":"Java · Spring Boot","children":[]},{"content":"Python · 数据处理","children":[]},{"content":"Node.js · 中间层","children":[]}]},',
+    '  {"content":"前端技术","children":[{"content":"React · 组件库","children":[]},{"content":"Vue · 管理后台","children":[]}]},',
+    '  {"content":"基础设施","children":[{"content":"Docker · K8s","children":[]},{"content":"MySQL · Redis","children":[]}]}',
+    ']}',
+    '',
+    '❌ 反例 4（节点标题重复 · 父子或同级 content 相同）：',
+    '{"content":"专业技能","children":[{"content":"专业技能","children":[]},{"content":"Python","children":[]},{"content":"Python","children":[]}]}',
+    '✅ 正确：删除与父同名的子节点，合并同级重复 → {"content":"专业技能","children":[{"content":"Python","children":[]}]}',
     '',
     '## 输出格式（JSON）',
     '1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释',
