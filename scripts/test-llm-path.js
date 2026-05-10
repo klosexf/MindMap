@@ -124,6 +124,12 @@ const providerKeys = {
     baseUrl: process.env.HUNYUAN_BASE_URL || 'https://api.hunyuan.cloud.tencent.com/v1',
     defaultModel: 'hunyuan-turbos-latest',
   },
+  deepseek: {
+    key: process.env.DEEPSEEK_API_KEY,
+    keyEnv: 'DEEPSEEK_API_KEY',
+    baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
+    defaultModel: 'deepseek-chat',
+  },
 };
 
 console.log('🔑 API Key 配置状态:');

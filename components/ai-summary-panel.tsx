@@ -1,8 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-import type { MindMapNode, MindMapTree } from '@/lib/types/mindmap';
+import type { MindMapTree } from '@/lib/types/mindmap';
 
 interface SummaryProof {
   source?: string;
@@ -11,26 +11,6 @@ interface SummaryProof {
 }
 
 type SummaryFeedback = 'like' | 'dislike' | null;
-
-function buildTreeSignature(tree: MindMapTree): string {
-  const queue: MindMapNode[] = [tree.root];
-  const parts: string[] = [];
-
-  while (queue.length > 0 && parts.length < 80) {
-    const node = queue.shift();
-    if (!node) continue;
-
-    const content = node.content.replace(/\s+/g, ' ').trim().slice(0, 120);
-    if (content) parts.push(content);
-
-    for (const child of node.children || []) {
-      queue.push(child);
-      if (queue.length + parts.length >= 120) break;
-    }
-  }
-
-  return `${tree.meta.version}:${parts.join('|')}`;
-}
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString('zh-CN', {
@@ -51,10 +31,17 @@ export function AiSummaryPanel({ tree }: { tree: MindMapTree }) {
 
   const abortRef = useRef<AbortController | null>(null);
   const hasLoadedRef = useRef(false);
-  const signature = useMemo(() => buildTreeSignature(tree), [tree]);
+  const treeRef = useRef(tree);
+  const instanceKey = `${tree.id}:${tree.meta.createdAt}`;
+
+  useEffect(() => {
+    treeRef.current = tree;
+  }, [tree]);
 
   const requestSummary = useCallback(
     async (reason: 'auto' | 'manual') => {
+      const currentTree = treeRef.current;
+
       abortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
@@ -70,7 +57,7 @@ export function AiSummaryPanel({ tree }: { tree: MindMapTree }) {
         const res = await fetch('/api/summary', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tree }),
+          body: JSON.stringify({ tree: currentTree }),
           signal: controller.signal,
         });
 
@@ -104,8 +91,19 @@ export function AiSummaryPanel({ tree }: { tree: MindMapTree }) {
         }
       }
     },
-    [tree],
+    [],
   );
+
+  useEffect(() => {
+    abortRef.current?.abort();
+    hasLoadedRef.current = false;
+    setPoints([]);
+    setLoading(false);
+    setError(null);
+    setSummaryProof(null);
+    setUpdatedAt(null);
+    setStale(false);
+  }, [instanceKey]);
 
   useEffect(() => {
     const delay = hasLoadedRef.current ? 900 : 120;
@@ -114,7 +112,7 @@ export function AiSummaryPanel({ tree }: { tree: MindMapTree }) {
     }, delay);
 
     return () => window.clearTimeout(timer);
-  }, [signature, requestSummary]);
+  }, [instanceKey, requestSummary]);
 
   useEffect(() => {
     return () => {

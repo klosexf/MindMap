@@ -12,11 +12,12 @@ const patchRequestSchema = z.object({
 });
 
 interface Params {
-  params: { id: string };
+  params: Promise<{ id: string }>;
 }
 
 export async function GET(_: Request, { params }: Params) {
-  const tree = await getMindMap(params.id);
+  const { id } = await params;
+  const tree = await getMindMap(id);
 
   if (!tree) {
     return NextResponse.json({ error: 'Mindmap not found' }, { status: 404 });
@@ -26,11 +27,12 @@ export async function GET(_: Request, { params }: Params) {
 }
 
 export async function PATCH(req: Request, { params }: Params) {
+  const { id } = await params;
   try {
     const payload = patchRequestSchema.parse(await req.json());
 
     if (payload.tree) {
-      if (payload.tree.id !== params.id) {
+      if (payload.tree.id !== id) {
         return NextResponse.json({ error: 'Tree id mismatch' }, { status: 400 });
       }
 
@@ -42,7 +44,7 @@ export async function PATCH(req: Request, { params }: Params) {
       return NextResponse.json({ error: 'Missing patches or tree payload' }, { status: 400 });
     }
 
-    const updated = await patchMindMap(params.id, payload.patches);
+    const updated = await patchMindMap(id, payload.patches);
     return NextResponse.json({ tree: updated });
   } catch (error) {
     return NextResponse.json(
@@ -55,7 +57,8 @@ export async function PATCH(req: Request, { params }: Params) {
 }
 
 export async function DELETE(_: Request, { params }: Params) {
-  const deleted = await deleteMindMap(params.id);
+  const { id } = await params;
+  const deleted = await deleteMindMap(id);
 
   if (!deleted) {
     return NextResponse.json({ error: 'Mindmap not found' }, { status: 404 });

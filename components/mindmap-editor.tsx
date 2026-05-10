@@ -8,6 +8,8 @@ import { getLayoutConfig, getNodeSize, toG6GraphData } from '@/lib/utils/g6';
 import { readGraphViewportState, restoreGraphViewportState } from '@/lib/utils/g6-viewport';
 import {
   countNodes,
+  findClosestRectByBorderProximity,
+  findParentInfo,
   inferDropModeFromPoint,
   resolveDropMoveTarget,
   type DropMoveMode,
@@ -132,12 +134,17 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
   const onUpdateNodePositionRef = useRef(onUpdateNodePosition);
   const skipNextLayoutRef = useRef(false);
   const focusNodeIdOnNextRenderRef = useRef<string | null>(null);
+  const viewportBeforeCommitRef = useRef<ReturnType<typeof readGraphViewportState>>(null);
 
   const commitEdit = useCallback(
     (value: string) => {
       const nodeId = editingNodeId;
       const originalText = originalEditValueRef.current;
       if (nodeId && value.trim()) {
+        const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
+        if (graph && !graph.destroyed) {
+          viewportBeforeCommitRef.current = readGraphViewportState(graph);
+        }
         onUpdateNodeContent(nodeId, value.trim());
       }
       setEditingNodeId(null);
@@ -308,6 +315,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     const graph = new Graph({
       container,
       autoResize: true,
+      zoomRange: [0.1, 5],
       data: toG6GraphData(treeRef.current),
       layout: getLayoutConfig(layoutDirectionRef.current),
       renderer: createLayerRenderer(renderMode),
@@ -352,37 +360,33 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
           },
           dragging: {
             // Position-only: neutral gray — "just repositioning, no relationship change"
+            // Note: shadowBlur is intentionally removed to avoid SVG filter clipping
+            // the left border during drag operations (G6 v5 SVG renderer + filterUnits=userSpaceOnUse)
             opacity: 0.88,
             stroke: '#8B8B83',
             lineWidth: 2,
-            shadowColor: 'rgba(107,114,128,0.25)',
-            shadowBlur: 16,
+            fill: '#F9F9F6',
           },
           'drop-child': {
             // Hierarchy change: blue — "will become a child of this node"
+            // Keep this state filter-free: SVG shadow filters can clip the node stroke
+            // while the dragged node overlaps the target during reparent preview.
             stroke: '#2563EB',
             lineWidth: 3,
             fill: '#EFF6FF',
-            shadowColor: 'rgba(37,99,235,0.28)',
-            shadowBlur: 22,
           },
           'drop-sibling-before': {
-            // Peer reorder before: amber with left/top accent
+            // Peer reorder before: keep it filter-free so no SVG shadow
+            // can linger on the node after the structural move completes.
             stroke: '#D97706',
             lineWidth: 2.6,
             fill: '#FFF7ED',
-            shadowColor: 'rgba(217,119,6,0.22)',
-            shadowBlur: 14,
-            shadowOffsetX: -4,
           },
           'drop-sibling-after': {
-            // Peer reorder after: amber with right/bottom accent
+            // Peer reorder after: keep it filter-free for the same reason.
             stroke: '#D97706',
             lineWidth: 2.6,
             fill: '#FFF7ED',
-            shadowColor: 'rgba(217,119,6,0.22)',
-            shadowBlur: 14,
-            shadowOffsetX: 4,
           },
         },
       },
@@ -396,10 +400,6 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       },
       behaviors: [
         'drag-canvas',
-        {
-          type: 'zoom-canvas',
-          trigger: ['Control'],
-        },
         'click-select',
         {
           type: 'drag-element',
@@ -674,6 +674,22 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
         return buildDropPreviewForTarget(draggingNodeId, bestOverlap.id, draggingCenter);
       }
 
+      const currentParent = findParentInfo(treeRef.current.root, draggingNodeId);
+      const proximityCandidates: Array<{ id: string; rect: NodeClientRect }> = [];
+
+      for (const node of nodeData) {
+        const nodeId = node?.id;
+        if (!nodeId || nodeId === draggingNodeId || nodeId === currentParent?.parentId) continue;
+        const rect = readNodeClientRect(nodeId);
+        if (!rect) continue;
+        proximityCandidates.push({ id: nodeId, rect });
+      }
+
+      const closestByBorder = findClosestRectByBorderProximity(draggingRect, proximityCandidates);
+      if (closestByBorder) {
+        return buildDropPreviewForTarget(draggingNodeId, closestByBorder.id, null);
+      }
+
       return null; // Pure position move — no reparenting target
     };
 
@@ -684,23 +700,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       dropPreviewRef.current = null;
     };
 
-    const updateDropPreview = (evt: any) => {
-      const draggingNodeId = draggingNodeIdRef.current;
-      const targetNodeId = draggingNodeId
-        ? resolveDropTargetNodeId(evt, draggingNodeId)
-        : null;
-
-      if (!draggingNodeId || !targetNodeId) {
-        clearDropPreview();
-        return;
-      }
-
-      const nextPreview = buildDropPreviewForTarget(draggingNodeId, targetNodeId, readClientPoint(evt));
-      if (!nextPreview) {
-        clearDropPreview();
-        return;
-      }
-
+    const applyDropPreview = (nextPreview: DropPreview) => {
       const previousPreview = dropPreviewRef.current;
       if (
         previousPreview &&
@@ -726,6 +726,37 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
             : DROP_SIBLING_AFTER_STATE;
       setNodeState(nextPreview.targetNodeId, previewState, true);
       dropPreviewRef.current = nextPreview;
+    };
+
+    const updateDropPreview = (evt: any) => {
+      const draggingNodeId = draggingNodeIdRef.current;
+      const targetNodeId = draggingNodeId
+        ? resolveDropTargetNodeId(evt, draggingNodeId)
+        : null;
+
+      if (!draggingNodeId) {
+        clearDropPreview();
+        return;
+      }
+
+      if (!targetNodeId) {
+        const proximityPreview = buildDropPreviewFromDraggedNode(draggingNodeId);
+        if (!proximityPreview) {
+          clearDropPreview();
+          return;
+        }
+
+        applyDropPreview(proximityPreview);
+        return;
+      }
+
+      const nextPreview = buildDropPreviewForTarget(draggingNodeId, targetNodeId, readClientPoint(evt));
+      if (!nextPreview) {
+        clearDropPreview();
+        return;
+      }
+
+      applyDropPreview(nextPreview);
     };
 
     graph.on('node:click', (evt: any) => {
@@ -812,8 +843,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     };
   }, [renderMode, startEditingNode]);
 
-  // Custom trackpad two-finger pan via native wheel events
-  // Replaces scroll-canvas behavior for consistent drag-direction mapping across browsers
+  // Custom trackpad two-finger pan and pinch-to-zoom via native wheel events
   useEffect(() => {
     const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
     if (!graph || graph.destroyed) return;
@@ -821,11 +851,31 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     const container = containerRef.current;
     if (!container) return;
 
-    const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || e.metaKey) return;
+    const ZOOM_MIN = 0.1;
+    const ZOOM_MAX = 5;
+    const PINCH_SENSITIVITY = 0.005;
 
-      e.preventDefault();
-      graph.translateBy([e.deltaX, e.deltaY], false);
+    const onWheel = (e: WheelEvent) => {
+      if (e.metaKey) return;
+
+      if (e.ctrlKey) {
+        e.preventDefault();
+
+        const canvasPoint = graph.getCanvasByClient([e.clientX, e.clientY]);
+        const currentZoom = graph.getZoom();
+        const scaleDelta = Math.exp(-e.deltaY * PINCH_SENSITIVITY);
+        let newZoom = currentZoom * scaleDelta;
+
+        if (newZoom < ZOOM_MIN) newZoom = ZOOM_MIN;
+        if (newZoom > ZOOM_MAX) newZoom = ZOOM_MAX;
+
+        if (Math.abs(newZoom - currentZoom) < 0.0001) return;
+
+        graph.zoomTo(newZoom, false, canvasPoint);
+      } else {
+        e.preventDefault();
+        graph.translateBy([e.deltaX, e.deltaY], false);
+      }
     };
 
     container.addEventListener('wheel', onWheel, { passive: false });
@@ -872,7 +922,9 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     const focusNodeId = focusNodeIdOnNextRenderRef.current;
     focusNodeIdOnNextRenderRef.current = null;
 
-    const viewportState = readGraphViewportState(graph);
+    const savedViewport = viewportBeforeCommitRef.current;
+    viewportBeforeCommitRef.current = null;
+    const viewportState = savedViewport ?? readGraphViewportState(graph);
     graph.setData(toG6GraphData(tree));
     graph
       .render()
@@ -880,9 +932,10 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
         await applyPersistedNodePositions(graph, tree.root);
 
         if (focusNodeId) {
-          // After structural drag, center the viewport on the dragged node
           await focusViewportOnNode(graph, focusNodeId);
         } else {
+          await restoreGraphViewportState(graph, viewportState);
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
           await restoreGraphViewportState(graph, viewportState);
         }
 

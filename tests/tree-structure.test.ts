@@ -4,6 +4,7 @@ import type { MindMapTree } from '../lib/types/mindmap';
 import {
   applyTreePatch,
   balanceChildren,
+  findClosestRectByBorderProximity,
   findParentInfo,
   inferDropModeFromPoint,
   isDescendant,
@@ -131,6 +132,23 @@ describe('applyTreePatch move', () => {
 
     const aNode = moved.root.children?.find((c) => c.id === 'a');
     expect(aNode?.children?.map((c) => c.id)).toEqual(['a1', 'a2', 'b']);
+  });
+
+  it('moves a subtree into a nested target branch and preserves descendants', () => {
+    const tree = sampleTree();
+
+    const moved = applyTreePatch(tree, {
+      type: 'move',
+      nodeId: 'a',
+      newParentId: 'b',
+      newIndex: 0,
+      timestamp: Date.now(),
+    });
+
+    const branchB = moved.root.children?.find((c) => c.id === 'b');
+    expect(branchB?.children?.[0]?.id).toBe('a');
+    expect(branchB?.children?.[0]?.children?.map((c) => c.id)).toEqual(['a1', 'a2']);
+    expect(moved.root.children?.map((c) => c.id)).toEqual(['b', 'c', 'd']);
   });
 });
 
@@ -312,6 +330,14 @@ describe('resolveDropMoveTarget', () => {
     });
   });
 
+  it('resolves child mode for nested cross-branch drops', () => {
+    const tree = sampleTree();
+    expect(resolveDropMoveTarget(tree.root, 'd', 'a1', 'child')).toEqual({
+      newParentId: 'a1',
+      newIndex: 0,
+    });
+  });
+
   it('resolves sibling mode after target with same parent index adjustment', () => {
     const tree = sampleTree();
     const target = resolveDropMoveTarget(tree.root, 'a', 'c', 'sibling');
@@ -376,8 +402,57 @@ describe('inferDropModeFromPoint', () => {
     expect(inferDropModeFromPoint({ x: 200, y: 140 }, rect)).toBe('child');
   });
 
+  it('treats direct drops inside most of a node body as child mode', () => {
+    expect(inferDropModeFromPoint({ x: 140, y: 140 }, rect)).toBe('child');
+    expect(inferDropModeFromPoint({ x: 260, y: 140 }, rect)).toBe('child');
+  });
+
   it('treats side areas as sibling mode', () => {
     expect(inferDropModeFromPoint({ x: 110, y: 140 }, rect)).toBe('sibling');
     expect(inferDropModeFromPoint({ x: 290, y: 140 }, rect)).toBe('sibling');
+  });
+
+  it('uses top and bottom edge bands for sibling mode in vertical layouts', () => {
+    expect(inferDropModeFromPoint({ x: 200, y: 110 }, rect, 'TB')).toBe('sibling');
+    expect(inferDropModeFromPoint({ x: 200, y: 140 }, rect, 'TB')).toBe('child');
+    expect(inferDropModeFromPoint({ x: 200, y: 170 }, rect, 'TB')).toBe('sibling');
+  });
+});
+
+describe('findClosestRectByBorderProximity', () => {
+  const draggingRect = { left: 100, top: 100, width: 120, height: 56 };
+
+  it('selects a target when the dragged node border is within the proximity threshold', () => {
+    expect(
+      findClosestRectByBorderProximity(draggingRect, [
+        { id: 'target', rect: { left: 244, top: 104, width: 120, height: 56 } },
+      ], 36),
+    ).toEqual({ id: 'target', distance: 24 });
+  });
+
+  it('does not select a target when every border is outside the proximity threshold', () => {
+    expect(
+      findClosestRectByBorderProximity(draggingRect, [
+        { id: 'target', rect: { left: 270, top: 104, width: 120, height: 56 } },
+      ], 36),
+    ).toBeNull();
+  });
+
+  it('chooses the nearest border match in dense layouts', () => {
+    expect(
+      findClosestRectByBorderProximity(draggingRect, [
+        { id: 'far', rect: { left: 252, top: 100, width: 120, height: 56 } },
+        { id: 'near', rect: { left: 242, top: 98, width: 120, height: 56 } },
+      ], 36),
+    ).toEqual({ id: 'near', distance: 22 });
+  });
+
+  it('uses diagonal border distance instead of center distance', () => {
+    const match = findClosestRectByBorderProximity(draggingRect, [
+      { id: 'diagonal', rect: { left: 238, top: 174, width: 120, height: 56 } },
+    ], 36);
+
+    expect(match?.id).toBe('diagonal');
+    expect(match?.distance).toBeCloseTo(Math.sqrt(18 ** 2 + 18 ** 2), 5);
   });
 });

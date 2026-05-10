@@ -33,6 +33,16 @@ npm run typecheck
 npm run lint
 ```
 
+## LLM TLS / CA
+
+If your network uses a local proxy or custom root certificate and LLM requests fail with certificate-chain errors, set this in `.env`:
+
+```bash
+LLM_CA_CERT_PATH=/etc/ssl/cert.pem
+```
+
+The setting applies to all OpenAI-compatible LLM providers used by the app, including DeepSeek.
+
 ## MinerU OCR (Official Free API, Recommended)
 
 Enable MinerU OCR in `.env`:

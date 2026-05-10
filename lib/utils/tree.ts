@@ -8,7 +8,8 @@ import {
 
 export const MAX_TREE_DEPTH = 3;
 export const MAX_TREE_NODES = 500;
-const DROP_CENTER_ZONE_WIDTH = 80;
+const DROP_SIBLING_EDGE_PX = 24;
+export const DROP_BORDER_PROXIMITY_PX = 36;
 
 export type DropMoveMode = 'child' | 'sibling';
 export type DropSiblingPlacement = 'before' | 'after';
@@ -28,6 +29,16 @@ export interface RectLike {
   top: number;
   width: number;
   height: number;
+}
+
+export interface RectProximityCandidate {
+  id: string;
+  rect: RectLike;
+}
+
+export interface RectProximityMatch {
+  id: string;
+  distance: number;
 }
 
 export function createSourceRefFallback(sourceRef: Partial<SourceReference>): SourceReference {
@@ -179,26 +190,94 @@ export function inferDropModeFromPoint(
   const isHorizontalLayout = direction === 'LR' || direction === 'RL';
 
   if (isHorizontalLayout) {
-    // For left↔right layouts: center horizontal zone = child, edges = sibling
-    const centerX = rect.left + rect.width / 2;
-    const centerHalfWidth = Math.max(
-      16,
-      Math.min(DROP_CENTER_ZONE_WIDTH / 2, rect.width / 2),
-    );
-    const centerLeft = centerX - centerHalfWidth;
-    const centerRight = centerX + centerHalfWidth;
-    return point.x >= centerLeft && point.x <= centerRight ? 'child' : 'sibling';
+    const edgeBand = Math.max(12, Math.min(DROP_SIBLING_EDGE_PX, rect.width / 4));
+    const leftEdge = rect.left + edgeBand;
+    const rightEdge = rect.left + rect.width - edgeBand;
+    return point.x > leftEdge && point.x < rightEdge ? 'child' : 'sibling';
   }
 
-  // For top↔bottom layouts: center vertical zone = child, edges = sibling
-  const centerY = rect.top + rect.height / 2;
-  const centerHalfHeight = Math.max(
-    16,
-    Math.min(DROP_CENTER_ZONE_WIDTH / 2, rect.height / 2),
+  const edgeBand = Math.max(12, Math.min(DROP_SIBLING_EDGE_PX, rect.height / 4));
+  const topEdge = rect.top + edgeBand;
+  const bottomEdge = rect.top + rect.height - edgeBand;
+  return point.y > topEdge && point.y < bottomEdge ? 'child' : 'sibling';
+}
+
+function normalizeRect(rect: RectLike): RectLike {
+  const right = rect.left + rect.width;
+  const bottom = rect.top + rect.height;
+  return {
+    left: Math.min(rect.left, right),
+    top: Math.min(rect.top, bottom),
+    width: Math.abs(rect.width),
+    height: Math.abs(rect.height),
+  };
+}
+
+function isValidRect(rect: RectLike): boolean {
+  return (
+    Number.isFinite(rect.left) &&
+    Number.isFinite(rect.top) &&
+    Number.isFinite(rect.width) &&
+    Number.isFinite(rect.height) &&
+    rect.width > 0 &&
+    rect.height > 0
   );
-  const centerTop = centerY - centerHalfHeight;
-  const centerBottom = centerY + centerHalfHeight;
-  return point.y >= centerTop && point.y <= centerBottom ? 'child' : 'sibling';
+}
+
+function rectCenterDistance(a: RectLike, b: RectLike): number {
+  const ax = a.left + a.width / 2;
+  const ay = a.top + a.height / 2;
+  const bx = b.left + b.width / 2;
+  const by = b.top + b.height / 2;
+  return Math.hypot(ax - bx, ay - by);
+}
+
+export function rectBorderDistance(a: RectLike, b: RectLike): number {
+  const source = normalizeRect(a);
+  const target = normalizeRect(b);
+
+  const sourceRight = source.left + source.width;
+  const sourceBottom = source.top + source.height;
+  const targetRight = target.left + target.width;
+  const targetBottom = target.top + target.height;
+
+  const dx = Math.max(target.left - sourceRight, source.left - targetRight, 0);
+  const dy = Math.max(target.top - sourceBottom, source.top - targetBottom, 0);
+  return Math.hypot(dx, dy);
+}
+
+export function findClosestRectByBorderProximity(
+  draggingRect: RectLike,
+  candidates: RectProximityCandidate[],
+  maxDistance = DROP_BORDER_PROXIMITY_PX,
+): RectProximityMatch | null {
+  if (!isValidRect(draggingRect) || maxDistance < 0) return null;
+
+  const source = normalizeRect(draggingRect);
+  let best: { id: string; distance: number; centerDistance: number } | null = null;
+
+  for (const candidate of candidates) {
+    if (!candidate.id || !isValidRect(candidate.rect)) continue;
+
+    const target = normalizeRect(candidate.rect);
+    const distance = rectBorderDistance(source, target);
+    if (distance > maxDistance) continue;
+
+    const centerDistance = rectCenterDistance(source, target);
+    if (
+      !best ||
+      distance < best.distance ||
+      (distance === best.distance && centerDistance < best.centerDistance)
+    ) {
+      best = {
+        id: candidate.id,
+        distance,
+        centerDistance,
+      };
+    }
+  }
+
+  return best ? { id: best.id, distance: best.distance } : null;
 }
 
 export function applyTreePatch(tree: MindMapTree, patch: TreePatch): MindMapTree {
@@ -262,6 +341,8 @@ export function applyTreePatch(tree: MindMapTree, patch: TreePatch): MindMapTree
 
       const movedNode = removeNode(nextTree.root, patch.nodeId);
       if (!movedNode) return nextTree;
+
+      clearNodePositions(movedNode);
 
       const newParent = findNode(nextTree.root, patch.newParentId);
       if (!newParent) return nextTree;
@@ -424,6 +505,12 @@ export function removeNode(root: MindMapNode, nodeId: string): MindMapNode | nul
     if (removed) return removed;
   }
   return null;
+}
+
+export function clearNodePositions(node: MindMapNode): void {
+  delete node.position;
+  if (!node.children?.length) return;
+  node.children.forEach((child) => clearNodePositions(child));
 }
 
 export function balanceChildren(tree: MindMapTree): MindMapTree {

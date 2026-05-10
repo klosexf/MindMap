@@ -132,7 +132,8 @@ a {
 .page {
   width: min(1200px, 100%);
   margin: 0 auto;
-  padding: 0 24px;
+  padding-left: 24px;
+  padding-right: 24px;
   position: relative;
   z-index: 1;
 }
@@ -1433,7 +1434,8 @@ a {
 
 @media (max-width: 1023px) {
   .page {
-    padding: 0 16px;
+    padding-left: 16px;
+    padding-right: 16px;
   }
 
   .home-nav-links {
