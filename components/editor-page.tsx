@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { EditorToolbar } from '@/components/editor-toolbar';
 import { AiSummaryPanel } from '@/components/ai-summary-panel';
 import { MindMapEditor, type MindMapEditorRef } from '@/components/mindmap-editor';
-import type { MindMapTree, NodePosition } from '@/lib/types/mindmap';
+import type { MindMapTree, NodePosition, NormalizedDocument } from '@/lib/types/mindmap';
 import { useMindMapStore } from '@/store/mindmap-store';
 
 interface EditorPageProps {
@@ -29,6 +29,7 @@ export function EditorPage({ id }: EditorPageProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [normalizedDocument, setNormalizedDocument] = useState<NormalizedDocument | null>(null);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const savedVersionRef = useRef<number>(0);
@@ -61,11 +62,12 @@ export function EditorPage({ id }: EditorPageProps) {
         throw new Error(statusText);
       }
 
-      const json = (await res.json()) as { tree: MindMapTree };
+      const json = (await res.json()) as { tree: MindMapTree; normalizedDocument?: NormalizedDocument };
       if (!json.tree) {
         throw new Error('服务器返回的导图数据为空');
       }
       setTree(json.tree);
+      setNormalizedDocument(json.normalizedDocument ?? null);
       setSelectedNode(json.tree.root.id);
       savedVersionRef.current = json.tree.meta.version;
       setDirty(false);
@@ -78,7 +80,10 @@ export function EditorPage({ id }: EditorPageProps) {
 
   useEffect(() => {
     loadTree();
-    return () => setTree(null);
+    return () => {
+      setTree(null);
+      setNormalizedDocument(null);
+    };
   }, [loadTree, setTree]);
 
   // Track dirty state when tree changes
@@ -347,7 +352,7 @@ export function EditorPage({ id }: EditorPageProps) {
           />
         </div>
 
-        <AiSummaryPanel tree={tree} />
+        <AiSummaryPanel tree={tree} normalizedDocument={normalizedDocument} />
       </section>
     </main>
   );

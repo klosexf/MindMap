@@ -228,3 +228,50 @@ export interface NormalizedDocument {
     parseWarning?: string;
   };
 }
+
+export const parsedChunkSchema = z.object({
+  id: z.string().min(1),
+  text: z.string().min(1),
+  tokenEstimate: z.number().int().positive(),
+  sourceRef: sourceReferenceSchema,
+});
+
+export const ocrDebugPageSchema = z.object({
+  page: z.number().int().positive(),
+  rawText: z.string(),
+  cleanedText: z.string(),
+  accepted: z.boolean(),
+  reason: z.string().optional(),
+});
+
+export const ocrDebugSchema = z.object({
+  enabled: z.boolean(),
+  attempted: z.boolean(),
+  provider: z.string().optional(),
+  model: z.string().optional(),
+  attemptedPages: z.number().int().nonnegative(),
+  acceptedPages: z.number().int().nonnegative(),
+  errorMessages: z.array(z.string()),
+  pages: z.array(ocrDebugPageSchema),
+});
+
+export const normalizedDocumentSchema = z.object({
+  markdown: z.string().min(1),
+  chunks: z.array(parsedChunkSchema).min(1),
+  sourceMeta: z.object({
+    type: z.enum(SOURCE_TYPES),
+    title: z.string().optional(),
+    sourceUrl: z.string().url().optional(),
+    sourceFileName: z.string().optional(),
+    ocrUsed: z.boolean().optional(),
+    ocrDebug: ocrDebugSchema.optional(),
+    parseWarning: z.string().optional(),
+  }),
+});
+
+export const mindMapRecordSchema = z.object({
+  tree: mindMapTreeSchema,
+  normalizedDocument: normalizedDocumentSchema.optional(),
+});
+
+export type MindMapRecord = z.infer<typeof mindMapRecordSchema>;

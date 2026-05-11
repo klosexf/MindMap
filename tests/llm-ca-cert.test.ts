@@ -82,4 +82,93 @@ describe('LLM CA cert handling', () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('uses a dedicated system prompt for markdown summaries instead of the mindmap-generation system', async () => {
+    process.env.LLM_PROVIDER = 'openai';
+    process.env.LLM_MODEL = 'gpt-4o-mini';
+    process.env.OPENAI_API_KEY = 'sk-test';
+
+    createOpenAISpy.mockImplementation(() => {
+      const provider = ((model: string) => ({ kind: 'responses', model })) as unknown as {
+        (model: string): unknown;
+        chat: (model: string) => unknown;
+      };
+      provider.chat = (model: string) => ({ kind: 'chat', model });
+      return provider;
+    });
+
+    generateTextSpy.mockResolvedValue({
+      text: '# Demo\n\n## 中心思想\n\n- Point one',
+    });
+
+    const { generateMarkdownPreview } = await import('../lib/llm/generate');
+    await generateMarkdownPreview(makeDoc());
+
+    expect(generateTextSpy).toHaveBeenCalledTimes(1);
+    expect(generateTextSpy.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        system: expect.stringContaining('Markdown'),
+      }),
+    );
+    expect(String(generateTextSpy.mock.calls[0]?.[0]?.system || '')).not.toContain('组织为思维导图结构');
+  });
+
+  it('uses a dedicated system prompt for document summaries instead of the mindmap-generation system', async () => {
+    process.env.LLM_PROVIDER = 'openai';
+    process.env.LLM_MODEL = 'gpt-4o-mini';
+    process.env.OPENAI_API_KEY = 'sk-test';
+
+    createOpenAISpy.mockImplementation(() => {
+      const provider = ((model: string) => ({ kind: 'responses', model })) as unknown as {
+        (model: string): unknown;
+        chat: (model: string) => unknown;
+      };
+      provider.chat = (model: string) => ({ kind: 'chat', model });
+      return provider;
+    });
+
+    generateTextSpy.mockResolvedValue({
+      text: '{"points":["Point one","Point two"]}',
+    });
+
+    const { generateDocumentSummary } = await import('../lib/llm/generate');
+    await generateDocumentSummary(makeDoc());
+
+    expect(generateTextSpy).toHaveBeenCalledTimes(1);
+    expect(generateTextSpy.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        system: expect.stringContaining('文档事实总结'),
+      }),
+    );
+    expect(String(generateTextSpy.mock.calls[0]?.[0]?.system || '')).not.toContain('组织为思维导图结构');
+  });
+
+  it('preserves leading years and counts in document summary points while still normalizing real list markers', async () => {
+    process.env.LLM_PROVIDER = 'openai';
+    process.env.LLM_MODEL = 'gpt-4o-mini';
+    process.env.OPENAI_API_KEY = 'sk-test';
+
+    createOpenAISpy.mockImplementation(() => {
+      const provider = ((model: string) => ({ kind: 'responses', model })) as unknown as {
+        (model: string): unknown;
+        chat: (model: string) => unknown;
+      };
+      provider.chat = (model: string) => ({ kind: 'chat', model });
+      return provider;
+    });
+
+    generateTextSpy.mockResolvedValue({
+      text: '{"points":["1993年7月4日出生","6年互联网产品经理经验","2019年6月-2024年11月担任产品经理","1. 负责产品全生命周期管理"]}',
+    });
+
+    const { generateDocumentSummary } = await import('../lib/llm/generate');
+    const result = await generateDocumentSummary(makeDoc());
+
+    expect(result.points).toEqual([
+      '1993年7月4日出生',
+      '6年互联网产品经理经验',
+      '2019年6月-2024年11月担任产品经理',
+      '负责产品全生命周期管理',
+    ]);
+  });
 });

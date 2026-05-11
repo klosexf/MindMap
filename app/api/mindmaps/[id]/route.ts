@@ -1,14 +1,15 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
-import { deleteMindMap, getMindMap, patchMindMap, saveMindMap } from '@/lib/storage/mindmap-store';
-import { mindMapTreeSchema, treePatchListSchema } from '@/lib/types/mindmap';
+import { deleteMindMap, getMindMapRecord, patchMindMap, saveMindMap } from '@/lib/storage/mindmap-store';
+import { mindMapTreeSchema, normalizedDocumentSchema, treePatchListSchema } from '@/lib/types/mindmap';
 
 export const runtime = 'nodejs';
 
 const patchRequestSchema = z.object({
   patches: treePatchListSchema.optional(),
   tree: mindMapTreeSchema.optional(),
+  normalizedDocument: normalizedDocumentSchema.optional(),
 });
 
 interface Params {
@@ -17,13 +18,13 @@ interface Params {
 
 export async function GET(_: Request, { params }: Params) {
   const { id } = await params;
-  const tree = await getMindMap(id);
+  const record = await getMindMapRecord(id);
 
-  if (!tree) {
+  if (!record) {
     return NextResponse.json({ error: 'Mindmap not found' }, { status: 404 });
   }
 
-  return NextResponse.json({ tree });
+  return NextResponse.json({ tree: record.tree, normalizedDocument: record.normalizedDocument });
 }
 
 export async function PATCH(req: Request, { params }: Params) {
@@ -36,8 +37,8 @@ export async function PATCH(req: Request, { params }: Params) {
         return NextResponse.json({ error: 'Tree id mismatch' }, { status: 400 });
       }
 
-      const saved = await saveMindMap(payload.tree);
-      return NextResponse.json({ tree: saved });
+      const saved = await saveMindMap(payload.tree, payload.normalizedDocument);
+      return NextResponse.json({ tree: saved, normalizedDocument: payload.normalizedDocument });
     }
 
     if (!payload.patches) {

@@ -9,6 +9,26 @@ const bodySchema = z.object({
   title: z.string().optional(),
 });
 
+function sanitizeAsciiFilename(value: string): string {
+  const normalized = value
+    .normalize('NFKD')
+    .replace(/[^\x20-\x7E]+/g, '-')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-._]+|[-._]+$/g, '');
+
+  return normalized || 'mindmap';
+}
+
+function encodeContentDispositionFilename(title?: string): string {
+  const baseName = (title || 'mindmap').trim() || 'mindmap';
+  const asciiFilename = `${sanitizeAsciiFilename(baseName)}.png`;
+  const utf8Filename = encodeURIComponent(`${baseName}.png`)
+    .replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+
+  return `attachment; filename="${asciiFilename}"; filename*=UTF-8''${utf8Filename}`;
+}
+
 function createPlaceholderPng(title = 'MindMap Export'): Buffer {
   const width = 1200;
   const height = 630;
@@ -57,7 +77,7 @@ export async function POST(req: Request) {
     return new Response(buffer, {
       headers: {
         'Content-Type': 'image/png',
-        'Content-Disposition': `attachment; filename="${title || 'mindmap'}.png"`,
+        'Content-Disposition': encodeContentDispositionFilename(title),
         'Cache-Control': 'no-store',
       },
     });

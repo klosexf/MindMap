@@ -1,13 +1,13 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
-import { generateAiSummary } from '@/lib/llm/generate';
-import { mindMapTreeSchema } from '@/lib/types/mindmap';
+import { generateDocumentSummary } from '@/lib/llm/generate';
+import { normalizedDocumentSchema } from '@/lib/types/mindmap';
 
 export const runtime = 'nodejs';
 
 const requestSchema = z.object({
-  tree: mindMapTreeSchema,
+  normalizedDocument: normalizedDocumentSchema,
 });
 
 export async function POST(req: Request) {
@@ -22,7 +22,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await generateAiSummary(parseResult.data.tree);
+    const result = await generateDocumentSummary(parseResult.data.normalizedDocument);
     return NextResponse.json({
       points: result.points,
       proof: {

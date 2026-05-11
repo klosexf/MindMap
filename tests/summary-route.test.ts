@@ -1,60 +1,43 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const generateAiSummaryMock = vi.hoisted(() => vi.fn());
+const generateDocumentSummaryMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@/lib/llm/generate', () => ({
-  generateAiSummary: generateAiSummaryMock,
+  generateDocumentSummary: generateDocumentSummaryMock,
 }));
 
 import { POST } from '../app/api/summary/route';
-import type { MindMapTree } from '../lib/types/mindmap';
+import type { NormalizedDocument } from '../lib/types/mindmap';
 
-const demoTree: MindMapTree = {
-  id: 'tree_demo',
-  root: {
-    id: 'root_1',
-    content: '人工智能发展报告 2024',
-    collapsed: false,
-    meta: {
-      sourceRef: { type: 'text', text: '人工智能发展报告 2024' },
-      confidence: 0.95,
-      type: 'main',
-      createdAt: 1,
-      createdBy: 'ai',
-    },
-    children: [
-      {
-        id: 'node_1',
-        content: '大模型能力持续提升',
-        collapsed: false,
-        meta: {
-          sourceRef: { type: 'text', text: '大模型能力持续提升' },
-          confidence: 0.84,
-          type: 'detail',
-          createdAt: 2,
-          createdBy: 'ai',
-        },
-        children: [],
+const demoDoc: NormalizedDocument = {
+  markdown: '# 人工智能发展报告 2024\n\n## 第一章\n\n大模型能力持续提升。',
+  chunks: [
+    {
+      id: 'chunk_1',
+      text: '## 第一章\n\n大模型能力持续提升。',
+      tokenEstimate: 24,
+      sourceRef: {
+        type: 'pdf',
+        page: 1,
+        location: 'page:1',
+        text: '大模型能力持续提升。',
       },
-    ],
-  },
-  meta: {
+    },
+  ],
+  sourceMeta: {
+    type: 'pdf',
     title: '人工智能发展报告 2024',
-    sourceType: 'text',
-    createdAt: 1,
-    updatedAt: 2,
-    version: 1,
-    truncated: false,
+    sourceFileName: 'ai-report-2024.pdf',
   },
 };
 
 describe('POST /api/summary', () => {
   beforeEach(() => {
-    generateAiSummaryMock.mockReset();
+    generateDocumentSummaryMock.mockReset();
   });
 
   it('returns ai summary content and proof metadata', async () => {
-    generateAiSummaryMock.mockResolvedValue({
+    generateDocumentSummaryMock.mockResolvedValue({
       points: [
         '大模型、多模态与 Agent 持续驱动 AI 技术演进。',
         '行业应用从能力展示转向业务闭环与效率提升。',
@@ -68,7 +51,7 @@ describe('POST /api/summary', () => {
     const req = new Request('http://localhost/api/summary', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tree: demoTree }),
+      body: JSON.stringify({ normalizedDocument: demoDoc }),
     });
 
     const res = await POST(req);
@@ -99,12 +82,12 @@ describe('POST /api/summary', () => {
   });
 
   it('returns 502 when summary generation fails', async () => {
-    generateAiSummaryMock.mockRejectedValue(new Error('summary timeout'));
+    generateDocumentSummaryMock.mockRejectedValue(new Error('summary timeout'));
 
     const req = new Request('http://localhost/api/summary', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tree: demoTree }),
+      body: JSON.stringify({ normalizedDocument: demoDoc }),
     });
 
     const res = await POST(req);

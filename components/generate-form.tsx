@@ -393,7 +393,7 @@ export function GenerateForm() {
       const saveRes = await fetch(`/api/mindmaps/${finalTree.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tree: finalTree }),
+        body: JSON.stringify({ tree: finalTree, normalizedDocument: parseJson.normalizedDocument }),
       });
 
       if (!saveRes.ok) {

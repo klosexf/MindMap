@@ -1891,6 +1891,22 @@ const ANTI_HALLUCINATION_SYSTEM = [
   '- 严禁为节省空间而截断关键信息，必须通过拆分保留全部信息',
 ].join('\n');
 
+const MARKDOWN_SUMMARY_SYSTEM = [
+  '你是一名 Markdown 文档总结助手，不是思维导图生成器。',
+  '你的任务是基于用户提供的原文，输出一份结构化、可读、忠于原文的 Markdown 总结。',
+  '你只能提炼、归纳、压缩原文，不得编造、推断、补充外部知识。',
+  '除非原文明示，否则不要主动补充行动建议、风险判断或延伸分析。',
+  '输出必须服务于“文档总结”本身，而不是为思维导图节点生成做准备。',
+].join('\n');
+
+const DOCUMENT_SUMMARY_SYSTEM = [
+  '你是一名文档事实总结助手，不是思维导图生成器。',
+  '你的任务是基于用户提供的原文片段输出简洁摘要点，严格忠于原文。',
+  '只允许做压缩总结，不得编造、推断、补充外部知识。',
+  '如果原文存在 OCR 噪声、截断或歧义，只能弱化表述或跳过，不能自行补完。',
+  '除非原文明示，否则不要主动输出风险、建议、行动项。',
+].join('\n');
+
 const PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK = [
   '## 文档总结与思维导图构建目标',
   '请先在内部形成一份符合金字塔原理的结构化总结，再据此生成思维导图结构：',
@@ -2463,7 +2479,7 @@ async function generateTreeWithCompatProvider(
 
 function normalizeSummaryPoint(text: string): string {
   return text
-    .replace(/^\s*[-*•\d.)\s]+/, '')
+    .replace(/^\s*(?:[-*•]+|\d+[.)、])\s+/, '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120);
@@ -2495,38 +2511,41 @@ function collectOutlineLines(tree: MindMapTree, maxLines = 40): string[] {
   return lines;
 }
 
-function buildHeuristicSummaryPoints(tree: MindMapTree): string[] {
-  const rootTopic = normalizeSummaryPoint(tree.root.content) || '当前主题';
-  const topBranches = (tree.root.children || [])
-    .map((node) => ({
-      title: normalizeSummaryPoint(node.content),
-      details: (node.children || [])
-        .map((child) => normalizeSummaryPoint(child.content))
-        .filter(Boolean)
-        .slice(0, 2),
-    }))
-    .filter((item) => item.title)
-    .slice(0, 6);
+function formatSourceRefForSummary(sourceRef: SourceReference): string {
+  if (sourceRef.page) return `page:${sourceRef.page}`;
+  if (sourceRef.location) return sourceRef.location;
+  if (sourceRef.timestamp) return sourceRef.timestamp;
+  if (sourceRef.url) return sourceRef.url;
+  return sourceRef.type;
+}
 
-  if (topBranches.length === 0) {
+function collectDocumentSummaryLines(doc: NormalizedDocument, maxLines = 24): string[] {
+  return doc.chunks
+    .map((chunk) => {
+      const text = normalizeSummaryPoint(chunk.sourceRef.text || chunk.text);
+      if (!text) return '';
+      return `[${formatSourceRefForSummary(chunk.sourceRef)}] ${text.slice(0, 180)}`;
+    })
+    .filter(Boolean)
+    .slice(0, maxLines);
+}
+
+function buildHeuristicDocumentSummaryPoints(doc: NormalizedDocument): string[] {
+  const title = doc.sourceMeta.title || '当前文档';
+  const lines = collectDocumentSummaryLines(doc, 6);
+
+  if (lines.length === 0) {
+    const warning = normalizeSummaryPoint(doc.sourceMeta.parseWarning || '');
     return [
-      `当前导图围绕「${rootTopic}」展开，建议补充 2-3 个关键分支以形成完整结构。`,
-      '可先增加「核心观点」「支撑依据」「行动建议」三个方向，便于后续追问与扩展。',
-      '节点内容越具体，摘要越稳定，建议在分支下补充事实、数据或案例描述。',
+      `${title} 的原文快照为空或不可读，当前无法提炼稳定摘要。`,
+      warning ? `解析提示：${warning}` : '当前未提取到可直接引用的正文片段。',
     ];
   }
 
-  const summaryPoints = topBranches.map((branch) => {
-    if (branch.details.length === 0) {
-      return `${branch.title} 是当前导图的重要分支，可继续补充细节节点以完善论证。`;
-    }
-    return `${branch.title}：${branch.details.join('、')}。`;
-  });
-
-  if (summaryPoints.length < 3) {
-    summaryPoints.push(`整体主题聚焦在「${rootTopic}」，当前结构可支撑快速回顾与二次编辑。`);
+  const summaryPoints = lines.map((line) => line.replace(/^\[[^\]]+\]\s*/, ''));
+  if (doc.sourceMeta.parseWarning) {
+    summaryPoints.push(`解析提示：${normalizeSummaryPoint(doc.sourceMeta.parseWarning)}`);
   }
-
   return summaryPoints.slice(0, 8);
 }
 
@@ -2565,20 +2584,25 @@ function parseSummaryPointsFromText(text: string): string[] {
   return bulletPoints;
 }
 
-function buildSummaryPromptFromTree(tree: MindMapTree): string {
-  const title = tree.meta.title || normalizeSummaryPoint(tree.root.content) || '未命名导图';
-  const outline = collectOutlineLines(tree, 42).join('\n');
+function buildDocumentSummaryPrompt(doc: NormalizedDocument): string {
+  const title = doc.sourceMeta.title || '未命名文档';
+  const outline = collectDocumentSummaryLines(doc, 28).join('\n');
+  const parseWarning = normalizeSummaryPoint(doc.sourceMeta.parseWarning || '');
 
   return [
-    '你是信息提炼助手。请基于导图结构输出简洁中文摘要。',
+    '你是文档事实总结助手。请直接基于给定原文片段输出简洁中文摘要。',
     '输出要求：',
     '1. 输出 JSON：{"points":["..."]}，不要输出其它字段。',
-    '2. points 数量 3-8 条，每条 18-60 字。',
-    '3. 只基于给定导图内容，不要编造外部事实。',
-    '4. 重点提炼：核心主题、关键分支、行动/风险提示。',
+    '2. points 数量 3-8 条；若原文信息有限，可少于 3 条。',
+    '3. 只基于给定原文片段，不要编造外部事实，不要补充推断。',
+    '4. 重点提炼：核心主题、关键事实、明确结论；仅当原文明示时才写风险、问题或建议。',
+    '5. 优先保留原文中的术语、数据、专有名词与结论性表述。',
+    '6. 若原文存在 OCR 噪声、截断或歧义，只能如实弱化表述，不得自行补完。',
     '',
-    `导图标题：${title}`,
-    '导图结构：',
+    `文档标题：${title}`,
+    `来源类型：${doc.sourceMeta.type}`,
+    parseWarning ? `解析提示：${parseWarning}` : '',
+    '原文片段：',
     outline,
   ].join('\n');
 }
@@ -2655,7 +2679,7 @@ export async function generateMarkdownPreview(
 
   const result = await generateText({
     model: languageModel,
-    system: ANTI_HALLUCINATION_SYSTEM,
+    system: MARKDOWN_SUMMARY_SYSTEM,
     prompt: buildMarkdownPreviewPrompt(doc),
     maxRetries: markdownMaxRetries,
     timeout: markdownTimeoutMs ?? requestConfig.timeoutMs,
@@ -2673,14 +2697,14 @@ export async function generateMarkdownPreview(
   };
 }
 
-export async function generateAiSummary(
-  tree: MindMapTree,
+export async function generateDocumentSummary(
+  doc: NormalizedDocument,
   options: {
     abortSignal?: AbortSignal;
   } = {},
 ): Promise<AiSummaryResult> {
   const llmConfig = resolveLLMConfig();
-  const fallbackPoints = buildHeuristicSummaryPoints(tree);
+  const fallbackPoints = buildHeuristicDocumentSummaryPoints(doc);
   const hasApiKey = Boolean(llmConfig.apiKey);
 
   if (!llmConfig.supported || !hasApiKey) {
@@ -2705,8 +2729,8 @@ export async function generateAiSummary(
 
   const result = await generateText({
     model: languageModel,
-    system: ANTI_HALLUCINATION_SYSTEM,
-    prompt: buildSummaryPromptFromTree(tree),
+    system: DOCUMENT_SUMMARY_SYSTEM,
+    prompt: buildDocumentSummaryPrompt(doc),
     maxRetries: summaryMaxRetries,
     timeout: summaryTimeoutMs ?? requestConfig.timeoutMs,
     abortSignal: options.abortSignal,
