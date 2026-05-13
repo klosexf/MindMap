@@ -115,6 +115,17 @@ describe('Prompt Generation', () => {
     }
   });
 
+  it('should include explicit anti-duplication rules for repeated facts across nodes', () => {
+    const prompts = [buildPrompt(testDoc), buildCompatJsonPrompt(testDoc)];
+
+    for (const prompt of prompts) {
+      expect(prompt).toContain('同一事实/经历/数据/句意全树只能出现一次');
+      expect(prompt).toContain('不得在父节点和子节点中重复复述同一条信息');
+      expect(prompt).toContain('禁止用“(1)”“(2)”');
+      expect(prompt).toContain('全树去重扫描');
+    }
+  });
+
   it('should keep the compat prompt compact enough for non-streaming providers', () => {
     const prompt = buildCompatJsonPrompt(testDoc);
 

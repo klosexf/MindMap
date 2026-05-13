@@ -1,5 +1,5 @@
 import { treeToGraphData } from '@antv/g6';
-import type { GraphData, NodeData } from '@antv/g6';
+import type { EdgeData, GraphData, NodeData } from '@antv/g6';
 
 import type { LayoutDirection, MindMapNode, MindMapTree } from '@/lib/types/mindmap';
 
@@ -22,6 +22,11 @@ function toHierarchyNode(node: MindMapNode): HierarchyNode {
     position: node.position,
     children: (node.children || []).map((child) => toHierarchyNode(child)),
   };
+}
+
+function collectChildCounts(node: HierarchyNode, counts: Map<string, number>): void {
+  counts.set(node.id, node.children.length);
+  node.children.forEach((child) => collectChildCounts(child, counts));
 }
 
 const _canvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
@@ -64,6 +69,37 @@ interface NodeSize {
   height: number;
 }
 
+interface PortConfig {
+  incoming: { key: string; placement: [number, number] };
+  outgoing: { key: string; placement: [number, number] };
+}
+
+function getPortConfig(direction: LayoutDirection): PortConfig {
+  switch (direction) {
+    case 'RL':
+      return {
+        incoming: { key: 'right-center', placement: [1, 0.5] },
+        outgoing: { key: 'left-center', placement: [0, 0.5] },
+      };
+    case 'TB':
+      return {
+        incoming: { key: 'top-center', placement: [0.5, 0] },
+        outgoing: { key: 'bottom-center', placement: [0.5, 1] },
+      };
+    case 'BT':
+      return {
+        incoming: { key: 'bottom-center', placement: [0.5, 1] },
+        outgoing: { key: 'top-center', placement: [0.5, 0] },
+      };
+    case 'LR':
+    default:
+      return {
+        incoming: { key: 'left-center', placement: [0, 0.5] },
+        outgoing: { key: 'right-center', placement: [1, 0.5] },
+      };
+  }
+}
+
 export function getNodeSize(nodeId: string, label: string, rootId: string): NodeSize {
   const text = label || '';
   const isRoot = nodeId === rootId;
@@ -85,8 +121,11 @@ export function getNodeSize(nodeId: string, label: string, rootId: string): Node
   return { width: nodeWidth, height: nodeHeight };
 }
 
-export function toG6GraphData(tree: MindMapTree): GraphData {
+export function toG6GraphData(tree: MindMapTree, direction: LayoutDirection = 'LR'): GraphData {
   const hierarchy = toHierarchyNode(tree.root);
+  const portConfig = getPortConfig(direction);
+  const childCounts = new Map<string, number>();
+  collectChildCounts(hierarchy, childCounts);
   const graph = treeToGraphData(hierarchy, {
     getNodeData: (node, depth) => {
       const data = node as {
@@ -109,12 +148,43 @@ export function toG6GraphData(tree: MindMapTree): GraphData {
         },
         style: {
           collapsed: Boolean(data.collapsed),
+          port: true,
+          ports: [
+            {
+              ...portConfig.incoming,
+              r: 0,
+              fill: 'transparent',
+              stroke: 'transparent',
+              lineWidth: 0,
+            },
+            {
+              ...portConfig.outgoing,
+              r: 0,
+              fill: 'transparent',
+              stroke: 'transparent',
+              lineWidth: 0,
+            },
+          ],
           ...(data.position ? { x: data.position.x, y: data.position.y } : {}),
         },
       };
       return nodeData;
     },
   });
+
+  graph.edges = (graph.edges || []).map((edge) => ({
+    ...(edge as EdgeData),
+    sourcePort: portConfig.outgoing.key,
+    targetPort: portConfig.incoming.key,
+    ...(childCounts.get(String((edge as EdgeData).source)) === 1
+      ? {
+          style: {
+            router: false,
+            radius: 0,
+          },
+        }
+      : {}),
+  }));
 
   return graph;
 }

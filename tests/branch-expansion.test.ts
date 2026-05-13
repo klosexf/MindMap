@@ -101,4 +101,42 @@ describe('branch expansion', () => {
     expect(tree.root.content).not.toContain('产品经理_深圳 18-30K');
     expect(tree.root.content).not.toBe('思维导图');
   });
+
+  it('does not reuse the same source sentence across multiple expanded branches', () => {
+    const ref = sourceRef();
+    const sharedSentence = '负责商业化营收、流量转化和团队搭建。';
+    const doc: NormalizedDocument = {
+      markdown: sharedSentence,
+      chunks: [
+        {
+          id: 'shared-chunk',
+          text: sharedSentence,
+          tokenEstimate: 16,
+          sourceRef: ref,
+        },
+      ],
+      sourceMeta: {
+        type: 'pdf',
+        title: '产品经理简历',
+        sourceFileName: 'resume.pdf',
+      },
+    };
+
+    const tree = getDefaultMindMapTree('产品经理简历', ref, 'pdf');
+    const root = createNode('产品经理兼具商业化与增长能力', ref, 'ai');
+    root.children = [
+      createNode('商业化能力', ref, 'ai'),
+      createNode('流量转化能力', ref, 'ai'),
+    ];
+
+    const result = repairSparseFirstLayerForDoc({ ...tree, root }, doc);
+    const branchDetails = (result.root.children || []).flatMap((branch) =>
+      (branch.children || []).map((child) => child.content),
+    );
+    const normalizedSharedSentence = sharedSentence.replace(/[。！？!?,，\s]/g, '');
+
+    expect(
+      branchDetails.filter((content) => content.replace(/[。！？!?,，\s]/g, '') === normalizedSharedSentence),
+    ).toHaveLength(1);
+  });
 });

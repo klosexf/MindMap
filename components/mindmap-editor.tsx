@@ -60,6 +60,158 @@ interface DropPreview {
   };
 }
 
+type PortPlacement = [number, number];
+
+interface RuntimePort {
+  key: string;
+  placement: PortPlacement;
+  r: number;
+  fill: string;
+  stroke: string;
+  lineWidth: number;
+}
+
+function collectChildrenByParent(node: MindMapNode, map: Map<string, string[]>): void {
+  map.set(
+    node.id,
+    (node.children || []).map((child) => child.id),
+  );
+  node.children?.forEach((child) => collectChildrenByParent(child, map));
+}
+
+function getRuntimePortAnchors(direction: LayoutDirection) {
+  switch (direction) {
+    case 'RL':
+      return {
+        incoming: { key: 'right-center', placement: [1, 0.5] as PortPlacement },
+        outgoing: { key: 'left-center', placement: [0, 0.5] as PortPlacement },
+      };
+    case 'TB':
+      return {
+        incoming: { key: 'top-center', placement: [0.5, 0] as PortPlacement },
+        outgoing: { key: 'bottom-center', placement: [0.5, 1] as PortPlacement },
+      };
+    case 'BT':
+      return {
+        incoming: { key: 'bottom-center', placement: [0.5, 1] as PortPlacement },
+        outgoing: { key: 'top-center', placement: [0.5, 0] as PortPlacement },
+      };
+    case 'LR':
+    default:
+      return {
+        incoming: { key: 'left-center', placement: [0, 0.5] as PortPlacement },
+        outgoing: { key: 'right-center', placement: [1, 0.5] as PortPlacement },
+      };
+  }
+}
+
+function createHiddenPort(key: string, placement: PortPlacement): RuntimePort {
+  return {
+    key,
+    placement,
+    r: 0,
+    fill: 'transparent',
+    stroke: 'transparent',
+    lineWidth: 0,
+  };
+}
+
+async function applyParallelStraightEdgeLayout(graph: Graph, root: MindMapNode, direction: LayoutDirection): Promise<void> {
+  const childrenByParent = new Map<string, string[]>();
+  collectChildrenByParent(root, childrenByParent);
+
+  const nodeData = graph.getNodeData() as Array<{
+    id?: string;
+    data?: { _width?: number; _height?: number };
+    style?: { ports?: RuntimePort[] };
+  }>;
+  const edgeData = graph.getEdgeData() as Array<{ id?: string; source?: string; target?: string }>;
+  const nodeById = new Map(nodeData.filter((node) => node.id).map((node) => [node.id as string, node]));
+  const edgeByPair = new Map(
+    edgeData
+      .filter((edge) => edge.id && edge.source && edge.target)
+      .map((edge) => [`${edge.source}::${edge.target}`, edge.id as string]),
+  );
+
+  const { incoming, outgoing } = getRuntimePortAnchors(direction);
+  const nodeUpdates: Array<{ id: string; style: { port: true; ports: RuntimePort[] } }> = [];
+  const edgeUpdates: Array<{
+    id: string;
+    sourcePort: string;
+    targetPort: string;
+    style: { router: false; radius: number };
+  }> = [];
+
+  for (const [parentId, childIds] of childrenByParent.entries()) {
+    const parent = nodeById.get(parentId);
+    if (!parent?.id) continue;
+
+    const parentPosition = graph.getElementPosition(parentId);
+    if (!Array.isArray(parentPosition)) continue;
+    const [, parentY] = parentPosition;
+    const parentWidth = Number(parent.data?._width) || 160;
+    const parentHeight = Number(parent.data?._height) || 36;
+
+    const ports: RuntimePort[] = [createHiddenPort(incoming.key, incoming.placement)];
+
+    if (childIds.length <= 1) {
+      ports.push(createHiddenPort(outgoing.key, outgoing.placement));
+    }
+
+    for (const childId of childIds) {
+      const edgeId = edgeByPair.get(`${parentId}::${childId}`);
+      if (!edgeId) continue;
+
+      const sourcePortKey =
+        childIds.length <= 1 ? outgoing.key : `${outgoing.key}-${childId}`;
+
+      if (childIds.length > 1) {
+        const childPosition = graph.getElementPosition(childId);
+        if (!Array.isArray(childPosition)) continue;
+        const [childX, childY] = childPosition;
+
+        let placement: PortPlacement;
+        if (direction === 'LR' || direction === 'RL') {
+          placement = [outgoing.placement[0], 0.5 + (childY - parentY) / parentHeight];
+        } else {
+          placement = [0.5 + (childX - parentPosition[0]) / parentWidth, outgoing.placement[1]];
+        }
+
+        ports.push(createHiddenPort(sourcePortKey, placement));
+      }
+
+      edgeUpdates.push({
+        id: edgeId,
+        sourcePort: sourcePortKey,
+        targetPort: incoming.key,
+        style: {
+          router: false,
+          radius: 0,
+        },
+      });
+    }
+
+    nodeUpdates.push({
+      id: parentId,
+      style: {
+        port: true,
+        ports,
+      },
+    });
+  }
+
+  if (nodeUpdates.length > 0) {
+    graph.updateNodeData(nodeUpdates);
+  }
+  if (edgeUpdates.length > 0) {
+    graph.updateEdgeData(edgeUpdates);
+  }
+
+  if (nodeUpdates.length > 0 || edgeUpdates.length > 0) {
+    await graph.draw();
+  }
+}
+
 function isPointInRect(point: { x: number; y: number }, rect: NodeClientRect): boolean {
   return (
     point.x >= rect.left &&
@@ -316,7 +468,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       container,
       autoResize: true,
       zoomRange: [0.1, 5],
-      data: toG6GraphData(treeRef.current),
+      data: toG6GraphData(treeRef.current, layoutDirectionRef.current),
       layout: getLayoutConfig(layoutDirectionRef.current),
       renderer: createLayerRenderer(renderMode),
       node: {
@@ -395,7 +547,11 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
         style: {
           lineWidth: 1.2,
           stroke: '#7A7A70',
-          radius: 14,
+          radius: 4,
+          router: {
+            type: 'orth',
+            padding: 16,
+          },
         },
       },
       behaviors: [
@@ -925,7 +1081,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     const savedViewport = viewportBeforeCommitRef.current;
     viewportBeforeCommitRef.current = null;
     const viewportState = savedViewport ?? readGraphViewportState(graph);
-    graph.setData(toG6GraphData(tree));
+    graph.setData(toG6GraphData(tree, layoutDirectionRef.current));
     graph
       .render()
       .then(async () => {

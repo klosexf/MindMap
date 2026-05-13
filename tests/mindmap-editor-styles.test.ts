@@ -30,4 +30,22 @@ describe('mindmap drag preview styles', () => {
     expect(dropSiblingBeforeState).not.toMatch(SHADOW_PROP_PATTERN);
     expect(dropSiblingAfterState).not.toMatch(SHADOW_PROP_PATTERN);
   });
+
+  it('uses a small polyline corner radius so connectors stay close to right angles', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      'utf8',
+    );
+
+    expect(source).toMatch(/edge:\s*\{[\s\S]*?type:\s*'polyline'[\s\S]*?radius:\s*4\b/);
+  });
+
+  it('enables orthogonal polyline routing so edge segments stay horizontal or vertical', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      'utf8',
+    );
+
+    expect(source).toMatch(/edge:\s*\{[\s\S]*?type:\s*'polyline'[\s\S]*?router:\s*\{\s*type:\s*'orth'/);
+  });
 });

@@ -25,6 +25,7 @@ import {
   createSourceRefFallback,
   flattenTree,
   getDefaultMindMapTree,
+  traverseTree,
 } from '@/lib/utils/tree';
 import {
   isWeChatArticleUrl,
@@ -900,6 +901,13 @@ function scoreSentenceForBranch(branchLabel: string, sentence: string): number {
   return Math.max(0, score);
 }
 
+function normalizeExpansionSentenceKey(text: string): string {
+  return sanitizeSentence(text)
+    .replace(/\s+/g, '')
+    .replace(/[，。！？!?,；;：:“”"'‘’、·\-\|\/\\()（）[\]【】{}]/g, '')
+    .toLowerCase();
+}
+
 function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): MindMapTree {
   const topChildren = tree.root.children || [];
   if (topChildren.length === 0) return tree;
@@ -908,35 +916,78 @@ function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): Mi
   if (pool.length === 0) return tree;
   const MIN_SCORE_THRESHOLD = 2;
   const MAX_DETAILS_PER_BRANCH = 3;
+  const usedSentenceKeys = new Set<string>();
+  const assignedDetails = new Map<string, MindMapNode[]>();
+  const expansionTargets: Array<{ id: string; content: string; depth: number }> = [];
 
-  function expandNode(node: MindMapNode, depth: number): MindMapNode {
-    const expandedChildren = (node.children || []).map((child) => expandNode(child, depth + 1));
-    const nodeWithChildren = { ...node, children: expandedChildren };
-    const shouldTryExpand = depth >= 1 && depth <= 2 && expandedChildren.length === 0;
-    if (!shouldTryExpand) return nodeWithChildren;
+  traverseTree(tree.root, (node) => {
+    const normalized = normalizeExpansionSentenceKey(node.content);
+    if (normalized) {
+      usedSentenceKeys.add(normalized);
+    }
+  });
 
-    const minimumScore = isCategoryLikeLabel(node.content) ? MIN_SCORE_THRESHOLD : 3;
+  function collectTargets(node: MindMapNode, depth: number): void {
+    const children = node.children || [];
+    children.forEach((child) => collectTargets(child, depth + 1));
+
+    if (depth >= 1 && depth <= 2 && children.length === 0) {
+      expansionTargets.push({ id: node.id, content: node.content, depth });
+    }
+  }
+
+  topChildren.forEach((child) => collectTargets(child, 1));
+  expansionTargets.sort((a, b) => {
+    if (b.depth !== a.depth) return b.depth - a.depth;
+    return b.content.length - a.content.length;
+  });
+
+  for (const target of expansionTargets) {
+    const minimumScore = isCategoryLikeLabel(target.content) ? MIN_SCORE_THRESHOLD : 3;
     const ranked = pool
       .map((item) => ({
         ...item,
-        score: scoreSentenceForBranch(node.content, item.sentence),
+        score: scoreSentenceForBranch(target.content, item.sentence),
       }))
       .filter((item) => item.score >= minimumScore)
       .sort((a, b) => b.score - a.score);
 
     const selected = ranked
-      .filter((item) => item.sentence !== node.content.trim())
+      .filter((item) => {
+        if (item.sentence === target.content.trim()) return false;
+
+        const sentenceKey = normalizeExpansionSentenceKey(item.sentence);
+        if (!sentenceKey) return false;
+        if (usedSentenceKeys.has(sentenceKey)) return false;
+
+        return true;
+      })
       .slice(0, MAX_DETAILS_PER_BRANCH);
 
-    if (selected.length === 0) return nodeWithChildren;
+    if (selected.length === 0) {
+      continue;
+    }
 
-    const details = selected.map((item) =>
-      createHeuristicNode(item.sentence, item.sourceRef, 'detail', 0.6),
+    selected.forEach((item) => {
+      const sentenceKey = normalizeExpansionSentenceKey(item.sentence);
+      if (sentenceKey) {
+        usedSentenceKeys.add(sentenceKey);
+      }
+    });
+
+    assignedDetails.set(
+      target.id,
+      selected.map((item) => createHeuristicNode(item.sentence, item.sourceRef, 'detail', 0.6)),
     );
+  }
+
+  function applyExpansion(node: MindMapNode): MindMapNode {
+    const expandedChildren = (node.children || []).map((child) => applyExpansion(child));
+    const assignedChildren = expandedChildren.length === 0 ? assignedDetails.get(node.id) : undefined;
 
     return {
-      ...nodeWithChildren,
-      children: details,
+      ...node,
+      children: assignedChildren ?? expandedChildren,
     };
   }
 
@@ -944,7 +995,7 @@ function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): Mi
     ...tree,
     root: {
       ...tree.root,
-      children: topChildren.map((child) => expandNode(child, 1)),
+      children: topChildren.map((child) => applyExpansion(child)),
     },
   };
 }
@@ -1976,6 +2027,10 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '3. 文档中没有对应内容的维度，不创建节点',
     '4. 文末若被截断，以最后一个完整段落为准，不补全断尾',
     '5. 同一信息在原文多次出现时，只保留一次，归入最相关父节点',
+    '   - 同一事实/经历/数据/句意全树只能出现一次，不得在不同分支重复挂载',
+    '   - 如果同一条信息同时可归入多个父节点，只保留在“最具体、最贴切”的那个分支，其余分支不得复述',
+    '   - 不得在父节点和子节点中重复复述同一条信息：父节点负责概括，子节点负责补充新的支撑事实',
+    '   - 禁止用“(1)”“(2)”或近似后缀为重复节点强行区分；遇到重复只能删除、合并或改写为不同信息维度',
     '6. 分类边界不可逾越：每个父节点下的子节点必须属于同一语义类别',
     '   - 核心原则：先确定父节点定义的语义范畴，再判断每条信息是否属于该范畴',
     '   - 判定方法：抽取子节点关键词 → 问"这描述的是父节点范畴内的事吗？"→ 不是则不可放入',
@@ -2050,6 +2105,7 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '3. 同级节点排列是否有明确逻辑顺序（演绎/时间/结构/程度）？',
     '4. 节点标题唯一性：无重复，无高度相似（<3个相似）',
     '5. 特别检查：是否出现文件名、编号 → 立即替换',
+    '6. 全树去重扫描：检查是否有同一事实被父子重复、跨分支重复，或仅靠“(1)”“(2)”区分的伪去重节点',
     '',
     '### 验证步骤 4：内容质量与过滤',
     '逐个检查所有节点，标记以下类型并删除：',
@@ -2231,6 +2287,9 @@ export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '- 内容必须忠实原文；允许压缩改写，不允许新增事实、数据、人名、案例、术语。',
     '- 模糊、乱码、不完整句子直接忽略；文档没有的维度不要创建节点。',
     '- 同一信息多次出现时只保留一次，放到最相关父节点下。',
+    '- 同一事实/经历/数据/句意全树只能出现一次；如果可放入多个分支，只保留在最贴切的那个分支。',
+    '- 不得在父节点和子节点中重复复述同一条信息；父节点做概括，子节点必须补充新的支撑事实。',
+    '- 禁止用“(1)”“(2)”或其他编号后缀来制造伪去重节点；重复内容只能删除、合并或改写为不同维度。',
     '- 文件名禁令：任何节点 content 禁止包含文件名或文件扩展名。',
     '- 每个子节点必须属于其父节点语义范畴；如果不属于，就删除或移到正确位置。',
     '- 根节点和每个父节点都必须包含实质信息，不得使用“概述”“分析”“总结”“背景”“方法”等空标签。',
@@ -2249,6 +2308,7 @@ export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '- 只输出合法 JSON，不要输出 Markdown、解释、自检过程或额外文字。',
     '- JSON 结构：{"title":"...","root":{"content":"...","children":[...]}}。',
     '- 生成前先在内部完成规划与自检，再一次性输出最终 JSON。',
+    '- 输出前执行一次全树去重扫描，确认没有跨分支重复、父子复述或“(1)/(2)”伪去重节点。',
     '',
     PYRAMID_SELF_CHECK_LOOP,
     '',
