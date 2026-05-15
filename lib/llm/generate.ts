@@ -1575,6 +1575,60 @@ function isWeakRootTitle(title: string): boolean {
   return /基础信息|性别|电话|邮箱|手机/.test(title);
 }
 
+function isGenericDocumentTitle(title: string): boolean {
+  return /(PRD|技术方案|需求文档|规范文档|设计规范|设计系统|说明文档|文档)$/i.test(title.trim());
+}
+
+function shouldPreferDocumentTitleForRoot(title?: string): boolean {
+  if (!title) return false;
+  const trimmed = title.trim();
+  if (!trimmed) return false;
+  if (PAGE_LABEL_RE.test(trimmed)) return false;
+  if (isFileOrDownloadTitle(trimmed)) return false;
+
+  const sanitized = sanitizeSentence(trimmed) || trimmed;
+  if (!sanitized.trim()) return false;
+  if (isFileOrDownloadTitle(sanitized)) return false;
+
+  return true;
+}
+
+export function preferDocumentTitleForRoot(tree: MindMapTree, documentTitle?: string): MindMapTree {
+  if (!shouldPreferDocumentTitleForRoot(documentTitle)) return tree;
+
+  const preferredRoot = (sanitizeSentence(documentTitle!) || documentTitle!.trim()).slice(0, 120).trim();
+  if (!preferredRoot) return tree;
+  const currentRoot = (sanitizeSentence(tree.root.content) || tree.root.content).trim();
+  const titleLooksGeneric = isGenericDocumentTitle(preferredRoot);
+  const currentRootLooksWeak =
+    !currentRoot ||
+    isWeakRootTitle(currentRoot) ||
+    isFileOrDownloadTitle(currentRoot) ||
+    currentRoot.length < 6;
+
+  const shouldReplaceRoot =
+    currentRootLooksWeak ||
+    (!titleLooksGeneric && currentRoot.length <= 10 && preferredRoot.length >= currentRoot.length + 4);
+
+  if (!shouldReplaceRoot && tree.meta.title === preferredRoot) {
+    return tree;
+  }
+
+  return {
+    ...tree,
+    root: shouldReplaceRoot
+      ? {
+          ...tree.root,
+          content: preferredRoot,
+        }
+      : tree.root,
+    meta: {
+      ...tree.meta,
+      title: preferredRoot,
+    },
+  };
+}
+
 const PAGE_LABEL_RE = /^(Page\s+\d+|OCR\s+Page\s+\d+|OCR\s+第\d+页|page:\d+|ocr-page:\d+|第\d+页)$/i;
 
 function titleFromChunk(text: string, index: number): string {
@@ -1662,7 +1716,8 @@ function llmTreeToMindMapTree(llmTree: LLMMindMapTree, doc: NormalizedDocument):
   const clamped = clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
   const parsed = mindMapTreeSchema.parse(clamped);
   const sanitized = sanitizeMindMapTreeForOutput(parsed, doc.sourceMeta.title || '思维导图');
-  const result = ensureFirstLayerDetails(sanitized, doc);
+  const titleAligned = preferDocumentTitleForRoot(sanitized, doc.sourceMeta.title);
+  const result = ensureFirstLayerDetails(titleAligned, doc);
   const validated = validateSemanticHierarchy(result);
   const restructured = restructureOversizedBranches(validated);
   const deduped = deduplicateNodeTitles(restructured);
@@ -1857,7 +1912,7 @@ const ANTI_HALLUCINATION_SYSTEM = [
   '你必须将文档内容组织为**总分结构**的思维导图，严格遵循以下四原则：',
   '',
   '### 原则一 · 结论先行（Conclusion First）',
-  '- 根节点必须是全文的**核心结论/中心思想**，而非简单重复文档标题',
+  '- 根节点不应机械复用文档标题；只有当标题本身已经概括核心判断、且不只是文档类型名时，才可直接使用标题，否则应改写为全文核心结论/中心思想',
   '- 每个父节点都是其所有子节点的**概括性结论**——读者只看父节点就能理解该分支的核心要点',
   '- 禁止父节点仅为分类标签（如"概述""分析""总结""特点"），必须包含实质性结论信息',
   '- 示例：❌"技术架构"→ ✅"微服务+事件驱动架构支撑高并发场景"',
@@ -1961,12 +2016,36 @@ const DOCUMENT_SUMMARY_SYSTEM = [
 const PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK = [
   '## 文档总结与思维导图构建目标',
   '请先在内部形成一份符合金字塔原理的结构化总结，再据此生成思维导图结构：',
-  '- 顶层：明确中心主题与中心思想，中心主题不得简单等同于文件名或标题',
+  '- 顶层：明确中心主题与中心思想；只有当文档标题本身已经概括核心判断、且不只是文档类型名时，根节点才可直接使用标题；否则应改写为全文核心结论',
   '- 中层：构建3-5个主要分支作为关键论点；信息不足时可少于3个，但必须忠实原文，不得凑数',
   '- 底层：每个关键论点必须由原文中的具体论据、数据、案例或事实支撑',
   '- 展开要求：所有二级节点必须至少展开一层，二级节点不得保持叶子状态；子节点必须来自原文',
   '- 逻辑关系：明确判断各层级之间是演绎、归纳、因果、并列或递进关系',
   '- 结构输出：思维导图节点应体现“中心主题→关键论点→支撑依据”的金字塔层级',
+].join('\n');
+
+const HIGH_VALUE_EXTRACTION_WORKFLOW = [
+  '## 高价值信息提炼流程（先做，再生成）',
+  '1. 先识别文档真正要回答的核心问题，以及作者/原文给出的核心结论。',
+  '2. 从原文中优先提取高信息密度内容：明确结论、关键事实、数字指标、因果关系、步骤方法、风险限制、案例证据、建议动作、对比差异、前提条件。',
+  '3. 对提取出的信息做重要性排序：优先保留“最影响理解结果”的信息，而不是按原文出现顺序平均摘抄。',
+  '4. 将同一逻辑角色的信息分别处理：结论放父节点，证据/做法/数据/例子放子节点，不要混写。',
+  '5. 如果原文同时包含“是什么/为什么/怎么做/结果如何/有哪些限制”，应优先保留这些高价值维度；缺失的维度才允许不写。',
+].join('\n');
+
+const COVERAGE_CHECKLIST = [
+  '## 关键信息覆盖检查',
+  '- 输出前检查原文是否出现以下高价值信号：核心主张、背景前提、问题痛点、原因机制、方法步骤、关键数据、案例证据、结果影响、风险限制、建议结论。',
+  '- 哪类信号在原文中明确出现，就应该在导图中留下对应节点或支撑信息；不要只保留章节名而漏掉真正重要的判断。',
+  '- 如果原文是教程/方案/复盘/观点/研究/新闻，需优先保留最能帮助用户理解与复述的内容，而不是平均分配篇幅。',
+].join('\n');
+
+const NODE_WRITING_RULES = [
+  '## 节点写法优化',
+  '- 节点优先写成“对象 + 判断/动作/结果”的高信息表达，不要只写宽泛主题词。',
+  '- 优先保留原文中的专有名词、阈值、比例、时间、对象、条件、对比项，让节点脱离上下文也能读懂。',
+  '- 父节点应回答“这一组信息的核心意思是什么”，子节点应回答“这个结论凭什么成立/如何展开”。',
+  '- 如果一个节点只是在重复章节标题、空泛概念或泛化套话，应继续压缩/改写，直到包含可理解的实质信息。',
 ].join('\n');
 
 const PYRAMID_SELF_CHECK_LOOP = [
@@ -1989,12 +2068,14 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '',
     PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK,
     '',
+    HIGH_VALUE_EXTRACTION_WORKFLOW,
+    '',
     '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
     '## 金字塔原理 · 总分结构生成框架',
     '',
     '### 核心四原则（必须同时满足）',
     '',
-    '**原则一 · 结论先行**：根节点 = 全文核心结论（不是标题复述），每个父节点 = 子节点的高度概括性结论。读者只看任一父节点，就能理解该分支的核心要点。禁止父节点仅写分类标签（如"概述""分析""特点"），必须包含实质性信息。',
+    '**原则一 · 结论先行**：根节点不应机械复用文档标题；只有当标题本身已经概括核心判断、且不只是文档类型名时，才可直接使用标题。否则应改写为全文核心结论。每个父节点 = 子节点的高度概括性结论。读者只看任一父节点，就能理解该分支的核心要点。禁止父节点仅写分类标签（如"概述""分析""特点"），必须包含实质性信息。',
     '',
     '**原则二 · 以上统下**：上层是下层的思想概括（总），下层是上层的具体支撑（分）。每一层都能回答上一层的"为什么"或"如何做到"。自顶向下能自然推导，自底向上能归纳收束。禁止父子脱节——父说A、子说B。',
     '',
@@ -2011,7 +2092,7 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
     '',
     '## 第一步 · 金字塔构建规划（不输出，只用于自检）',
-    '1. **识别核心结论**：通读全文，提炼1句话核心结论作为根节点——不是文档标题的复述，而是文档真正要表达的中心思想',
+    '1. **确定根节点文案**：先判断文档标题是否已经概括核心判断，而不只是文档类型名；只有满足这一条件时，根节点才直接使用标题。若标题只是文件名、下载名、编号、文档类型名或信息价值低于正文结论，则提炼1句话核心结论作为根节点',
     '2. **拆解支撑论点**：核心结论需要哪2-8个分论点来支撑？这些成为一级节点，每个分论点也是一个结论性陈述',
     '3. **MECE验证**：分论点是否互斥且穷尽？粒度是否一致？',
     '4. **确定递进逻辑**：一级节点之间按什么逻辑排序（演绎/时间/结构/程度）？标记排序依据',
@@ -2040,6 +2121,7 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '   - 禁止：产品经理_深圳.pdf、简历.pdf(1)、论文.docx 等任何含文件扩展名的文本',
     '   - 禁止：直接复制输入开头的文件名作为任何节点标题',
     '   - 遇到文件名时，从该文件对应的正文内容中提取有意义的标题',
+    '   - 即使文档标题本身正常，只要它主要是在说明“这是什么文档”而非“文档的核心判断”，根节点也应改写为更有信息量的结论句',
     '8. 📏 内容长度约束：每个节点的 content 必须 ≤ 35 字',
     '   - 超过 35 字的信息必须拆分为父子结构',
     '   - 父节点用 10-20 字概括核心语义，子节点承载详细描述',
@@ -2066,6 +2148,10 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '2. 关联紧密的信息合并为一个节点（如"概念名 · 核心定义"合一），细节作 children',
     '3. 重组的依据是语义关联与金字塔逻辑，而非原文章节顺序',
     '',
+    COVERAGE_CHECKLIST,
+    '',
+    NODE_WRITING_RULES,
+    '',
     '## 子节点数量管理（重要）',
     '- 任何节点的直接子节点数 ≤ 8 个，保持视觉清爽',
     '- 当某节点下信息 > 8 条时：在父节点与叶子之间插入归纳节点（二级分组）',
@@ -2074,7 +2160,7 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '- 禁止为凑整而删除信息——信息多时用"增加层级"而非"减少节点"',
     '',
     '## 好导图的判定标准（输出前自检）',
-    '- ✅ 结论先行：根节点是核心结论而非标题；每个父节点是子节点的概括性结论而非标签',
+    '- ✅ 结论先行：只有当文档标题本身已经表达核心判断时，根节点才沿用标题；若标题只是文档类型名或信息量偏低，根节点必须改写为核心结论。每个父节点都是子节点的概括性结论而非标签',
     '- ✅ 以上统下：上层概括下层，下层支撑上层，任何父子关系可双向验证',
     '- ✅ 归类分组：一级节点之间互斥不重叠（MECE），同层粒度一致',
     '- ✅ 逻辑递进：同级节点按明确逻辑排序（演绎/时间/结构/程度），非随机排列',
@@ -2088,7 +2174,7 @@ export function buildPrompt(doc: NormalizedDocument): string {
     '## 【强制执行】生成后自测验证流程（必须逐项检查）',
     '',
     '### 验证步骤 1：结论先行检查（金字塔顶层验证）',
-    '1. 检查根节点：是否表达了全文的核心结论/中心思想？（不是标题复述）',
+    '1. 检查根节点：文档标题是否真的表达了核心判断，而不只是文档类型名？若没有，根节点是否已改写为准确的全文核心结论/中心思想？',
     '2. 检查每个一级节点：是否包含实质性结论信息？（不是"概述""分析""总结"等空标签）',
     '3. 检查每个父节点：提取其关键词 → 看其子节点是否在围绕这个结论展开支撑？',
     '4. 不合格节点必须重写：将"标签式标题"改为"结论式标题"',
@@ -2277,8 +2363,10 @@ export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '',
     PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK,
     '',
+    HIGH_VALUE_EXTRACTION_WORKFLOW,
+    '',
     '## 核心四原则',
-    '- 结论先行：根节点 = 全文核心结论；每个父节点都必须是结论性陈述，不得仅为分类标签。',
+    '- 结论先行：根节点不应机械复用文档标题；只有当标题本身已经概括核心判断、且不只是文档类型名时，根节点才可直接使用标题。否则必须改写为全文核心结论。每个父节点都必须是结论性陈述，不得仅为分类标签。',
     '- 以上统下：上层是下层的思想概括，下层是上层的具体支撑；禁止父说A、子说B。',
     '- 归类分组：同级节点按同一逻辑维度分组，满足 MECE，互斥且完全穷尽。',
     '- 逻辑递进：同级节点必须按演绎、时间、结构或程度之一排序，不得随机排列。',
@@ -2291,9 +2379,14 @@ export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '- 不得在父节点和子节点中重复复述同一条信息；父节点做概括，子节点必须补充新的支撑事实。',
     '- 禁止用“(1)”“(2)”或其他编号后缀来制造伪去重节点；重复内容只能删除、合并或改写为不同维度。',
     '- 文件名禁令：任何节点 content 禁止包含文件名或文件扩展名。',
+    '- 即使文档标题本身正常，只要它主要是在说明“这是什么文档”而非“文档的核心判断”，根节点也应改写为更有信息量的结论句。',
     '- 每个子节点必须属于其父节点语义范畴；如果不属于，就删除或移到正确位置。',
     '- 根节点和每个父节点都必须包含实质信息，不得使用“概述”“分析”“总结”“背景”“方法”等空标签。',
     '- 节点标题必须唯一；父子、同级之间不得重复或高度相似。',
+    '',
+    COVERAGE_CHECKLIST,
+    '',
+    NODE_WRITING_RULES,
     '',
     '## 约束条件',
     `- 最大层级：${MAX_TREE_DEPTH}`,
@@ -2656,8 +2749,11 @@ function buildDocumentSummaryPrompt(doc: NormalizedDocument): string {
     '2. points 数量 3-8 条；若原文信息有限，可少于 3 条。',
     '3. 只基于给定原文片段，不要编造外部事实，不要补充推断。',
     '4. 重点提炼：核心主题、关键事实、明确结论；仅当原文明示时才写风险、问题或建议。',
-    '5. 优先保留原文中的术语、数据、专有名词与结论性表述。',
-    '6. 若原文存在 OCR 噪声、截断或歧义，只能如实弱化表述，不得自行补完。',
+    '5. 优先保留高信息密度内容：结论、数字、因果、步骤、差异、限制条件、案例证据。',
+    '6. 每条摘要必须让读者单独阅读时也能理解，避免“优化体验”“提升效率”这类泛化空话。',
+    '7. 如果原文中同时出现“问题/原因/做法/结果”，优先覆盖这些关键维度，不要只摘章节名。',
+    '8. 优先保留原文中的术语、数据、专有名词与结论性表述。',
+    '9. 若原文存在 OCR 噪声、截断或歧义，只能如实弱化表述，不得自行补完。',
     '',
     `文档标题：${title}`,
     `来源类型：${doc.sourceMeta.type}`,

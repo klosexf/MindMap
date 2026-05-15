@@ -20,7 +20,7 @@ describe('Prompt Generation', () => {
     expect(prompt).toContain('金字塔原理');
     expect(prompt).toContain('结论先行');
     expect(prompt).toContain('总分结构');
-    expect(prompt).toContain('根节点 = 全文核心结论');
+    expect(prompt).toContain('根节点不应机械复用文档标题');
     expect(prompt).toContain('结论性陈述');
   });
 
@@ -126,9 +126,53 @@ describe('Prompt Generation', () => {
     }
   });
 
+  it('should require high-value information extraction instead of shallow heading restatement', () => {
+    const prompts = [buildPrompt(testDoc), buildCompatJsonPrompt(testDoc)];
+
+    for (const prompt of prompts) {
+      expect(prompt).toContain('高价值信息提炼流程');
+      expect(prompt).toContain('高信息密度内容');
+      expect(prompt).toContain('最影响理解结果');
+      expect(prompt).toContain('不要只保留章节名');
+    }
+  });
+
+  it('should include a coverage checklist for important information dimensions', () => {
+    const prompts = [buildPrompt(testDoc), buildCompatJsonPrompt(testDoc)];
+
+    for (const prompt of prompts) {
+      expect(prompt).toContain('关键信息覆盖检查');
+      expect(prompt).toContain('核心主张');
+      expect(prompt).toContain('方法步骤');
+      expect(prompt).toContain('风险限制');
+      expect(prompt).toContain('帮助用户理解与复述');
+    }
+  });
+
+  it('should include node writing guidance for user comprehension', () => {
+    const prompts = [buildPrompt(testDoc), buildCompatJsonPrompt(testDoc)];
+
+    for (const prompt of prompts) {
+      expect(prompt).toContain('节点写法优化');
+      expect(prompt).toContain('对象 + 判断/动作/结果');
+      expect(prompt).toContain('脱离上下文也能读懂');
+      expect(prompt).toContain('泛化套话');
+    }
+  });
+
   it('should keep the compat prompt compact enough for non-streaming providers', () => {
     const prompt = buildCompatJsonPrompt(testDoc);
 
-    expect(prompt.length).toBeLessThan(6000);
+    expect(prompt.length).toBeLessThan(7600);
+  });
+
+  it('should prefer a meaningful document title for the root node in both prompts', () => {
+    const prompt = buildPrompt(testDoc);
+    const compatPrompt = buildCompatJsonPrompt(testDoc);
+
+    expect(prompt).toContain('只有当标题本身已经概括核心判断');
+    expect(prompt).toContain('不只是文档类型名');
+    expect(compatPrompt).toContain('根节点不应机械复用文档标题');
+    expect(compatPrompt).toContain('更有信息量的结论句');
   });
 });

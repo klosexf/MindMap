@@ -129,6 +129,7 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
   deleteNode: (nodeId) => {
     const tree = get().tree;
     if (!tree || tree.root.id === nodeId) return;
+    const parentInfo = findParentInfo(tree.root, nodeId);
 
     get().applyPatch({
       type: 'delete',
@@ -141,17 +142,7 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
     if (selected === nodeId) {
       const updatedTree = get().tree;
       if (updatedTree) {
-        function findParent(n: MindMapTree['root'], targetId: string): string | null {
-          if (!n.children?.length) return null;
-          if (n.children.some((c) => c.id === targetId)) return n.id;
-          for (const c of n.children) {
-            const p = findParent(c, targetId);
-            if (p) return p;
-          }
-          return null;
-        }
-        const parentId = findParent(updatedTree.root, nodeId);
-        set({ selectedNodeId: parentId || updatedTree.root.id });
+        set({ selectedNodeId: parentInfo?.parentId || updatedTree.root.id });
       }
     }
   },

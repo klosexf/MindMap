@@ -13,6 +13,10 @@ interface EditorPageProps {
   id: string;
 }
 
+interface AddNodeAndEditOptions {
+  centerInViewport?: boolean;
+}
+
 function downloadBlob(blob: Blob, filename: string): void {
   const href = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -95,7 +99,7 @@ export function EditorPage({ id }: EditorPageProps) {
 
   // Inline add node helpers
   const addNodeAndEdit = useCallback(
-    (mode: 'child' | 'sibling') => {
+    (mode: 'child' | 'sibling', options?: AddNodeAndEditOptions) => {
       if (!selectedNodeId || !tree) return;
 
       const newId =
@@ -108,7 +112,7 @@ export function EditorPage({ id }: EditorPageProps) {
 
       // Wait for React to commit tree changes and G6 to render the new node
       setTimeout(() => {
-        editorRef.current?.startEditingNode(newId);
+        editorRef.current?.startEditingNode(newId, options);
       }, 150);
     },
     [selectedNodeId, tree, addChildNode, addSiblingNode, setSelectedNode],
@@ -128,6 +132,10 @@ export function EditorPage({ id }: EditorPageProps) {
     },
     [deleteNode],
   );
+
+  const handleEnterWithoutText = useCallback(() => {
+    addNodeAndEdit('child', { centerInViewport: true });
+  }, [addNodeAndEdit]);
 
   const saveTreeSnapshot = useCallback(async (treeToSave: MindMapTree) => {
     queuedSaveRef.current = treeToSave;
@@ -196,7 +204,7 @@ export function EditorPage({ id }: EditorPageProps) {
 
       if (event.key === 'Tab') {
         event.preventDefault();
-        addNodeAndEdit('child');
+        addNodeAndEdit('child', { centerInViewport: true });
       }
 
       if (event.key === 'Enter' && !event.shiftKey && !event.metaKey && !event.ctrlKey) {
@@ -204,7 +212,7 @@ export function EditorPage({ id }: EditorPageProps) {
         if (activeTag === 'input' || activeTag === 'textarea') return;
 
         event.preventDefault();
-        addNodeAndEdit('sibling');
+        addNodeAndEdit('sibling', { centerInViewport: true });
       }
 
       if (event.key === 'Delete' || event.key === 'Backspace') {
@@ -349,6 +357,7 @@ export function EditorPage({ id }: EditorPageProps) {
             onMoveNode={moveNode}
             onUpdateNodePosition={handleUpdateNodePosition}
             onEditEnd={handleEditEnd}
+            onEnterWithoutText={handleEnterWithoutText}
           />
         </div>
 
