@@ -340,17 +340,15 @@ function getSingleChildPlacements(
   childIncoming: PortPlacement;
 } {
   if (direction === 'LR' || direction === 'RL') {
-    const sharedY = (parentPosition[1] + childPosition[1]) / 2;
     return {
-      parentOutgoing: [outgoing.placement[0], 0.5 + (sharedY - parentPosition[1]) / parentSize.height],
-      childIncoming: [incoming.placement[0], 0.5 + (sharedY - childPosition[1]) / childSize.height],
+      parentOutgoing: [outgoing.placement[0], outgoing.placement[1]],
+      childIncoming: [incoming.placement[0], 0.5 + (parentPosition[1] - childPosition[1]) / childSize.height],
     };
   }
 
-  const sharedX = (parentPosition[0] + childPosition[0]) / 2;
   return {
-    parentOutgoing: [0.5 + (sharedX - parentPosition[0]) / parentSize.width, outgoing.placement[1]],
-    childIncoming: [0.5 + (sharedX - childPosition[0]) / childSize.width, incoming.placement[1]],
+    parentOutgoing: [outgoing.placement[0], outgoing.placement[1]],
+    childIncoming: [0.5 + (parentPosition[0] - childPosition[0]) / childSize.width, incoming.placement[1]],
   };
 }
 

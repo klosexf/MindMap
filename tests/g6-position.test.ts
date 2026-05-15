@@ -270,7 +270,7 @@ describe('toG6GraphData node positions', () => {
           port: true,
           ports: [
             { key: 'left-center', placement: [0, 0.5] },
-            { key: 'right-center', placement: [1, 0.875] },
+            { key: 'right-center', placement: [1, 0.5] },
           ],
         },
       },
@@ -279,7 +279,7 @@ describe('toG6GraphData node positions', () => {
         style: {
           port: true,
           ports: [
-            { key: 'left-center', placement: [0, 0] },
+            { key: 'left-center', placement: [0, -0.5] },
             { key: 'right-center', placement: [1, 0.5] },
           ],
         },
@@ -338,7 +338,7 @@ describe('toG6GraphData node positions', () => {
           port: true,
           ports: [
             { key: 'top-center', placement: [0.5, 0] },
-            { key: 'bottom-center', placement: [0.5833333333333334, 1] },
+            { key: 'bottom-center', placement: [0.5, 1] },
           ],
         },
       },
@@ -347,7 +347,7 @@ describe('toG6GraphData node positions', () => {
         style: {
           port: true,
           ports: [
-            { key: 'top-center', placement: [0.35, 0] },
+            { key: 'top-center', placement: [0.2, 0] },
             { key: 'bottom-center', placement: [0.5, 1] },
           ],
         },
