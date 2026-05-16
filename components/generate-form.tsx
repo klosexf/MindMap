@@ -125,12 +125,15 @@ export function GenerateForm() {
 
   function switchMode(nextMode: InputMode) {
     if (nextMode === mode) return;
-    setMode(nextMode);
-    setWarning(null);
-    setError(null);
-    if (!loading) {
-      setStatus('等待输入...');
-    }
+    setMode((prev) => {
+      if (prev === nextMode) return prev;
+      setWarning(null);
+      setError(null);
+      if (!loading) {
+        setStatus('等待输入...');
+      }
+      return nextMode;
+    });
   }
 
   function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
@@ -424,6 +427,7 @@ export function GenerateForm() {
             aria-selected={mode === tab.mode}
             aria-controls={`panel-${tab.mode}`}
             type="button"
+            tabIndex={mode === tab.mode ? 0 : -1}
             className={mode === tab.mode ? 'active' : ''}
             onClick={() => switchMode(tab.mode)}
             onKeyDown={(event) => handleTabKeyDown(event, index)}

@@ -498,6 +498,7 @@ a {
   position: relative;
   z-index: 2;
   pointer-events: auto;
+  user-select: none;
 }
 
 .input-tabs button {
@@ -510,12 +511,28 @@ a {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 160ms ease;
+  transition: background 160ms ease, color 160ms ease, transform 120ms ease, box-shadow 160ms ease;
+  position: relative;
+  isolation: auto;
+}
+
+.input-tabs button:hover:not(.active) {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.input-tabs button:active:not(.active) {
+  transform: scale(0.97);
 }
 
 .input-tabs button.active {
   background: var(--color-cta);
   color: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+.input-tabs button:focus-visible {
+  outline: 2px solid var(--color-cta);
+  outline-offset: 2px;
 }
 
 .input-shell {
@@ -1414,6 +1431,11 @@ a {
   position: fixed;
   z-index: 100;
   pointer-events: auto;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: inherit;
 }
 
 .node-inline-textarea {

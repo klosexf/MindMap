@@ -33,19 +33,89 @@ describe('mindmap drag preview styles', () => {
 
   it('uses a small polyline corner radius so connectors stay close to right angles', () => {
     const source = readFileSync(
-      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      path.join(process.cwd(), 'lib/utils/g6.ts'),
       'utf8',
     );
 
-    expect(source).toMatch(/edge:\s*\{[\s\S]*?type:\s*'polyline'[\s\S]*?radius:\s*4\b/);
+    expect(source).toMatch(/polylineRadius:\s*10/);
   });
 
   it('enables orthogonal polyline routing so edge segments stay horizontal or vertical', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'lib/utils/g6.ts'),
+      'utf8',
+    );
+
+    expect(source).toMatch(/type:\s*'orth'\s+as const/);
+  });
+
+  it('styles root and non-root nodes with the same rounded card treatment', () => {
     const source = readFileSync(
       path.join(process.cwd(), 'components/mindmap-editor.tsx'),
       'utf8',
     );
 
-    expect(source).toMatch(/edge:\s*\{[\s\S]*?type:\s*'polyline'[\s\S]*?router:\s*\{\s*type:\s*'orth'/);
+    expect(source).toMatch(/radius:\s*NODE_VISUAL_TOKENS\.radius/);
+    expect(source).not.toMatch(/datum\.id === treeRef\.current\.root\.id\s*\?/);
+    expect(source).toMatch(/fill:\s*NODE_VISUAL_TOKENS\.fill/);
+    expect(source).toMatch(/stroke:\s*NODE_VISUAL_TOKENS\.stroke/);
+  });
+
+  it('limits node dragging to the right mouse button and suppresses the canvas context menu', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      'utf8',
+    );
+
+    expect(source).toMatch(/isRightMouseButtonEvent\(event\)/);
+    expect(source).toMatch(/event\?\.button\s*===\s*2/);
+    expect(source).toMatch(/addEventListener\(\s*'contextmenu'/);
+    expect(source).toMatch(/preventDefault\(\)/);
+  });
+
+  it('expands the inline editor downward based on the remaining viewport height', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      'utf8',
+    );
+
+    expect(source).toMatch(/viewportRect\.bottom\s*-\s*editRect\.top\s*-\s*16/);
+    expect(source).not.toMatch(/const maxHeight = viewportRect\.height - 32/);
+  });
+
+  it('wraps inline editor text without enabling internal scrolling', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      'utf8',
+    );
+
+    expect(source).not.toMatch(/overflowY:\s*'auto'/);
+    expect(source).not.toMatch(/overflowX:\s*'hidden'/);
+    expect(source).toMatch(/overflow:\s*'hidden'/);
+    expect(source).toMatch(/overflowWrap:\s*'anywhere'/);
+    expect(source).toMatch(/wordBreak:\s*'break-word'/);
+  });
+
+  it('sizes the inline editor from the textarea scrollHeight after real browser layout', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      'utf8',
+    );
+
+    expect(source).toMatch(/textareaRef\.current/);
+    expect(source).toMatch(/scrollHeight/);
+    expect(source).toMatch(/style\.height\s*=\s*'auto'/);
+  });
+
+  it('keeps the stylesheet fallback aligned with the no-scroll wrapping behavior', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'app/globals.css'),
+      'utf8',
+    );
+
+    expect(source).not.toMatch(/\.node-inline-editor\s*\{[\s\S]*overflow-y:\s*auto/);
+    expect(source).toMatch(/\.node-inline-editor\s*\{[\s\S]*overflow:\s*hidden/);
+    expect(source).toMatch(/\.node-inline-editor\s*\{[\s\S]*overflow-wrap:\s*anywhere/);
+    expect(source).toMatch(/\.node-inline-editor\s*\{[\s\S]*word-break:\s*break-word/);
   });
 });

@@ -1808,9 +1808,9 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
     root.children = doc.chunks.slice(0, 24).map((chunk, index) => {
       const chunkSourceRef = chunk.sourceRef || sourceRef;
       const branch = createHeuristicNode(titleFromChunk(chunk.text, index), chunkSourceRef, 'detail', 0.68);
-      branch.children = extractSentences(chunk.text, 4).map((sentence) =>
-        createHeuristicNode(sentence, chunkSourceRef, 'detail', 0.62),
-      );
+      branch.children = extractSentences(chunk.text, 4)
+        .filter((sentence) => normalizeExpansionSentenceKey(sentence) !== normalizeExpansionSentenceKey(branch.content))
+        .map((sentence) => createHeuristicNode(sentence, chunkSourceRef, 'detail', 0.62));
       return branch;
     });
 

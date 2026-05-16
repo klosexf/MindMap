@@ -1,15 +1,17 @@
 'use client';
 
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Graph } from '@antv/g6';
 
 import type { LayoutDirection, MindMapTree, MindMapNode, NodePosition } from '@/lib/types/mindmap';
 import {
   applyParallelStraightEdgeLayout,
+  EDGE_VISUAL_TOKENS,
   getEdgeRenderStyle,
   getEdgeRenderType,
   getLayoutConfig,
   getNodeSize,
+  NODE_VISUAL_TOKENS,
   toG6GraphData,
 } from '@/lib/utils/g6';
 import { focusGraphViewportOnNode, getViewportLockedEditorRect, readGraphViewportState, restoreGraphViewportState } from '@/lib/utils/g6-viewport';
@@ -81,17 +83,20 @@ function isPointInRect(point: { x: number; y: number }, rect: NodeClientRect): b
   );
 }
 
+function isRightMouseButtonEvent(event: { button?: number; originalEvent?: { button?: number }; srcEvent?: { button?: number } } | null | undefined): boolean {
+  return event?.button === 2 || event?.originalEvent?.button === 2 || event?.srcEvent?.button === 2;
+}
+
 const TRANSIENT_DRAG_STATES = ['dragging', 'drop-child', 'drop-sibling-before', 'drop-sibling-after'] as const;
 
 function getNodeTextMetrics(datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }, rootId: string): NodeTextMetrics {
   const size = getNodeSize(datum.id || '', datum.data?.label || '', rootId);
-  const isRoot = datum.id === rootId;
-  const fontSize = isRoot ? 14 : 12;
-  const fontWeight = isRoot ? 600 : 500;
-  const lineHeight = fontSize * 1.6;
-  const horizontalPadding = 24;
+  const fontSize = NODE_VISUAL_TOKENS.fontSize;
+  const fontWeight = NODE_VISUAL_TOKENS.fontWeight;
+  const lineHeight = fontSize * NODE_VISUAL_TOKENS.lineHeightMultiplier;
+  const horizontalPadding = NODE_VISUAL_TOKENS.horizontalPadding;
   const labelMaxWidth = Math.max(size.width - horizontalPadding, 1);
-  const lineCount = Math.round((size.height - 16) / lineHeight);
+  const lineCount = Math.round((size.height - NODE_VISUAL_TOKENS.verticalPadding) / lineHeight);
 
   return {
     width: size.width,
@@ -134,6 +139,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
   const [editRect, setEditRect] = useState<DOMRect | null>(null);
+  const [dynamicEditorHeight, setDynamicEditorHeight] = useState<number | null>(null);
 
   const originalEditValueRef = useRef('');
   const draggingNodeIdRef = useRef<string | null>(null);
@@ -162,6 +168,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       setEditingNodeId(null);
       setEditValue('');
       setEditRect(null);
+      setDynamicEditorHeight(null);
       originalEditValueRef.current = '';
       if (nodeId) onEditEnd?.(nodeId, true, value, originalText);
     },
@@ -175,6 +182,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     setEditingNodeId(null);
     setEditValue('');
     setEditRect(null);
+    setDynamicEditorHeight(null);
     originalEditValueRef.current = '';
     if (nodeId) onEditEnd?.(nodeId, false, currentValue, originalText);
   }, [editingNodeId, editValue, onEditEnd]);
@@ -350,16 +358,16 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
             const metrics = getNodeTextMetrics(datum, treeRef.current.root.id);
             return [metrics.width, metrics.height];
           },
-          radius: 12,
-          fill: (datum: { id?: string }) => (datum.id === treeRef.current.root.id ? '#F5F5F2' : '#FFFFFFFE'),
-          stroke: (datum: { id?: string }) => (datum.id === treeRef.current.root.id ? '#1A1A1A' : '#E6E6DC'),
-          lineWidth: (datum: { id?: string }) => (datum.id === treeRef.current.root.id ? 2 : 1),
+          radius: NODE_VISUAL_TOKENS.radius,
+          fill: NODE_VISUAL_TOKENS.fill,
+          stroke: NODE_VISUAL_TOKENS.stroke,
+          lineWidth: NODE_VISUAL_TOKENS.lineWidth,
           label: true,
           labelPlacement: 'center',
           labelTextAlign: 'center',
           labelTextBaseline: 'middle',
           labelText: (datum: { data?: { label?: string } }) => datum.data?.label || '',
-          labelFill: '#1A1A1A',
+          labelFill: NODE_VISUAL_TOKENS.text,
           labelFontSize: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
             getNodeTextMetrics(datum, treeRef.current.root.id).fontSize,
           labelFontWeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
@@ -379,8 +387,8 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
         },
         state: {
           selected: {
-            stroke: '#1A1A1A',
-            lineWidth: 2.4,
+            stroke: EDGE_VISUAL_TOKENS.stroke,
+            lineWidth: 2.2,
           },
           dragging: {
             // Position-only: neutral gray — "just repositioning, no relationship change"
@@ -426,12 +434,30 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
           key: 'drag-element',
           hideEdge: 'none',
           shadow: false,
-          enable: (event: { targetType?: string; target?: { id?: string } }) =>
-            event.targetType === 'node' && event.target?.id !== treeRef.current.root.id,
+          enable: (
+            event: {
+              targetType?: string;
+              target?: { id?: string };
+              button?: number;
+              originalEvent?: { button?: number };
+              srcEvent?: { button?: number };
+            },
+          ) =>
+            event.targetType === 'node' &&
+            event.target?.id !== treeRef.current.root.id &&
+            isRightMouseButtonEvent(event),
         },
       ],
       animation: false,
     });
+
+    const suppressCanvasContextMenu = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (target?.closest('.node-inline-editor')) return;
+      event.preventDefault();
+    };
+
+    container.addEventListener('contextmenu', suppressCanvasContextMenu);
 
     const DROP_CHILD_STATE = 'drop-child';
     const DROP_SIBLING_BEFORE_STATE = 'drop-sibling-before';
@@ -852,6 +878,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     graphRef.current = graph;
 
     return () => {
+      container.removeEventListener('contextmenu', suppressCanvasContextMenu);
       draggingNodeIdRef.current = null;
       dropPreviewRef.current = null;
       try {
@@ -931,6 +958,10 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     graph
       .render()
       .then(async () => {
+        // Structural/content changes need an explicit layout pass.
+        // `render()` alone is not sufficient to reliably recompute node
+        // positions after reparenting, resizing, or other non-position edits.
+        await graph.layout();
         await applyPersistedNodePositions(graph, tree.root);
         await applyParallelStraightEdgeLayout(graph as any, tree.root, layoutDirectionRef.current);
 
@@ -1012,6 +1043,29 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     });
   }, [editingNodeId, editRect]);
 
+  useLayoutEffect(() => {
+    if (!editingNodeId || !editRect) {
+      setDynamicEditorHeight(null);
+      return;
+    }
+
+    const container = containerRef.current;
+    const textarea = textareaRef.current;
+    if (!container || !textarea) return;
+
+    const viewportRect = container.getBoundingClientRect();
+    const maxHeight = Math.max(viewportRect.bottom - editRect.top - 16, NODE_VISUAL_TOKENS.minNodeHeight);
+    textarea.style.height = 'auto';
+
+    const nextHeight = Math.min(
+      Math.max(textarea.scrollHeight + 4, editRect.height, NODE_VISUAL_TOKENS.minNodeHeight),
+      maxHeight,
+    );
+
+    textarea.style.height = `${nextHeight}px`;
+    setDynamicEditorHeight(nextHeight);
+  }, [editingNodeId, editRect, editValue]);
+
   return (
     <div ref={containerRef} className="mindmap-canvas">
       {editingNodeId && editRect && (
@@ -1042,19 +1096,23 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
             left: editRect.left,
             top: editRect.top,
             width: editRect.width,
-            height: editRect.height,
+            height: dynamicEditorHeight ?? editRect.height,
             zIndex: 1000,
-            border: '2px solid #1A1A1A',
-            borderRadius: 12,
-            padding: '8px 12px',
-            fontSize: 14,
-            lineHeight: 1.5,
+            border: `2px solid ${EDGE_VISUAL_TOKENS.stroke}`,
+            borderRadius: NODE_VISUAL_TOKENS.radius,
+            padding: '10px 18px',
+            fontSize: NODE_VISUAL_TOKENS.fontSize,
+            lineHeight: NODE_VISUAL_TOKENS.lineHeightMultiplier,
             resize: 'none',
             outline: 'none',
-            background: '#FFFFFFFE',
-            color: '#1A1A1A',
+            background: NODE_VISUAL_TOKENS.fill,
+            color: NODE_VISUAL_TOKENS.text,
             fontFamily: 'system-ui, sans-serif',
             boxShadow: '0 4px 12px rgba(0,0,0,0.12)',
+            overflow: 'hidden',
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+            wordBreak: 'break-word',
           }}
         />
       )}

@@ -30,15 +30,34 @@ function collectChildCounts(node: HierarchyNode, counts: Map<string, number>): v
 }
 
 const _canvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
-const MAX_NODE_WIDTH = 420;
-const EDGE_STROKE = '#7A7A70';
-const EDGE_LINE_WIDTH = 1.2;
-const EDGE_ROUTER_PADDING = 16;
-const POLYLINE_EDGE_RADIUS = 4;
+
+export const NODE_VISUAL_TOKENS = {
+  fill: '#FFFDF8',
+  stroke: '#DDD7CC',
+  text: '#4F4B45',
+  radius: 24,
+  lineWidth: 1.4,
+  fontSize: 16,
+  fontWeight: 600,
+  lineHeightMultiplier: 1.55,
+  horizontalPadding: 36,
+  verticalPadding: 20,
+  minNodeWidth: 112,
+  minNodeHeight: 56,
+  maxNodeWidth: 760,
+} as const;
+
+export const EDGE_VISUAL_TOKENS = {
+  stroke: '#8A867E',
+  lineWidth: 2,
+  routerPadding: 28,
+  polylineRadius: 10,
+  minStraightEdgeGap: 40,
+} as const;
 
 type MindMapEdgeType = 'line' | 'polyline';
 
-function measureTextWidth(text: string, fontSize: number, fontWeight: number): number {
+export function measureTextWidth(text: string, fontSize: number, fontWeight: number): number {
   if (!_canvas) return text.length * fontSize * 0.6;
   const ctx = _canvas.getContext('2d');
   if (!ctx) return text.length * fontSize * 0.6;
@@ -46,7 +65,7 @@ function measureTextWidth(text: string, fontSize: number, fontWeight: number): n
   return ctx.measureText(text).width;
 }
 
-function wrapTextByWidth(text: string, maxWidth: number, fontSize: number, fontWeight: number): string[] {
+export function wrapTextByWidth(text: string, maxWidth: number, fontSize: number, fontWeight: number): string[] {
   const rows: string[] = [];
 
   for (const paragraph of text.split(/\r?\n/)) {
@@ -106,13 +125,15 @@ interface ParallelLayoutGraphLike {
       sourcePort: string;
       targetPort: string;
       type?: 'line' | 'polyline';
-      style?: { router: false; radius: number };
+      style?: {
+        router: false;
+        radius: number;
+        controlPoints?: Array<[number, number]>;
+      };
     }>,
   ) => void;
   draw: () => Promise<void>;
 }
-
-const MIN_STRAIGHT_EDGE_GAP = 32;
 
 function getPortConfig(direction: LayoutDirection): PortConfig {
   switch (direction) {
@@ -282,8 +303,8 @@ async function ensureParentChildSpacing(
       };
 
       const currentGap = getStraightEdgeGap(direction, parentPosition, childPosition, parentSize, childSize);
-      if (currentGap < MIN_STRAIGHT_EDGE_GAP) {
-        delta = Math.max(delta, MIN_STRAIGHT_EDGE_GAP - currentGap);
+      if (currentGap < EDGE_VISUAL_TOKENS.minStraightEdgeGap) {
+        delta = Math.max(delta, EDGE_VISUAL_TOKENS.minStraightEdgeGap - currentGap);
       }
     }
 
@@ -365,49 +386,186 @@ function isAxisAlignedWithParent(
   return Math.abs(parentPosition[0] - childPosition[0]) <= epsilon;
 }
 
+function isNearlyEqual(a: number, b: number, epsilon = 0.5): boolean {
+  return Math.abs(a - b) <= epsilon;
+}
+
+function getOutgoingBoundaryCoordinate(
+  direction: LayoutDirection,
+  center: ArrayLike<number>,
+  size: { width: number; height: number },
+): number {
+  switch (direction) {
+    case 'RL':
+      return center[0] - size.width / 2;
+    case 'TB':
+      return center[1] + size.height / 2;
+    case 'BT':
+      return center[1] - size.height / 2;
+    case 'LR':
+    default:
+      return center[0] + size.width / 2;
+  }
+}
+
+function getIncomingBoundaryCoordinate(
+  direction: LayoutDirection,
+  center: ArrayLike<number>,
+  size: { width: number; height: number },
+): number {
+  switch (direction) {
+    case 'RL':
+      return center[0] + size.width / 2;
+    case 'TB':
+      return center[1] - size.height / 2;
+    case 'BT':
+      return center[1] + size.height / 2;
+    case 'LR':
+    default:
+      return center[0] - size.width / 2;
+  }
+}
+
+function getSharedTrunkCoordinate(
+  direction: LayoutDirection,
+  parentPosition: ArrayLike<number>,
+  parentSize: { width: number; height: number },
+  children: Array<{ position: [number, number]; size: { width: number; height: number } }>,
+): number {
+  const sourceBoundary = getOutgoingBoundaryCoordinate(direction, parentPosition, parentSize);
+  const targetBoundaries = children.map(({ position, size }) => getIncomingBoundaryCoordinate(direction, position, size));
+  const preferredOffset = EDGE_VISUAL_TOKENS.routerPadding;
+
+  switch (direction) {
+    case 'RL': {
+      const nearestTargetBoundary = Math.max(...targetBoundaries);
+      const constrained = nearestTargetBoundary + preferredOffset;
+      if (constrained < sourceBoundary) return Math.max(sourceBoundary - preferredOffset, constrained);
+      return sourceBoundary - Math.max((sourceBoundary - nearestTargetBoundary) / 2, 0);
+    }
+    case 'TB': {
+      const nearestTargetBoundary = Math.min(...targetBoundaries);
+      const constrained = nearestTargetBoundary - preferredOffset;
+      if (constrained > sourceBoundary) return Math.min(sourceBoundary + preferredOffset, constrained);
+      return sourceBoundary + Math.max((nearestTargetBoundary - sourceBoundary) / 2, 0);
+    }
+    case 'BT': {
+      const nearestTargetBoundary = Math.max(...targetBoundaries);
+      const constrained = nearestTargetBoundary + preferredOffset;
+      if (constrained < sourceBoundary) return Math.max(sourceBoundary - preferredOffset, constrained);
+      return sourceBoundary - Math.max((sourceBoundary - nearestTargetBoundary) / 2, 0);
+    }
+    case 'LR':
+    default: {
+      const nearestTargetBoundary = Math.min(...targetBoundaries);
+      const constrained = nearestTargetBoundary - preferredOffset;
+      if (constrained > sourceBoundary) return Math.min(sourceBoundary + preferredOffset, constrained);
+      return sourceBoundary + Math.max((nearestTargetBoundary - sourceBoundary) / 2, 0);
+    }
+  }
+}
+
+function getBranchControlPoints(
+  direction: LayoutDirection,
+  parentPosition: ArrayLike<number>,
+  childPosition: ArrayLike<number>,
+  trunkCoordinate: number,
+): Array<[number, number]> {
+  if (direction === 'LR' || direction === 'RL') {
+    const points: Array<[number, number]> = [[trunkCoordinate, Number(parentPosition[1])]];
+    if (!isNearlyEqual(Number(parentPosition[1]), Number(childPosition[1]))) {
+      points.push([trunkCoordinate, Number(childPosition[1])]);
+    }
+    return points;
+  }
+
+  const points: Array<[number, number]> = [[Number(parentPosition[0]), trunkCoordinate]];
+  if (!isNearlyEqual(Number(parentPosition[0]), Number(childPosition[0]))) {
+    points.push([Number(childPosition[0]), trunkCoordinate]);
+  }
+  return points;
+}
+
 export function getNodeSize(nodeId: string, label: string, rootId: string): NodeSize {
+  void nodeId;
+  void rootId;
   const text = label || '';
-  const isRoot = nodeId === rootId;
-  const fontSize = isRoot ? 14 : 12;
-  const fontWeight = isRoot ? 600 : 500;
-  const lineHeight = fontSize * 1.6;
-  const horizontalPadding = 24;
-  const verticalPadding = 16;
-  const minNodeWidth = isRoot ? 180 : 120;
-  const minNodeHeight = isRoot ? 44 : 36;
+  const fontSize = NODE_VISUAL_TOKENS.fontSize;
+  const fontWeight = NODE_VISUAL_TOKENS.fontWeight;
+  const lineHeight = fontSize * NODE_VISUAL_TOKENS.lineHeightMultiplier;
+  const horizontalPadding = NODE_VISUAL_TOKENS.horizontalPadding;
+  const verticalPadding = NODE_VISUAL_TOKENS.verticalPadding;
   const singleLineWidth = measureTextWidth(text || ' ', fontSize, fontWeight);
   const preferredWidth = singleLineWidth + horizontalPadding;
-  const nodeWidth = Math.max(Math.min(preferredWidth, MAX_NODE_WIDTH), minNodeWidth);
+  const nodeWidth = Math.max(
+    Math.min(preferredWidth, NODE_VISUAL_TOKENS.maxNodeWidth),
+    NODE_VISUAL_TOKENS.minNodeWidth,
+  );
   const labelMaxWidth = Math.max(nodeWidth - horizontalPadding, 1);
   const wrappedLines = wrapTextByWidth(text || ' ', labelMaxWidth, fontSize, fontWeight);
   const contentHeight = wrappedLines.length * lineHeight;
-  const nodeHeight = Math.max(contentHeight + verticalPadding, minNodeHeight);
+  const nodeHeight = Math.max(contentHeight + verticalPadding, NODE_VISUAL_TOKENS.minNodeHeight);
 
   return { width: nodeWidth, height: nodeHeight };
+}
+
+export interface EditorDynamicSize {
+  width: number;
+  height: number;
+  lineCount: number;
+}
+
+export function getEditorDynamicSize(
+  text: string,
+  availableWidth: number,
+  options?: { maxHeight?: number; padding?: number },
+): EditorDynamicSize {
+  const fontSize = NODE_VISUAL_TOKENS.fontSize;
+  const fontWeight = NODE_VISUAL_TOKENS.fontWeight;
+  const lineHeight = fontSize * NODE_VISUAL_TOKENS.lineHeightMultiplier;
+  const padding = options?.padding ?? 36;
+  const labelMaxWidth = Math.max(availableWidth - padding, 1);
+  const wrappedLines = wrapTextByWidth(text || ' ', labelMaxWidth, fontSize, fontWeight);
+  const contentHeight = wrappedLines.length * lineHeight;
+  const verticalPadding = NODE_VISUAL_TOKENS.verticalPadding;
+  let height = contentHeight + verticalPadding;
+  if (options?.maxHeight) {
+    height = Math.min(height, options.maxHeight);
+  }
+  height = Math.max(height, NODE_VISUAL_TOKENS.minNodeHeight);
+
+  return {
+    width: availableWidth,
+    height,
+    lineCount: wrappedLines.length,
+  };
 }
 
 export function getEdgeRenderType(edge: Pick<EdgeData, 'type'>): MindMapEdgeType {
   return edge.type === 'line' ? 'line' : 'polyline';
 }
 
-export function getEdgeRenderStyle(edge: Pick<EdgeData, 'type'>) {
-  if (getEdgeRenderType(edge) === 'line') {
-    return {
-      lineWidth: EDGE_LINE_WIDTH,
-      stroke: EDGE_STROKE,
+export function getEdgeRenderStyle(edge: Pick<EdgeData, 'type' | 'style'>) {
+  const baseStyle = getEdgeRenderType(edge) === 'line'
+    ? {
+      lineWidth: EDGE_VISUAL_TOKENS.lineWidth,
+      stroke: EDGE_VISUAL_TOKENS.stroke,
       radius: 0,
       router: false as const,
+    }
+    : {
+      lineWidth: EDGE_VISUAL_TOKENS.lineWidth,
+      stroke: EDGE_VISUAL_TOKENS.stroke,
+      radius: EDGE_VISUAL_TOKENS.polylineRadius,
+      router: {
+        type: 'orth' as const,
+        padding: EDGE_VISUAL_TOKENS.routerPadding,
+      },
     };
-  }
 
   return {
-    lineWidth: EDGE_LINE_WIDTH,
-    stroke: EDGE_STROKE,
-    radius: POLYLINE_EDGE_RADIUS,
-    router: {
-      type: 'orth' as const,
-      padding: EDGE_ROUTER_PADDING,
-    },
+    ...baseStyle,
+    ...((edge as { style?: Record<string, unknown> }).style ?? {}),
   };
 }
 
@@ -502,7 +660,11 @@ export async function applyParallelStraightEdgeLayout(
     sourcePort: string;
     targetPort: string;
     type?: 'line' | 'polyline';
-    style?: { router: false; radius: number };
+    style?: {
+      router: false;
+      radius: number;
+      controlPoints?: Array<[number, number]>;
+    };
   }> = [];
 
   for (const node of nodeData) {
@@ -542,6 +704,24 @@ export async function applyParallelStraightEdgeLayout(
         height: Number(child.data?._height) || 36,
       };
 
+      if (!isAxisAlignedWithParent(direction, parentPosition, childPosition)) {
+        const trunkCoordinate = getSharedTrunkCoordinate(direction, parentPosition, parentSize, [
+          { position: childPosition, size: childSize },
+        ]);
+        edgeUpdates.push({
+          id: edgeId,
+          type: 'polyline',
+          sourcePort: outgoing.key,
+          targetPort: incoming.key,
+          style: {
+            router: false,
+            radius: EDGE_VISUAL_TOKENS.polylineRadius,
+            controlPoints: getBranchControlPoints(direction, parentPosition, childPosition, trunkCoordinate),
+          },
+        });
+        continue;
+      }
+
       const { parentOutgoing, childIncoming } = getSingleChildPlacements(
         direction,
         parentPosition,
@@ -567,32 +747,41 @@ export async function applyParallelStraightEdgeLayout(
       continue;
     }
 
-    for (const childId of childIds) {
-      const edgeId = edgeByPair.get(`${parentId}::${childId}`);
-      if (!edgeId) continue;
+    const branchChildren = childIds
+      .map((childId) => {
+        const child = nodeById.get(childId);
+        const childPosition = positionsByNodeId.get(childId);
+        if (!child?.id || !childPosition) return null;
 
-      const childPosition = positionsByNodeId.get(childId);
-      if (!childPosition) continue;
-
-      if (isAxisAlignedWithParent(direction, parentPosition, childPosition)) {
-        edgeUpdates.push({
-          id: edgeId,
-          type: 'line',
-          sourcePort: outgoing.key,
-          targetPort: incoming.key,
-          style: {
-            router: false,
-            radius: 0,
+        return {
+          childId,
+          position: childPosition,
+          size: {
+            width: Number(child.data?._width) || 160,
+            height: Number(child.data?._height) || 36,
           },
-        });
-        continue;
-      }
+        };
+      })
+      .filter((child): child is NonNullable<typeof child> => Boolean(child));
+
+    if (!branchChildren.length) continue;
+
+    const trunkCoordinate = getSharedTrunkCoordinate(direction, parentPosition, parentSize, branchChildren);
+
+    for (const child of branchChildren) {
+      const edgeId = edgeByPair.get(`${parentId}::${child.childId}`);
+      if (!edgeId) continue;
 
       edgeUpdates.push({
         id: edgeId,
         type: 'polyline',
         sourcePort: outgoing.key,
         targetPort: incoming.key,
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: getBranchControlPoints(direction, parentPosition, child.position, trunkCoordinate),
+        },
       });
     }
   }

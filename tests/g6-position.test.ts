@@ -3,8 +3,11 @@ import { describe, expect, it } from 'vitest';
 import type { MindMapTree } from '../lib/types/mindmap';
 import {
   applyParallelStraightEdgeLayout,
+  EDGE_VISUAL_TOKENS,
   getEdgeRenderStyle,
   getEdgeRenderType,
+  getNodeSize,
+  NODE_VISUAL_TOKENS,
   toG6GraphData,
 } from '../lib/utils/g6';
 
@@ -126,7 +129,58 @@ function branchingTree(): MindMapTree {
   };
 }
 
+function singleWordTree(): MindMapTree {
+  const now = Date.now();
+  return {
+    id: 'tree-single-word',
+    root: {
+      id: 'root',
+      content: 'Root',
+      children: [
+        {
+          id: 'word',
+          content: '词',
+          children: [],
+          collapsed: false,
+          meta: {
+            sourceRef: { type: 'text', text: '词' },
+            createdAt: now,
+            createdBy: 'user',
+            type: 'detail',
+          },
+        },
+      ],
+      collapsed: false,
+      meta: {
+        sourceRef: { type: 'text', text: 'root' },
+        createdAt: now,
+        createdBy: 'ai',
+        type: 'main',
+      },
+    },
+    meta: {
+      sourceType: 'text',
+      title: 'single-word',
+      createdAt: now,
+      updatedAt: now,
+      version: 1,
+      truncated: false,
+    },
+  };
+}
+
 describe('toG6GraphData node positions', () => {
+  it('uses the same rounded-card sizing model for root nodes, phrase nodes, and single-word nodes', () => {
+    const rootPhrase = getNodeSize('root', '积分生态+数字消费营销', 'root');
+    const childPhrase = getNodeSize('child', '积分生态+数字消费营销', 'root');
+    const singleWord = getNodeSize('child', '营销', 'root');
+
+    expect(rootPhrase).toEqual(childPhrase);
+    expect(singleWord.height).toBe(NODE_VISUAL_TOKENS.minNodeHeight);
+    expect(singleWord.width).toBeGreaterThanOrEqual(NODE_VISUAL_TOKENS.minNodeWidth);
+    expect(singleWord.width).toBeLessThan(rootPhrase.width);
+  });
+
   it('maps persisted node positions into G6 style coordinates', () => {
     const graphData = toG6GraphData(sampleTree());
     const child = graphData.nodes?.find((node) => node.id === 'child');
@@ -169,6 +223,17 @@ describe('toG6GraphData node positions', () => {
     expect(edge?.type).toBe('line');
   });
 
+  it('keeps a single-word child on a straight line when it is the only child', () => {
+    const graphData = toG6GraphData(singleWordTree(), 'LR');
+    const edge = graphData.edges?.find((item) => item.source === 'root' && item.target === 'word');
+
+    expect(edge?.style).toMatchObject({
+      router: false,
+      radius: 0,
+    });
+    expect(edge?.type).toBe('line');
+  });
+
   it('resolves runtime edge rendering by edge datum type so straight links do not inherit orthogonal routing', () => {
     expect(
       getEdgeRenderType({
@@ -180,8 +245,8 @@ describe('toG6GraphData node positions', () => {
         type: 'line',
       }),
     ).toEqual({
-      lineWidth: 1.2,
-      stroke: '#7A7A70',
+      lineWidth: EDGE_VISUAL_TOKENS.lineWidth,
+      stroke: EDGE_VISUAL_TOKENS.stroke,
       radius: 0,
       router: false,
     });
@@ -196,12 +261,12 @@ describe('toG6GraphData node positions', () => {
         type: 'polyline',
       }),
     ).toEqual({
-      lineWidth: 1.2,
-      stroke: '#7A7A70',
-      radius: 4,
+      lineWidth: EDGE_VISUAL_TOKENS.lineWidth,
+      stroke: EDGE_VISUAL_TOKENS.stroke,
+      radius: EDGE_VISUAL_TOKENS.polylineRadius,
       router: {
         type: 'orth',
-        padding: 16,
+        padding: EDGE_VISUAL_TOKENS.routerPadding,
       },
     });
   });
@@ -220,13 +285,94 @@ describe('toG6GraphData node positions', () => {
     expect(branchedEdge?.style).toBeUndefined();
   });
 
-  it('pins single-child LR edges to a shared Y coordinate so the segment stays perfectly horizontal', async () => {
+  it('pins single-child LR edges to a shared Y coordinate when parent and child are already horizontally aligned', async () => {
     const nodeUpdates: Array<{ id: string; style: { port: true; ports: Array<{ key: string; placement: [number, number] }> } }> = [];
     const edgeUpdates: Array<{
       id: string;
       sourcePort: string;
       targetPort: string;
       style: { router: false; radius: number };
+    }> = [];
+
+    const graph = {
+      getNodeData: () => [
+        {
+          id: 'root',
+          data: { _width: 200, _height: 40 },
+        },
+        {
+          id: 'child',
+          data: { _width: 120, _height: 30 },
+        },
+      ],
+      getEdgeData: () => [
+        {
+          id: 'edge-root-child',
+          source: 'root',
+          target: 'child',
+        },
+      ],
+      getElementPosition: (id: string) => {
+        if (id === 'root') return [0, 0];
+        if (id === 'child') return [240, 0];
+        return undefined;
+      },
+      updateNodeData: (updates: typeof nodeUpdates) => {
+        nodeUpdates.push(...updates);
+      },
+      updateEdgeData: (updates: typeof edgeUpdates) => {
+        edgeUpdates.push(...updates);
+      },
+      draw: async () => undefined,
+    };
+
+    await applyParallelStraightEdgeLayout(graph as any, sampleTree().root, 'LR');
+
+    expect(nodeUpdates).toMatchObject([
+      {
+        id: 'root',
+        style: {
+          port: true,
+          ports: [
+            { key: 'left-center', placement: [0, 0.5] },
+            { key: 'right-center', placement: [1, 0.5] },
+          ],
+        },
+      },
+      {
+        id: 'child',
+        style: {
+          port: true,
+          ports: [
+            { key: 'left-center', placement: [0, 0.5] },
+            { key: 'right-center', placement: [1, 0.5] },
+          ],
+        },
+      },
+    ]);
+    expect(edgeUpdates).toEqual([
+      {
+        id: 'edge-root-child',
+        type: 'line',
+        sourcePort: 'right-center',
+        targetPort: 'left-center',
+        style: { router: false, radius: 0 },
+      },
+    ]);
+  });
+
+  it('keeps a misaligned single-child LR edge on orthogonal routing to avoid diagonal crossings through descendant chains', async () => {
+    const nodeUpdates: Array<{ id: string; style: { port: true; ports: Array<{ key: string; placement: [number, number] }> } }> = [];
+    const edgeUpdates: Array<{
+      id: string;
+      sourcePort: string;
+      targetPort: string;
+      type?: 'line' | 'polyline';
+      style?: {
+        router: false;
+        radius: number;
+        controlPoints: Array<[number, number]>;
+      };
     }> = [];
 
     const graph = {
@@ -279,7 +425,7 @@ describe('toG6GraphData node positions', () => {
         style: {
           port: true,
           ports: [
-            { key: 'left-center', placement: [0, -0.5] },
+            { key: 'left-center', placement: [0, 0.5] },
             { key: 'right-center', placement: [1, 0.5] },
           ],
         },
@@ -288,15 +434,22 @@ describe('toG6GraphData node positions', () => {
     expect(edgeUpdates).toEqual([
       {
         id: 'edge-root-child',
-        type: 'line',
+        type: 'polyline',
         sourcePort: 'right-center',
         targetPort: 'left-center',
-        style: { router: false, radius: 0 },
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [128, 0],
+            [128, 30],
+          ],
+        },
       },
     ]);
   });
 
-  it('pins single-child TB edges to a shared X coordinate so the segment stays perfectly vertical', async () => {
+  it('pins single-child TB edges to a shared X coordinate when parent and child are already vertically aligned', async () => {
     const nodeUpdates: Array<{ id: string; style: { port: true; ports: Array<{ key: string; placement: [number, number] }> } }> = [];
 
     const graph = {
@@ -319,7 +472,7 @@ describe('toG6GraphData node positions', () => {
       ],
       getElementPosition: (id: string) => {
         if (id === 'root') return [0, 0];
-        if (id === 'child') return [30, 180];
+        if (id === 'child') return [0, 180];
         return undefined;
       },
       updateNodeData: (updates: typeof nodeUpdates) => {
@@ -347,7 +500,7 @@ describe('toG6GraphData node positions', () => {
         style: {
           port: true,
           ports: [
-            { key: 'top-center', placement: [0.2, 0] },
+            { key: 'top-center', placement: [0.5, 0] },
             { key: 'bottom-center', placement: [0.5, 1] },
           ],
         },
@@ -419,7 +572,7 @@ describe('toG6GraphData node positions', () => {
 
     expect(translated).toEqual([
       {
-        child: [1023, 710.2],
+        child: [1031, 710.2],
       },
     ]);
   });
@@ -521,20 +674,24 @@ describe('toG6GraphData node positions', () => {
 
     expect(translated).toEqual([
       {
-        'child-a': [182, -80],
-        'child-b': [182, 0],
-        'child-c': [182, 80],
+        'child-a': [190, -80],
+        'child-b': [190, 0],
+        'child-c': [190, 80],
       },
     ]);
   });
 
-  it('renders the centered branch child as a straight line to avoid orthogonal U-turns in LR layout', async () => {
+  it('keeps the centered branch child on the shared orthogonal branch when the parent has multiple children', async () => {
     const edgeUpdates: Array<{
       id: string;
       type?: 'line' | 'polyline';
       sourcePort: string;
       targetPort: string;
-      style?: { router: false; radius: number };
+      style?: {
+        router: false;
+        radius: number;
+        controlPoints: Array<[number, number]>;
+      };
     }> = [];
 
     const graph = {
@@ -607,19 +764,164 @@ describe('toG6GraphData node positions', () => {
         type: 'polyline',
         sourcePort: 'right-center',
         targetPort: 'left-center',
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [128, 0],
+            [128, -80],
+          ],
+        },
       },
       {
         id: 'edge-parent-b',
-        type: 'line',
+        type: 'polyline',
         sourcePort: 'right-center',
         targetPort: 'left-center',
-        style: { router: false, radius: 0 },
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [128, 0],
+          ],
+        },
       },
       {
         id: 'edge-parent-c',
         type: 'polyline',
         sourcePort: 'right-center',
         targetPort: 'left-center',
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [128, 0],
+            [128, 80],
+          ],
+        },
+      },
+    ]);
+  });
+
+  it('uses a monotonic shared trunk for uneven LR branch children so no child edge needs a U-turn', async () => {
+    const edgeUpdates: Array<{
+      id: string;
+      type?: 'line' | 'polyline';
+      sourcePort: string;
+      targetPort: string;
+      style?: {
+        router: false;
+        radius: number;
+        controlPoints: Array<[number, number]>;
+      };
+    }> = [];
+
+    const graph = {
+      getNodeData: () => [
+        { id: 'parent', data: { _width: 212, _height: 56 } },
+        { id: 'child-a', data: { _width: 720, _height: 70 } },
+        { id: 'child-b', data: { _width: 720, _height: 70 } },
+        { id: 'child-c', data: { _width: 720, _height: 70 } },
+      ],
+      getEdgeData: () => [
+        { id: 'edge-parent-a', source: 'parent', target: 'child-a' },
+        { id: 'edge-parent-b', source: 'parent', target: 'child-b' },
+        { id: 'edge-parent-c', source: 'parent', target: 'child-c' },
+      ],
+      getElementPosition: (id: string) => {
+        if (id === 'parent') return [718.3294372558594, 965.5999755859375];
+        if (id === 'child-a') return [1418.3294677734375, 857.2000122070312];
+        if (id === 'child-b') return [1418.3294677734375, 958.7999877929688];
+        if (id === 'child-c') return [1418.3294677734375, 1060.4000244140625];
+        return undefined;
+      },
+      updateNodeData: () => undefined,
+      updateEdgeData: (updates: typeof edgeUpdates) => {
+        edgeUpdates.push(...updates);
+      },
+      draw: async () => undefined,
+    };
+
+    const now = Date.now();
+    const root = {
+      id: 'parent',
+      content: 'Parent',
+      collapsed: false,
+      children: [
+        {
+          id: 'child-a',
+          content: 'Child A',
+          children: [],
+          collapsed: false,
+          meta: { sourceRef: { type: 'text', text: 'child-a' }, createdAt: now, createdBy: 'user', type: 'detail' as const },
+        },
+        {
+          id: 'child-b',
+          content: 'Child B',
+          children: [],
+          collapsed: false,
+          meta: { sourceRef: { type: 'text', text: 'child-b' }, createdAt: now, createdBy: 'user', type: 'detail' as const },
+        },
+        {
+          id: 'child-c',
+          content: 'Child C',
+          children: [],
+          collapsed: false,
+          meta: { sourceRef: { type: 'text', text: 'child-c' }, createdAt: now, createdBy: 'user', type: 'detail' as const },
+        },
+      ],
+      meta: {
+        sourceRef: { type: 'text', text: 'parent' },
+        createdAt: now,
+        createdBy: 'user',
+        type: 'detail' as const,
+      },
+    };
+
+    await applyParallelStraightEdgeLayout(graph as any, root as any, 'LR');
+
+    expect(edgeUpdates).toEqual([
+      {
+        id: 'edge-parent-a',
+        type: 'polyline',
+        sourcePort: 'right-center',
+        targetPort: 'left-center',
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [852.3294372558594, 965.5999755859375],
+            [852.3294372558594, 857.2000122070312],
+          ],
+        },
+      },
+      {
+        id: 'edge-parent-b',
+        type: 'polyline',
+        sourcePort: 'right-center',
+        targetPort: 'left-center',
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [852.3294372558594, 965.5999755859375],
+            [852.3294372558594, 958.7999877929688],
+          ],
+        },
+      },
+      {
+        id: 'edge-parent-c',
+        type: 'polyline',
+        sourcePort: 'right-center',
+        targetPort: 'left-center',
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [852.3294372558594, 965.5999755859375],
+            [852.3294372558594, 1060.4000244140625],
+          ],
+        },
       },
     ]);
   });
@@ -696,12 +998,28 @@ describe('toG6GraphData node positions', () => {
         type: 'polyline',
         sourcePort: 'right-center',
         targetPort: 'left-center',
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [128, 0],
+            [128, -80],
+          ],
+        },
       },
       {
         id: 'edge-parent-b',
         type: 'polyline',
         sourcePort: 'right-center',
         targetPort: 'left-center',
+        style: {
+          router: false,
+          radius: EDGE_VISUAL_TOKENS.polylineRadius,
+          controlPoints: [
+            [128, 0],
+            [128, 80],
+          ],
+        },
       },
     ]);
 
@@ -719,5 +1037,190 @@ describe('toG6GraphData node positions', () => {
         }),
       ]),
     );
+  });
+
+  it('keeps parent-child spacing stable across repeated layout passes for a single-child LR branch', async () => {
+    const translated: Array<Record<string, [number, number]>> = [];
+    let childPosition: [number, number] = [969.2, 710.2];
+
+    const graph = {
+      getNodeData: () => [
+        {
+          id: 'parent',
+          data: { _width: 132, _height: 44 },
+        },
+        {
+          id: 'child',
+          data: { _width: 420, _height: 68 },
+        },
+      ],
+      getEdgeData: () => [
+        {
+          id: 'edge-parent-child',
+          source: 'parent',
+          target: 'child',
+        },
+      ],
+      getElementPosition: (id: string) => {
+        if (id === 'parent') return [715, 719.4];
+        if (id === 'child') return childPosition;
+        return undefined;
+      },
+      translateElementTo: async (positions: Record<string, [number, number]>) => {
+        translated.push(positions);
+        if (positions.child) {
+          childPosition = positions.child;
+        }
+      },
+      updateNodeData: () => undefined,
+      updateEdgeData: () => undefined,
+      draw: async () => undefined,
+    };
+
+    const now = Date.now();
+    const root = {
+      id: 'parent',
+      content: 'Parent',
+      collapsed: false,
+      children: [
+        {
+          id: 'child',
+          content: 'Child',
+          children: [],
+          collapsed: false,
+          meta: {
+            sourceRef: { type: 'text', text: 'child' },
+            createdAt: now,
+            createdBy: 'user',
+            type: 'detail' as const,
+          },
+        },
+      ],
+      meta: {
+        sourceRef: { type: 'text', text: 'parent' },
+        createdAt: now,
+        createdBy: 'user',
+        type: 'detail' as const,
+      },
+    };
+
+    await applyParallelStraightEdgeLayout(graph as any, root as any, 'LR');
+    await applyParallelStraightEdgeLayout(graph as any, root as any, 'LR');
+
+    expect(translated).toEqual([
+      {
+        child: [1031, 710.2],
+      },
+    ]);
+    expect(childPosition).toEqual([1031, 710.2]);
+  });
+
+  it('keeps branching child subtrees at a stable horizontal gap across repeated LR layout passes', async () => {
+    const translated: Array<Record<string, [number, number]>> = [];
+    const positions: Record<string, [number, number]> = {
+      parent: [0, 0],
+      'child-a': [179, -80],
+      'child-b': [179, 0],
+      'child-c': [179, 80],
+    };
+
+    const graph = {
+      getNodeData: () => [
+        {
+          id: 'parent',
+          data: { _width: 200, _height: 40 },
+        },
+        {
+          id: 'child-a',
+          data: { _width: 100, _height: 36 },
+        },
+        {
+          id: 'child-b',
+          data: { _width: 100, _height: 36 },
+        },
+        {
+          id: 'child-c',
+          data: { _width: 100, _height: 36 },
+        },
+      ],
+      getEdgeData: () => [
+        { id: 'edge-parent-a', source: 'parent', target: 'child-a' },
+        { id: 'edge-parent-b', source: 'parent', target: 'child-b' },
+        { id: 'edge-parent-c', source: 'parent', target: 'child-c' },
+      ],
+      getElementPosition: (id: string) => positions[id],
+      translateElementTo: async (nextPositions: Record<string, [number, number]>) => {
+        translated.push(nextPositions);
+        Object.assign(positions, nextPositions);
+      },
+      updateNodeData: () => undefined,
+      updateEdgeData: () => undefined,
+      draw: async () => undefined,
+    };
+
+    const now = Date.now();
+    const root = {
+      id: 'parent',
+      content: 'Parent',
+      collapsed: false,
+      children: [
+        {
+          id: 'child-a',
+          content: 'Child A',
+          children: [],
+          collapsed: false,
+          meta: {
+            sourceRef: { type: 'text', text: 'child-a' },
+            createdAt: now,
+            createdBy: 'user',
+            type: 'detail' as const,
+          },
+        },
+        {
+          id: 'child-b',
+          content: 'Child B',
+          children: [],
+          collapsed: false,
+          meta: {
+            sourceRef: { type: 'text', text: 'child-b' },
+            createdAt: now,
+            createdBy: 'user',
+            type: 'detail' as const,
+          },
+        },
+        {
+          id: 'child-c',
+          content: 'Child C',
+          children: [],
+          collapsed: false,
+          meta: {
+            sourceRef: { type: 'text', text: 'child-c' },
+            createdAt: now,
+            createdBy: 'user',
+            type: 'detail' as const,
+          },
+        },
+      ],
+      meta: {
+        sourceRef: { type: 'text', text: 'parent' },
+        createdAt: now,
+        createdBy: 'user',
+        type: 'detail' as const,
+      },
+    };
+
+    await applyParallelStraightEdgeLayout(graph as any, root as any, 'LR');
+    await applyParallelStraightEdgeLayout(graph as any, root as any, 'LR');
+
+    expect(translated).toEqual([
+      {
+        'child-a': [190, -80],
+        'child-b': [190, 0],
+        'child-c': [190, 80],
+      },
+    ]);
+    expect(positions['child-a']).toEqual([190, -80]);
+    expect(positions['child-b']).toEqual([190, 0]);
+    expect(positions['child-c']).toEqual([190, 80]);
   });
 });
