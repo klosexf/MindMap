@@ -10,21 +10,43 @@ import {
   getEdgeRenderStyle,
   getEdgeRenderType,
   getLayoutConfig,
+  getNodeFontMetrics,
   getNodeSize,
   NODE_VISUAL_TOKENS,
   toG6GraphData,
 } from '@/lib/utils/g6';
-import { focusGraphViewportOnNode, getViewportLockedEditorRect, readGraphViewportState, restoreGraphViewportState } from '@/lib/utils/g6-viewport';
+import {
+  ARROW_PAN_TAP_MIN_STEP,
+  clampArrowPanOffset,
+  computeArrowPanOffset,
+  computeArrowPanTailOffset,
+  computeZoomStepTarget,
+  focusGraphViewportOnNode,
+  getArrowPanDirection,
+  getArrowPanUnit,
+  getZoomStepDirection,
+  getViewportLockedEditorRect,
+  readGraphViewportState,
+  restoreGraphViewportState,
+  type ArrowPanDirection,
+  type GraphContentBounds,
+} from '@/lib/utils/g6-viewport';
 import {
   countNodes,
   findClosestRectByBorderProximity,
   findParentInfo,
+  getNodeDepth,
   inferDropModeFromPoint,
   resolveDropMoveTarget,
   type DropMoveMode,
   type DropSiblingPlacement,
 } from '@/lib/utils/tree';
 import { createLayerRenderer, selectRenderMode } from '@/lib/utils/renderer';
+
+/** +/- 键按住连续缩放时，相邻两步的最小间隔（毫秒） */
+const ZOOM_KEY_REPEAT_THROTTLE_MS = 150;
+/** 单步缩放的平滑动画时长（毫秒） */
+const ZOOM_KEY_ANIMATION_MS = 200;
 
 export interface MindMapEditorRef {
   exportPngDataUrl: () => Promise<string | null>;
@@ -89,10 +111,10 @@ function isRightMouseButtonEvent(event: { button?: number; originalEvent?: { but
 
 const TRANSIENT_DRAG_STATES = ['dragging', 'drop-child', 'drop-sibling-before', 'drop-sibling-after'] as const;
 
-function getNodeTextMetrics(datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }, rootId: string): NodeTextMetrics {
-  const size = getNodeSize(datum.id || '', datum.data?.label || '', rootId);
-  const fontSize = NODE_VISUAL_TOKENS.fontSize;
-  const fontWeight = NODE_VISUAL_TOKENS.fontWeight;
+function getNodeTextMetrics(datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }, rootId: string): NodeTextMetrics {
+  const depth = typeof datum.data?._depth === 'number' ? datum.data._depth : undefined;
+  const size = getNodeSize(datum.id || '', datum.data?.label || '', rootId, depth);
+  const { fontSize, fontWeight } = getNodeFontMetrics(datum.id || '', rootId, depth);
   const lineHeight = fontSize * NODE_VISUAL_TOKENS.lineHeightMultiplier;
   const horizontalPadding = NODE_VISUAL_TOKENS.horizontalPadding;
   const labelMaxWidth = Math.max(size.width - horizontalPadding, 1);
@@ -141,10 +163,24 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
   const [editRect, setEditRect] = useState<DOMRect | null>(null);
   const [dynamicEditorHeight, setDynamicEditorHeight] = useState<number | null>(null);
 
+  // 行内编辑器跟随被编辑节点的字体层级（根节点 = 大字号加粗，一级分支/二级/细节逐级缩小）
+  const editingFontMetrics = useMemo(
+    () =>
+      editingNodeId
+        ? getNodeFontMetrics(
+            editingNodeId,
+            tree.root.id,
+            getNodeDepth(tree.root, editingNodeId) ?? undefined,
+          )
+        : null,
+    [editingNodeId, tree],
+  );
+
   const originalEditValueRef = useRef('');
   const draggingNodeIdRef = useRef<string | null>(null);
   const dropPreviewRef = useRef<DropPreview | null>(null);
   const selectedNodeIdRef = useRef<string | null>(selectedNodeId);
+  const editingNodeIdRef = useRef<string | null>(null);
   const treeRef = useRef(tree);
   const layoutDirectionRef = useRef(layoutDirection);
   const onSelectNodeRef = useRef(onSelectNode);
@@ -321,6 +357,10 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
   }, [selectedNodeId]);
 
   useEffect(() => {
+    editingNodeIdRef.current = editingNodeId;
+  }, [editingNodeId]);
+
+  useEffect(() => {
     treeRef.current = tree;
   }, [tree]);
 
@@ -354,7 +394,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       node: {
         type: 'rect',
         style: {
-          size: (datum: { data?: { label?: string; _width?: number; _height?: number }; id?: string }) => {
+          size: (datum: { data?: { label?: string; _width?: number; _height?: number; _depth?: number }; id?: string }) => {
             const metrics = getNodeTextMetrics(datum, treeRef.current.root.id);
             return [metrics.width, metrics.height];
           },
@@ -363,32 +403,40 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
           stroke: NODE_VISUAL_TOKENS.stroke,
           lineWidth: NODE_VISUAL_TOKENS.lineWidth,
           label: true,
-          labelPlacement: 'center',
-          labelTextAlign: 'center',
+          labelPlacement: 'left',
+          labelTextAlign: 'left',
           labelTextBaseline: 'middle',
+          // 左对齐后从节点左边缘缩进半个水平内边距，保持左右各 18px 视觉留白
+          labelOffsetX: NODE_VISUAL_TOKENS.horizontalPadding / 2,
           labelText: (datum: { data?: { label?: string } }) => datum.data?.label || '',
           labelFill: NODE_VISUAL_TOKENS.text,
-          labelFontSize: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
+          labelFontSize: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }) =>
             getNodeTextMetrics(datum, treeRef.current.root.id).fontSize,
-          labelFontWeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
+          labelFontWeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }) =>
             getNodeTextMetrics(datum, treeRef.current.root.id).fontWeight,
           labelWordWrap: true,
-          labelMaxWidth: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) => {
+          labelMaxWidth: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }) => {
             const metrics = getNodeTextMetrics(datum, treeRef.current.root.id);
             return metrics.labelMaxWidth;
           },
-          labelMaxLines: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) => {
+          labelMaxLines: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }) => {
             const metrics = getNodeTextMetrics(datum, treeRef.current.root.id);
             return metrics.lineCount;
           },
           labelTextOverflow: 'clip',
-          labelLineHeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number } }) =>
+          labelLineHeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }) =>
             getNodeTextMetrics(datum, treeRef.current.root.id).lineHeight,
         },
         state: {
           selected: {
             stroke: EDGE_VISUAL_TOKENS.stroke,
             lineWidth: 2.2,
+            // 覆盖 G6 主题 selected 状态默认的 labelFontSize:12 / labelFontWeight:'bold'，
+            // 避免选中（含加载时自动选中根节点）把根节点的大字号加粗标题压扁。
+            labelFontSize: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }) =>
+              getNodeTextMetrics(datum, treeRef.current.root.id).fontSize,
+            labelFontWeight: (datum: { id?: string; data?: { label?: string; _width?: number; _height?: number; _depth?: number } }) =>
+              getNodeTextMetrics(datum, treeRef.current.root.id).fontWeight,
           },
           dragging: {
             // Position-only: neutral gray — "just repositioning, no relationship change"
@@ -809,6 +857,11 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
       onSelectNodeRef.current(evt?.target?.id ?? null);
     });
 
+    // 点击画布空白处取消节点选中，让方向键画布拖动等无选中交互可以激活
+    graph.on('canvas:click', () => {
+      onSelectNodeRef.current(null);
+    });
+
     graph.on('node:dblclick', (evt: any) => {
       const nodeId = evt?.target?.id ?? null;
       if (nodeId) {
@@ -901,16 +954,24 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     const ZOOM_MIN = 0.1;
     const ZOOM_MAX = 5;
     const PINCH_SENSITIVITY = 0.005;
+    // Mouse wheels emit large discrete deltaY values (~100-120 per notch),
+    // while trackpad gestures emit small continuous ones. A lower sensitivity
+    // keeps each wheel notch at ~15% zoom instead of ~45%.
+    const WHEEL_SENSITIVITY = 0.0015;
 
     const onWheel = (e: WheelEvent) => {
-      if (e.metaKey) return;
-
-      if (e.ctrlKey) {
+      if (e.metaKey || e.ctrlKey) {
         e.preventDefault();
 
+        // graph.zoomTo() expects the zoom anchor (origin) in viewport coordinates.
+        // getCanvasByClient returns canvas/world coordinates, which would anchor the
+        // zoom at the wrong point and shift content out of view. Convert to viewport
+        // coordinates before passing it as the origin.
         const canvasPoint = graph.getCanvasByClient([e.clientX, e.clientY]);
+        const viewportPoint = graph.getViewportByCanvas(canvasPoint);
         const currentZoom = graph.getZoom();
-        const scaleDelta = Math.exp(-e.deltaY * PINCH_SENSITIVITY);
+        const sensitivity = Math.abs(e.deltaY) >= 50 ? WHEEL_SENSITIVITY : PINCH_SENSITIVITY;
+        const scaleDelta = Math.exp(-e.deltaY * sensitivity);
         let newZoom = currentZoom * scaleDelta;
 
         if (newZoom < ZOOM_MIN) newZoom = ZOOM_MIN;
@@ -918,7 +979,7 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
 
         if (Math.abs(newZoom - currentZoom) < 0.0001) return;
 
-        graph.zoomTo(newZoom, false, canvasPoint);
+        graph.zoomTo(newZoom, false, viewportPoint);
       } else {
         e.preventDefault();
         graph.translateBy([e.deltaX, e.deltaY], false);
@@ -928,6 +989,364 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
     container.addEventListener('wheel', onWheel, { passive: false });
     return () => {
       container.removeEventListener('wheel', onWheel);
+    };
+  }, [renderMode]);
+
+  // 无节点选中时，方向键平滑拖动整个画布（视口向按键方向平移，与滚轮/滚动条语义一致）
+  // 轻点一下 = 平滑滑行一个最小步距；按住不放 = 连续平移；快速连按 = 步距累加
+  useEffect(() => {
+    interface ArrowPanSession {
+      startedAt: number;
+      lastFrameAt: number;
+      rafId: number;
+      contentBounds: GraphContentBounds | null;
+      /** 本次会话累计位移（视口像素） */
+      movedDistance: number;
+      /** 松开按键后需要滑行到的目标距离；null 表示无收尾滑行 */
+      tailTarget: number | null;
+      /** 最近一次按住方向的单位向量，收尾滑行沿用 */
+      lastUnit: [number, number];
+      /** 收尾滑行连续无位移的帧数，用于边界钳制场景下的兜底退出 */
+      idleTailFrames: number;
+    }
+
+    const activeDirections = new Set<ArrowPanDirection>();
+    let session: ArrowPanSession | null = null;
+    /** 上一次 +/- 键缩放生效时刻，用于按住时的重复节流 */
+    let lastZoomStepAt = 0;
+
+    const getAliveGraph = () => {
+      const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
+      return graph && !graph.destroyed ? graph : null;
+    };
+
+    const readContentBounds = (graph: Graph): GraphContentBounds | null => {
+      try {
+        const bounds = graph.getCanvas().getBounds() as { min?: ArrayLike<number>; max?: ArrayLike<number> } | null;
+        const minX = Number(bounds?.min?.[0]);
+        const minY = Number(bounds?.min?.[1]);
+        const maxX = Number(bounds?.max?.[0]);
+        const maxY = Number(bounds?.max?.[1]);
+        // 空画布的 AABB 会是 ±Infinity，统一按无内容处理（不平移限制）
+        if (![minX, minY, maxX, maxY].every((value) => Number.isFinite(value))) {
+          return null;
+        }
+        if (maxX < minX || maxY < minY) return null;
+        return { min: [minX, minY], max: [maxX, maxY] };
+      } catch {
+        return null;
+      }
+    };
+
+    const stopPan = () => {
+      if (session) {
+        cancelAnimationFrame(session.rafId);
+        session = null;
+      }
+      activeDirections.clear();
+    };
+
+    const step = (now: number) => {
+      const graph = getAliveGraph();
+      const held = activeDirections.size > 0;
+      const tailActive = session?.tailTarget !== null && session !== null && session.movedDistance < session.tailTarget - 0.5;
+      // 会话期间出现选中节点 / 进入编辑 / 画布销毁 / 既未按住也无收尾滑行时停止
+      if (
+        !graph ||
+        !session ||
+        (!held && !tailActive) ||
+        selectedNodeIdRef.current !== null ||
+        editingNodeIdRef.current !== null
+      ) {
+        stopPan();
+        return;
+      }
+
+      const frameDeltaMs = now - session.lastFrameAt;
+      let offset: [number, number];
+      if (held) {
+        session.lastUnit = getArrowPanUnit(activeDirections);
+        offset = computeArrowPanOffset(activeDirections, now - session.startedAt, frameDeltaMs);
+      } else {
+        offset = computeArrowPanTailOffset(
+          session.lastUnit,
+          (session.tailTarget ?? 0) - session.movedDistance,
+          frameDeltaMs,
+        );
+      }
+      session.lastFrameAt = now;
+
+      if (offset[0] !== 0 || offset[1] !== 0) {
+        let nextOffset: [number, number] = [0, 0];
+        try {
+          nextOffset = clampArrowPanOffset(offset, {
+            position: graph.getPosition(),
+            zoom: graph.getZoom(),
+            canvasSize: graph.getSize(),
+            contentBounds: session.contentBounds,
+          });
+        } catch {
+          nextOffset = [0, 0];
+        }
+
+        if (nextOffset[0] !== 0 || nextOffset[1] !== 0) {
+          graph.translateBy(nextOffset, false);
+          session.movedDistance += Math.hypot(nextOffset[0], nextOffset[1]);
+          session.idleTailFrames = 0;
+        } else if (!held) {
+          // 收尾滑行被边界钳制为 0（如已到画布边缘）：兜底退出，避免空转
+          session.idleTailFrames += 1;
+          if (session.idleTailFrames > 5) {
+            stopPan();
+            return;
+          }
+        }
+      } else if (!held) {
+        // 收尾滑行无剩余距离：由 tailActive 条件在下一帧退出
+        session.idleTailFrames += 1;
+        if (session.idleTailFrames > 5) {
+          stopPan();
+          return;
+        }
+      }
+
+      session.rafId = requestAnimationFrame(step);
+    };
+
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const element = target as HTMLElement | null;
+      if (!element || typeof element.tagName !== 'string') return false;
+      const tag = element.tagName.toLowerCase();
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || element.isContentEditable === true;
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      // +/- 键缩放：以视口中心为锚点，每按一步 ×1.2，按住时依赖系统按键重复连续缩放
+      const zoomDirection = getZoomStepDirection(event.key);
+      if (zoomDirection) {
+        // Ctrl/Cmd/Alt 组合保留给浏览器 / 系统快捷键；
+        // Shift 允许（主键盘的 + 依赖 Shift+=）
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        // 与方向键拖动相同的激活守卫
+        if (selectedNodeIdRef.current !== null) return;
+        if (editingNodeIdRef.current !== null || isEditableTarget(event.target)) return;
+        const graph = getAliveGraph();
+        if (!graph) return;
+
+        event.preventDefault();
+        // 按键重复触发过快时节流，保证按住时缩放速度适中
+        const now = performance.now();
+        if (now - lastZoomStepAt < ZOOM_KEY_REPEAT_THROTTLE_MS) return;
+        lastZoomStepAt = now;
+
+        const currentZoom = graph.getZoom();
+        const targetZoom = computeZoomStepTarget(currentZoom, zoomDirection);
+        if (Math.abs(targetZoom - currentZoom) < 0.0001) return;
+
+        const [width, height] = graph.getSize();
+        graph.zoomTo(targetZoom, { duration: ZOOM_KEY_ANIMATION_MS }, [width / 2, height / 2]);
+        return;
+      }
+
+      const direction = getArrowPanDirection(event.key);
+      if (!direction) return;
+      // 修饰键组合保留给浏览器 / 系统快捷键
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      // 仅在无节点选中时激活；有选中时方向键保持原有行为
+      if (selectedNodeIdRef.current !== null) return;
+      // 行内编辑或焦点在表单元素内时，方向键维持文本编辑行为
+      if (editingNodeIdRef.current !== null || isEditableTarget(event.target)) return;
+      if (!getAliveGraph()) return;
+
+      event.preventDefault();
+
+      // 忽略按键自动重复触发
+      if (activeDirections.has(direction)) return;
+
+      const wasIdle = activeDirections.size === 0;
+      activeDirections.add(direction);
+      // 立即记录方向单位向量：轻点时按键可能在第一帧渲染前就松开，
+      // 收尾滑行需要依赖这里记录的方向
+      const unit = getArrowPanUnit(activeDirections);
+
+      if (!session) {
+        const graph = getAliveGraph();
+        const now = performance.now();
+        session = {
+          startedAt: now,
+          lastFrameAt: now,
+          rafId: requestAnimationFrame(step),
+          contentBounds: graph ? readContentBounds(graph) : null,
+          movedDistance: 0,
+          tailTarget: null,
+          lastUnit: unit,
+          idleTailFrames: 0,
+        };
+      } else {
+        session.lastUnit = unit;
+        session.idleTailFrames = 0;
+        if (wasIdle) {
+          // 收尾滑行途中再次按下：在当前进度上追加一个轻点步距，快速连按可持续移动
+          session.tailTarget = Math.max(session.tailTarget ?? 0, session.movedDistance + ARROW_PAN_TAP_MIN_STEP);
+        }
+      }
+    };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      const direction = getArrowPanDirection(event.key);
+      if (!direction || !activeDirections.has(direction)) return;
+      activeDirections.delete(direction);
+
+      if (activeDirections.size === 0 && session) {
+        if (session.movedDistance >= ARROW_PAN_TAP_MIN_STEP) {
+          // 已移动超过轻点步距（长按场景），松开立即停止
+          stopPan();
+        } else {
+          // 轻点场景：继续滑行到最小步距，由 step 循环收尾
+          session.tailTarget = ARROW_PAN_TAP_MIN_STEP;
+        }
+      }
+    };
+
+    // 切走窗口 / 失焦时按键不会再触发 keyup，必须立即停止
+    const onBlur = () => stopPan();
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      stopPan();
+    };
+  }, [renderMode]);
+
+  // 按住空格键 + 鼠标左键拖动：从任意位置（含节点上方）平移画布。
+  // 在捕获阶段拦截 pointerdown 并 preventDefault，阻止浏览器对
+  // SVG 节点文字启动原生选区；stopPropagation 避免与 G6 的
+  // drag-canvas / click-select 等行为叠加响应。
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let spaceHeld = false;
+    let panning = false;
+    let activePointerId: number | null = null;
+    let lastX = 0;
+    let lastY = 0;
+
+    const getAliveGraph = () => {
+      const graph = graphRef.current as (Graph & { destroyed?: boolean }) | null;
+      return graph && !graph.destroyed ? graph : null;
+    };
+
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const element = target as HTMLElement | null;
+      if (!element || typeof element.tagName !== 'string') return false;
+      const tag = element.tagName.toLowerCase();
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || element.isContentEditable === true;
+    };
+
+    const applyCursor = () => {
+      container.style.cursor = spaceHeld ? (panning ? 'grabbing' : 'grab') : '';
+    };
+
+    const stopPan = () => {
+      panning = false;
+      activePointerId = null;
+      applyCursor();
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== 'Space' && event.key !== ' ') return;
+      // 修饰键组合保留给浏览器 / 系统快捷键
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      // 行内编辑或焦点在表单元素内时，空格维持文本输入行为
+      if (editingNodeIdRef.current !== null || isEditableTarget(event.target)) return;
+      if (!getAliveGraph()) return;
+
+      event.preventDefault();
+      spaceHeld = true;
+      applyCursor();
+    };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.code !== 'Space' && event.key !== ' ') return;
+      spaceHeld = false;
+      stopPan();
+    };
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (!spaceHeld || event.button !== 0) return;
+      if (!getAliveGraph()) return;
+
+      // preventDefault 取消后续的 mousedown，从根源上阻止文字选区；
+      // stopPropagation 阻止事件到达 G6，避免与 drag-canvas / click-select 叠加。
+      event.preventDefault();
+      event.stopPropagation();
+
+      try {
+        container.setPointerCapture(event.pointerId);
+      } catch {
+        // 指针捕获失败不影响拖动
+      }
+
+      panning = true;
+      activePointerId = event.pointerId;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      applyCursor();
+    };
+
+    const onPointerMove = (event: PointerEvent) => {
+      if (!panning || activePointerId !== event.pointerId) return;
+
+      const graph = getAliveGraph();
+      if (!graph) {
+        stopPan();
+        return;
+      }
+
+      const dx = event.clientX - lastX;
+      const dy = event.clientY - lastY;
+      lastX = event.clientX;
+      lastY = event.clientY;
+
+      if (dx !== 0 || dy !== 0) {
+        graph.translateBy([dx, dy], false);
+      }
+    };
+
+    const onPointerUp = (event: PointerEvent) => {
+      if (!panning || activePointerId !== event.pointerId) return;
+      stopPan();
+    };
+
+    // 切走窗口 / 失焦时按键不会再触发 keyup，必须立即停止
+    const onBlur = () => {
+      spaceHeld = false;
+      stopPan();
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    container.addEventListener('pointerdown', onPointerDown, true);
+    container.addEventListener('pointermove', onPointerMove);
+    container.addEventListener('pointerup', onPointerUp);
+    container.addEventListener('pointercancel', onPointerUp);
+
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+      container.removeEventListener('pointerdown', onPointerDown, true);
+      container.removeEventListener('pointermove', onPointerMove);
+      container.removeEventListener('pointerup', onPointerUp);
+      container.removeEventListener('pointercancel', onPointerUp);
+      spaceHeld = false;
+      stopPan();
     };
   }, [renderMode]);
 
@@ -1101,7 +1520,8 @@ export const MindMapEditor = forwardRef<MindMapEditorRef, MindMapEditorProps>(fu
             border: `2px solid ${EDGE_VISUAL_TOKENS.stroke}`,
             borderRadius: NODE_VISUAL_TOKENS.radius,
             padding: '10px 18px',
-            fontSize: NODE_VISUAL_TOKENS.fontSize,
+            fontSize: editingFontMetrics?.fontSize ?? NODE_VISUAL_TOKENS.fontSize,
+            fontWeight: editingFontMetrics?.fontWeight ?? NODE_VISUAL_TOKENS.fontWeight,
             lineHeight: NODE_VISUAL_TOKENS.lineHeightMultiplier,
             resize: 'none',
             outline: 'none',

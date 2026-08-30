@@ -7,13 +7,17 @@ import { generateMindMapStream } from '@/lib/llm/generate';
 import type { NormalizedDocument } from '@/lib/types/mindmap';
 import { describe, it, expect } from 'vitest';
 
-const PDF_PATH = '/Users/chenxiaofeng/Downloads/【产品经理_深圳 15-20K】谭艳丽 9年.pdf';
+// Manual benchmark: only runs when BENCH_PDF_PATH is provided, so regular
+// `npm run test` never spawns real OCR python processes, calls the LLM, or
+// depends on machine-local files.
+const PDF_PATH = process.env.BENCH_PDF_PATH;
+const itBench = PDF_PATH ? it : it.skip;
 
 describe('Full pipeline benchmark', () => {
-  it('measures each stage of PDF-to-mindmap', async () => {
-    const pdfBuffer = readFileSync(PDF_PATH);
+  itBench('measures each stage of PDF-to-mindmap', async () => {
+    const pdfBuffer = readFileSync(PDF_PATH as string);
     const base64 = pdfBuffer.toString('base64');
-    const fileName = path.basename(PDF_PATH);
+    const fileName = path.basename(PDF_PATH as string);
 
     console.log(`\n╔══════════════════════════════════════════╗`);
     console.log(`║  Full Pipeline: PDF → MindMap            ║`);

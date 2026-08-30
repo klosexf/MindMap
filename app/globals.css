@@ -778,6 +778,76 @@ a {
   color: var(--color-text);
 }
 
+.home-templates {
+  max-width: 860px;
+  margin: 24px auto 0;
+  text-align: center;
+}
+
+.templates-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.template-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-line);
+  background: var(--color-primary-bg);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease;
+}
+
+.template-card:hover:not(:disabled) {
+  border-color: var(--color-line-strong);
+  background: var(--color-primary-bg-light);
+  transform: translateY(-1px);
+}
+
+.template-card:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.template-card-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.template-card-desc {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.template-card-action {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.template-card:hover:not(:disabled) .template-card-action {
+  color: var(--color-text);
+}
+
+.template-error {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: #b3261e;
+}
+
+@media (max-width: 640px) {
+  .templates-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .cards-grid {
   max-width: 860px;
   margin: 26px auto 0;
@@ -1002,32 +1072,14 @@ a {
   min-height: 0;
   padding-top: 52px;
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 320px;
+  grid-template-columns: minmax(0, 1fr) 320px;
   grid-template-rows: 1fr;
   gap: 0;
 }
 
-.editor-sidecard {
-  border-right: 1px solid var(--color-line);
-  padding: 18px;
-  background: var(--color-primary-bg);
-}
-
-.editor-sidecard h2 {
-  margin: 0;
-  font-size: 14px;
-}
-
-.editor-sidecard ul {
-  margin: 12px 0 0;
-  padding-left: 16px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-  line-height: 1.8;
-}
-
 .editor-canvas-area {
   min-width: 0;
+  position: relative;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1052,6 +1104,353 @@ a {
 .mindmap-canvas {
   flex: 1;
   min-height: 0;
+}
+
+/* ---------- 视图模式：导图 ↔ 文字大纲 ---------- */
+
+/* 两个视图面板常驻挂载，切换只改可见性：保留画布缩放/平移与大纲滚动位置 */
+.canvas-pane {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  animation: pane-fade-in 200ms ease;
+}
+
+.canvas-pane.pane-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+@keyframes pane-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 左上角悬浮模式切换控件（参照 XMind 风格：白色胶囊 + 图标按钮） */
+.view-mode-toggle {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 15;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid var(--color-line);
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(6px);
+  box-shadow: var(--shadow-sm);
+}
+
+.view-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+
+.view-mode-btn svg {
+  flex-shrink: 0;
+}
+
+.view-mode-btn:hover:not(.active) {
+  color: var(--color-text);
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.view-mode-btn.active {
+  color: var(--color-text);
+  background: #ececea;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* ---------- 文字大纲模式：文档化排版 ---------- */
+
+.editor-canvas-area.outline-active {
+  background: #ebebe8;
+}
+
+.outline-pane {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 68px 24px 56px;
+}
+
+.outline-doc {
+  max-width: 760px;
+  margin: 0 auto;
+  min-height: calc(100% - 8px);
+  background: #ffffff;
+  border-radius: 14px;
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.06);
+  padding: 44px 56px 56px;
+  animation: pane-fade-in 200ms ease;
+}
+
+.outline-title {
+  font-size: 32px;
+  font-weight: 800;
+  line-height: 1.3;
+  color: #1f1f1c;
+  margin: 0 0 26px;
+  cursor: text;
+}
+
+.outline-title.editing {
+  cursor: default;
+}
+
+.outline-title-input {
+  width: 100%;
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+.outline-list,
+.outline-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* 子层级：左侧引导竖线（参照示例图的层级参考线） */
+.outline-children {
+  margin-left: 11px;
+  padding-left: 20px;
+  border-left: 1px solid #e4e4de;
+}
+
+.outline-item {
+  margin: 0;
+}
+
+.outline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 8px;
+  margin-left: -8px;
+  border-radius: 6px;
+  cursor: default;
+  transition: background 120ms ease;
+}
+
+.outline-row:hover {
+  background: rgba(0, 0, 0, 0.025);
+}
+
+.outline-row.selected {
+  background: var(--color-primary-bg);
+}
+
+.outline-bullet {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #2f6bff;
+  transform: translateY(-2px);
+}
+
+/* 展开/收起控制按钮：仅带子节点的行渲染；叶子节点用等宽占位保持缩进对齐 */
+.outline-toggle {
+  flex-shrink: 0;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: -4px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #8a8a82;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.outline-toggle:hover {
+  background: rgba(47, 107, 255, 0.1);
+  color: #2f6bff;
+}
+
+.outline-toggle:focus-visible {
+  outline: 2px solid #2f6bff;
+  outline-offset: 1px;
+}
+
+/* 箭头：收起时朝右，展开时旋转 90° 朝下 */
+.outline-toggle svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 220ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.outline-toggle.expanded svg {
+  transform: rotate(90deg);
+}
+
+.outline-toggle-spacer {
+  flex-shrink: 0;
+  align-self: center;
+  width: 14px;
+  margin-left: -4px;
+}
+
+/* 子节点容器：grid-template-rows 0fr ↔ 1fr 实现双向平滑高度过渡；
+   visibility 参与 transition，收起动画结束后才对屏幕阅读器隐藏 */
+.outline-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  visibility: hidden;
+  transition:
+    grid-template-rows 220ms cubic-bezier(0.4, 0, 0.2, 1),
+    visibility 220ms;
+}
+
+.outline-collapse.open {
+  grid-template-rows: 1fr;
+  visibility: visible;
+}
+
+.outline-collapse-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* 减弱动态效果偏好：关闭展开/收起过渡，状态切换立即生效 */
+@media (prefers-reduced-motion: reduce) {
+  .outline-collapse,
+  .outline-collapse.open {
+    transition: none;
+  }
+
+  .outline-toggle svg {
+    transition: none;
+  }
+}
+
+.outline-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #262622;
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.outline-text.placeholder {
+  color: #b5b5ad;
+}
+
+/* 层级排版：一级加粗大字，逐级缩小（参照示例图） */
+.outline-item.level-1 > .outline-row .outline-text {
+  font-size: 19px;
+  font-weight: 700;
+  color: #1f1f1c;
+}
+
+.outline-item.level-1 > .outline-row {
+  margin-top: 18px;
+}
+
+.outline-item.level-2 > .outline-row .outline-text {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.outline-item.level-2 .outline-bullet {
+  width: 6px;
+  height: 6px;
+}
+
+.outline-item.level-3 > .outline-row .outline-text,
+.outline-item.level-4 > .outline-row .outline-text {
+  font-size: 15px;
+  font-weight: 400;
+  color: #3a3a34;
+}
+
+.outline-item.level-3 .outline-bullet,
+.outline-item.level-4 .outline-bullet {
+  width: 6px;
+  height: 6px;
+  background: transparent;
+  border: 1.4px solid #2f6bff;
+}
+
+.outline-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #2f6bff;
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-size: inherit;
+  line-height: 1.6;
+  font-family: inherit;
+  color: var(--color-text);
+  background: #ffffff;
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(47, 107, 255, 0.12);
+}
+
+/* 大纲模式响应式：移动端收窄留白、缩小标题 */
+@media (max-width: 767px) {
+  .view-mode-toggle {
+    top: 10px;
+    left: 10px;
+  }
+
+  .view-mode-label {
+    display: none;
+  }
+
+  .outline-pane {
+    padding: 60px 10px 40px;
+  }
+
+  .outline-doc {
+    padding: 28px 18px 40px;
+    border-radius: 10px;
+  }
+
+  .outline-title {
+    font-size: 24px;
+  }
+
+  .outline-item.level-1 > .outline-row .outline-text {
+    font-size: 17px;
+  }
+
+  .outline-children {
+    padding-left: 14px;
+  }
+}
+
+/* 画布图层（SVG/Canvas）内的节点文字不允许被原生选区选中，
+   避免空格拖拽平移或普通拖动时出现高亮文字。 */
+.mindmap-canvas svg,
+.mindmap-canvas canvas {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .editor-summary-panel {
@@ -1294,78 +1693,133 @@ a {
   left: 0;
   right: 0;
   z-index: 20;
+  height: 52px;
   border-bottom: 1px solid var(--color-line);
   border-radius: 0;
   background: var(--color-bg-panel);
   box-shadow: var(--shadow-sm);
-  backdrop-filter: blur(12px);
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 20px;
+  flex-wrap: nowrap;
+  gap: 4px;
+  padding: 0 16px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.toolbar::-webkit-scrollbar {
+  display: none;
 }
 
 .toolbar-group {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* AI 组：浅色底色块，突出核心能力 */
+.toolbar-group.ai-group {
+  gap: 2px;
+  padding: 3px 6px;
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, #f7f6f1 0%, #f0efe7 100%);
+  border: 1px solid var(--color-line);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.toolbar-group.ai-group .tool-btn {
+  height: 26px;
+  min-height: 26px;
+}
+
+.toolbar-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex-shrink: 0;
+  padding-left: 12px;
 }
 
 .toolbar-divider {
   width: 1px;
   height: 20px;
+  margin: 0 6px;
   background: var(--color-line);
+  flex-shrink: 0;
 }
 
+/* ---------- 按钮：ghost 风格（图标 + 文字） ---------- */
+
 .tool-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
   min-height: 30px;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--color-line);
-  background: #ffffff;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--color-text);
   font-size: 12px;
   font-weight: 500;
-  padding: 0 10px;
+  padding: 0 8px;
+  white-space: nowrap;
   cursor: pointer;
-  transition: all 160ms ease;
+  transition: background 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 80ms ease;
+}
+
+.tool-btn svg {
+  flex-shrink: 0;
+  opacity: 0.85;
 }
 
 .tool-btn:hover:not(:disabled) {
-  border-color: var(--color-line-strong);
+  border-color: transparent;
   background: var(--color-primary-bg);
   color: var(--color-text);
 }
 
 .tool-btn:active:not(:disabled) {
-  border-color: var(--color-line-active);
   background: var(--color-primary-bg-light);
+  transform: scale(0.97);
+}
+
+.tool-btn:focus-visible {
+  outline: 2px solid var(--color-line-strong);
+  outline-offset: 1px;
 }
 
 .tool-btn.primary {
-  border-color: transparent;
+  border-color: var(--color-cta);
   background: var(--color-cta);
   color: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  padding: 0 12px;
+  margin-left: 4px;
 }
 
 .tool-btn.primary:hover:not(:disabled) {
   background: var(--color-cta-hover);
-  border-color: transparent;
+  border-color: var(--color-cta-hover);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.22);
 }
 
 .tool-btn.primary:active:not(:disabled) {
   background: var(--color-cta-active);
+  transform: scale(0.97);
 }
 
 .tool-btn.primary.dirty {
+  border-color: #c88a00;
   background: #c88a00;
   animation: save-pulse 2s ease-in-out infinite;
 }
 
 .tool-btn.primary.dirty:hover:not(:disabled) {
   background: #b07a00;
-  border-color: transparent;
+  border-color: #b07a00;
 }
 
 @keyframes save-pulse {
@@ -1374,35 +1828,169 @@ a {
 }
 
 .tool-btn.danger {
-  border-color: var(--color-danger);
   color: var(--color-danger);
-  background: #ffffff;
+  background: transparent;
 }
 
 .tool-btn.danger:hover:not(:disabled) {
   color: var(--color-danger);
-  border-color: var(--color-danger);
   background: var(--color-danger-bg);
 }
 
 .tool-btn.danger:active:not(:disabled) {
   color: var(--color-danger-active);
-  border-color: var(--color-danger-active);
   background: #ffe8fd;
 }
 
 .tool-btn:disabled {
   color: var(--color-text-disabled);
-  border-color: var(--color-line);
-  background: #ffffff;
+  background: transparent;
   opacity: 1;
   cursor: not-allowed;
 }
 
 .tool-btn.primary:disabled {
-  background: var(--color-primary-bg);
+  background: var(--color-primary-bg-light);
   color: var(--color-text-disabled);
-  border-color: var(--color-line);
+  border-color: transparent;
+}
+
+/* ---------- 布局方向下拉（结构示意图标面板） ---------- */
+
+.tool-dropdown {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.tool-btn .chevron {
+  transition: transform 140ms ease;
+}
+
+.tool-btn .chevron.chevron-open {
+  transform: rotate(180deg);
+}
+
+.layout-menu {
+  position: fixed;
+  z-index: 100;
+  min-width: 178px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-line);
+  background: var(--color-bg-panel);
+  box-shadow: var(--shadow-md);
+  animation: layout-menu-in 140ms ease;
+}
+
+@keyframes layout-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.layout-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.layout-option svg {
+  flex-shrink: 0;
+  color: var(--color-text-secondary);
+}
+
+.layout-option:hover {
+  background: var(--color-primary-bg);
+}
+
+.layout-option.active {
+  background: var(--color-primary-bg-light);
+}
+
+/* 选中项示意图标使用暖橙色，呼应参考图中的强调色 */
+.layout-option.active svg {
+  color: #e8734a;
+}
+
+.layout-option .layout-check {
+  margin-left: auto;
+  color: var(--color-text);
+}
+
+/* ---------- 下拉选择（图标 + select + chevron 融合样式） ---------- */
+
+.tool-select-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  transition: background 140ms ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.tool-select-wrap:hover {
+  background: var(--color-primary-bg);
+}
+
+.tool-select-wrap svg {
+  flex-shrink: 0;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.tool-select-wrap.compact {
+  height: 26px;
+  padding: 0 4px;
+}
+
+.tool-select-wrap.compact .tool-select {
+  font-size: 11px;
+}
+
+.tool-select {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  padding: 0;
+  height: 100%;
+  cursor: pointer;
+  outline: none;
+  max-width: 92px;
+}
+
+.tool-select:disabled {
+  color: var(--color-text-disabled);
+  cursor: not-allowed;
 }
 
 .editor-wrap {
@@ -1505,12 +2093,6 @@ a {
     grid-template-rows: auto;
   }
 
-  .editor-sidecard {
-    border-right: 0;
-    border-bottom: 1px solid var(--color-line);
-    padding: 14px 16px;
-  }
-
   .editor-summary-panel {
     border-left: 0;
     border-top: 1px solid var(--color-line);
@@ -1523,14 +2105,20 @@ a {
   }
 
   .toolbar {
-    padding: 6px 12px;
-    gap: 6px;
+    padding: 0 10px;
+    gap: 2px;
+    height: 48px;
   }
 
   .toolbar .tool-btn {
-    padding: 0 8px;
+    padding: 0 6px;
     font-size: 11px;
+    height: 28px;
     min-height: 28px;
+  }
+
+  .toolbar .toolbar-divider {
+    margin: 0 2px;
   }
 }
 
@@ -1587,8 +2175,9 @@ a {
   }
 
   .toolbar {
-    padding: 6px 10px;
-    gap: 4px;
+    padding: 0 8px;
+    gap: 2px;
+    height: 44px;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
@@ -1598,17 +2187,36 @@ a {
     display: none;
   }
 
+  /* 小屏隐藏文字，仅保留图标 + title 提示 */
+  .toolbar .tool-label {
+    display: none;
+  }
+
   .toolbar .tool-btn {
-    padding: 0 6px;
+    padding: 0 7px;
     font-size: 11px;
+    height: 28px;
     min-height: 28px;
     white-space: nowrap;
     flex-shrink: 0;
   }
 
+  .toolbar .tool-select-wrap {
+    padding: 0 4px;
+  }
+
   .toolbar .tool-select {
     font-size: 11px;
     flex-shrink: 0;
+    max-width: 64px;
+  }
+
+  .toolbar .toolbar-group.ai-group {
+    padding: 2px 3px;
+  }
+
+  .toolbar .toolbar-end {
+    padding-left: 6px;
   }
 
   .editor-workspace {

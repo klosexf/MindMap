@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 
-import { EditorToolbar } from '@/components/editor-toolbar';
+import { EditorToolbar, type AiOptimizeMode } from '@/components/editor-toolbar';
 import { AiSummaryPanel } from '@/components/ai-summary-panel';
 import { MindMapEditor, type MindMapEditorRef } from '@/components/mindmap-editor';
+import { OutlineView } from '@/components/outline-view';
+import { ViewModeToggle, VIEW_MODE_STORAGE_KEY, type EditorViewMode } from '@/components/view-mode-toggle';
 import type { MindMapTree, NodePosition, NormalizedDocument } from '@/lib/types/mindmap';
 import { useMindMapStore } from '@/store/mindmap-store';
 
@@ -53,7 +55,39 @@ export function EditorPage({ id }: EditorPageProps) {
   const setLayoutDirection = useMindMapStore((s) => s.setLayoutDirection);
   const moveNode = useMindMapStore((s) => s.moveNode);
   const updateNodePosition = useMindMapStore((s) => s.updateNodePosition);
-  const balanceLayout = useMindMapStore((s) => s.balanceLayout);
+  const canUndo = useMindMapStore((s) => s.canUndo);
+  const canRedo = useMindMapStore((s) => s.canRedo);
+  const undo = useMindMapStore((s) => s.undo);
+  const redo = useMindMapStore((s) => s.redo);
+  const addAiChildren = useMindMapStore((s) => s.addAiChildren);
+  const replaceTreeKeepHistory = useMindMapStore((s) => s.replaceTreeKeepHistory);
+
+  const [aiExpanding, setAiExpanding] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
+  const [optimizeMode, setOptimizeMode] = useState<AiOptimizeMode>('simplify');
+
+  // 视图模式：导图 ↔ 文字大纲，偏好持久化到 localStorage
+  const [viewMode, setViewMode] = useState<EditorViewMode>('mindmap');
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(VIEW_MODE_STORAGE_KEY);
+      if (saved === 'mindmap' || saved === 'outline') {
+        setViewMode(saved);
+      }
+    } catch {
+      /* localStorage 不可用时保持默认模式 */
+    }
+  }, []);
+
+  const handleViewModeChange = useCallback((mode: EditorViewMode) => {
+    setViewMode(mode);
+    try {
+      window.localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode);
+    } catch {
+      /* 忽略持久化失败，模式切换仍然生效 */
+    }
+  }, []);
 
   const loadTree = useCallback(async () => {
     setLoading(true);
@@ -72,7 +106,7 @@ export function EditorPage({ id }: EditorPageProps) {
       }
       setTree(json.tree);
       setNormalizedDocument(json.normalizedDocument ?? null);
-      setSelectedNode(json.tree.root.id);
+      // 不自动选中根节点：保持默认无选中状态，让方向键画布拖动等无选中交互开箱可用
       savedVersionRef.current = json.tree.meta.version;
       setDirty(false);
     } catch (err) {
@@ -110,12 +144,15 @@ export function EditorPage({ id }: EditorPageProps) {
 
       setSelectedNode(newId);
 
+      // 大纲模式下不唤起画布行内编辑，新节点以「空主题」出现在大纲中，双击即可编辑
+      if (viewMode === 'outline') return;
+
       // Wait for React to commit tree changes and G6 to render the new node
       setTimeout(() => {
         editorRef.current?.startEditingNode(newId, options);
       }, 150);
     },
-    [selectedNodeId, tree, addChildNode, addSiblingNode, setSelectedNode],
+    [selectedNodeId, tree, viewMode, addChildNode, addSiblingNode, setSelectedNode],
   );
 
   const handleAddChild = useCallback(() => addNodeAndEdit('child'), [addNodeAndEdit]);
@@ -190,6 +227,82 @@ export function EditorPage({ id }: EditorPageProps) {
     [saveTreeSnapshot, updateNodePosition],
   );
 
+  const handleAiExpand = useCallback(async () => {
+    if (!tree || !selectedNodeId || aiExpanding || optimizing) return;
+
+    setAiExpanding(true);
+    setNotice('AI 扩展中...');
+    try {
+      const res = await fetch('/api/expand', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tree,
+          nodeId: selectedNodeId,
+          normalizedDocument: normalizedDocument ?? undefined,
+        }),
+      });
+
+      const json = (await res.json().catch(() => ({}))) as {
+        children?: string[];
+        error?: string;
+      };
+      if (!res.ok) {
+        throw new Error(json.error || 'AI 扩展失败');
+      }
+
+      const ids = addAiChildren(selectedNodeId, json.children || []);
+      if (ids.length === 0) {
+        throw new Error('AI 扩展结果为空，请重试或换个节点');
+      }
+
+      setNotice(`AI 扩展完成：新增 ${ids.length} 个子节点`);
+      const nextTree = useMindMapStore.getState().tree;
+      if (nextTree) {
+        void saveTreeSnapshot(nextTree);
+      }
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'AI 扩展失败');
+    } finally {
+      setAiExpanding(false);
+    }
+  }, [tree, selectedNodeId, aiExpanding, optimizing, normalizedDocument, addAiChildren, saveTreeSnapshot]);
+
+  const handleAiOptimize = useCallback(async () => {
+    if (!tree || optimizing || aiExpanding) return;
+
+    setOptimizing(true);
+    setNotice('AI 优化中...');
+    try {
+      const res = await fetch('/api/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tree,
+          mode: optimizeMode,
+          normalizedDocument: normalizedDocument ?? undefined,
+        }),
+      });
+
+      const json = (await res.json().catch(() => ({}))) as {
+        tree?: MindMapTree;
+        error?: string;
+      };
+      if (!res.ok || !json.tree) {
+        throw new Error(json.error || 'AI 优化失败');
+      }
+
+      replaceTreeKeepHistory(json.tree);
+      setSelectedNode(json.tree.root.id);
+      setNotice('AI 优化完成，可用撤销恢复原结构');
+      void saveTreeSnapshot(json.tree);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'AI 优化失败');
+    } finally {
+      setOptimizing(false);
+    }
+  }, [tree, optimizing, aiExpanding, optimizeMode, normalizedDocument, replaceTreeKeepHistory, setSelectedNode, saveTreeSnapshot]);
+
   // Keyboard shortcuts
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent): void {
@@ -200,7 +313,42 @@ export function EditorPage({ id }: EditorPageProps) {
         return;
       }
 
+      // Cmd/Ctrl+Z to undo, Shift+Cmd/Ctrl+Z or Ctrl+Y to redo.
+      // Skipped while inline editing so the native text undo keeps working.
+      // Check the event origin, not document.activeElement: React may flush
+      // state updates (unmounting the inline editor) before this window-level
+      // handler runs, which would make activeElement fall back to <body> and
+      // wrongly trigger global shortcuts for keys typed inside the editor.
+      const target = event.target as HTMLElement | null;
+      const targetTag = target?.tagName?.toLowerCase() || '';
+      const fromEditable =
+        targetTag === 'input' ||
+        targetTag === 'textarea' ||
+        targetTag === 'select' ||
+        target?.isContentEditable === true;
+
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        !event.altKey &&
+        ['z', 'Z', 'y', 'Y'].includes(event.key)
+      ) {
+        if (fromEditable) return;
+        if (!tree) return;
+
+        event.preventDefault();
+        const isRedo = event.shiftKey || event.key === 'y' || event.key === 'Y';
+        if (isRedo) {
+          redo();
+        } else {
+          undo();
+        }
+        return;
+      }
+
       if (!tree || !selectedNodeId) return;
+
+      // 大纲模式下画布节点快捷键（Tab/Enter/Delete）交由大纲行内编辑处理
+      if (viewMode === 'outline') return;
 
       if (event.key === 'Tab') {
         event.preventDefault();
@@ -208,16 +356,14 @@ export function EditorPage({ id }: EditorPageProps) {
       }
 
       if (event.key === 'Enter' && !event.shiftKey && !event.metaKey && !event.ctrlKey) {
-        const activeTag = (document.activeElement?.tagName || '').toLowerCase();
-        if (activeTag === 'input' || activeTag === 'textarea') return;
+        if (fromEditable) return;
 
         event.preventDefault();
         addNodeAndEdit('sibling', { centerInViewport: true });
       }
 
       if (event.key === 'Delete' || event.key === 'Backspace') {
-        const activeTag = (document.activeElement?.tagName || '').toLowerCase();
-        if (activeTag === 'input' || activeTag === 'textarea') return;
+        if (fromEditable) return;
 
         if (selectedNodeId === tree.root.id) return;
         event.preventDefault();
@@ -227,7 +373,7 @@ export function EditorPage({ id }: EditorPageProps) {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [addNodeAndEdit, deleteNode, saveTree, selectedNodeId, tree]);
+  }, [addNodeAndEdit, deleteNode, saveTree, selectedNodeId, tree, undo, redo, viewMode]);
 
   async function exportMarkdown() {
     if (!tree) return;
@@ -272,11 +418,6 @@ export function EditorPage({ id }: EditorPageProps) {
     setNotice('PNG 已导出');
   }
 
-  function renameNode() {
-    if (!tree || !selectedNodeId) return;
-    editorRef.current?.startEditingNode(selectedNodeId);
-  }
-
   if (loading) {
     return (
       <main className="page editor-shell">
@@ -312,24 +453,26 @@ export function EditorPage({ id }: EditorPageProps) {
       </header>
 
       <section className="editor-workspace">
-        <aside className="editor-sidecard">
-          <h2>当前说明</h2>
-          <ul>
-            <li>快捷键：`Tab` 添加子节点</li>
-            <li>快捷键：`Enter` 添加兄弟节点</li>
-            <li>快捷键：`Delete` 删除非根节点</li>
-            <li>快捷键：`Ctrl+S` 保存导图</li>
-            <li>当前选中：{selectedNodeId || '未选择'}</li>
-          </ul>
-        </aside>
-
-        <div className="editor-canvas-area">
+        <div className={`editor-canvas-area${viewMode === 'outline' ? ' outline-active' : ''}`}>
           <EditorToolbar
             selectedNodeId={selectedNodeId}
             layoutDirection={layoutDirection}
             dirty={dirty}
             saving={saving}
-            onRename={renameNode}
+            canUndo={canUndo}
+            canRedo={canRedo}
+            aiExpanding={aiExpanding}
+            optimizing={optimizing}
+            optimizeMode={optimizeMode}
+            onUndo={undo}
+            onRedo={redo}
+            onAiExpand={() => {
+              void handleAiExpand();
+            }}
+            onAiOptimizeModeChange={setOptimizeMode}
+            onAiOptimize={() => {
+              void handleAiOptimize();
+            }}
             onAddChild={handleAddChild}
             onAddSibling={handleAddSibling}
             onToggleCollapse={() => {
@@ -344,21 +487,38 @@ export function EditorPage({ id }: EditorPageProps) {
             onExportMarkdown={exportMarkdown}
             onExportPng={exportPng}
             onLayoutChange={setLayoutDirection}
-            onBalance={balanceLayout}
           />
 
-          <MindMapEditor
-            ref={editorRef}
-            tree={tree}
-            selectedNodeId={selectedNodeId}
-            onSelectNode={setSelectedNode}
-            onUpdateNodeContent={updateNodeContent}
-            layoutDirection={layoutDirection}
-            onMoveNode={moveNode}
-            onUpdateNodePosition={handleUpdateNodePosition}
-            onEditEnd={handleEditEnd}
-            onEnterWithoutText={handleEnterWithoutText}
-          />
+          {/* 左上角悬浮模式切换控件 */}
+          <ViewModeToggle value={viewMode} onChange={handleViewModeChange} />
+
+          {/* 两个视图面板常驻挂载、CSS 切换可见性：
+              保留 G6 画布缩放/平移状态与大纲滚动位置，切换零开销 */}
+          <div className={`canvas-pane${viewMode === 'outline' ? ' pane-hidden' : ''}`}>
+            <MindMapEditor
+              ref={editorRef}
+              tree={tree}
+              selectedNodeId={selectedNodeId}
+              onSelectNode={setSelectedNode}
+              onUpdateNodeContent={updateNodeContent}
+              layoutDirection={layoutDirection}
+              onMoveNode={moveNode}
+              onUpdateNodePosition={handleUpdateNodePosition}
+              onEditEnd={handleEditEnd}
+              onEnterWithoutText={handleEnterWithoutText}
+            />
+          </div>
+
+          <div className={`canvas-pane outline-pane-wrap${viewMode === 'outline' ? '' : ' pane-hidden'}`}>
+            <OutlineView
+              tree={tree}
+              selectedNodeId={selectedNodeId}
+              onSelectNode={setSelectedNode}
+              onUpdateNodeContent={updateNodeContent}
+              onAddChild={(parentId) => addChildNode(parentId, '')}
+              onAddSibling={(nodeId) => addSiblingNode(nodeId, '')}
+            />
+          </div>
         </div>
 
         <AiSummaryPanel tree={tree} normalizedDocument={normalizedDocument} />

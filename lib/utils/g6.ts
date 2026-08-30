@@ -39,6 +39,17 @@ export const NODE_VISUAL_TOKENS = {
   lineWidth: 1.4,
   fontSize: 16,
   fontWeight: 600,
+  // 根节点（导图源头）标题视觉层级：显著更大 + 加粗，确保一眼识别起点
+  rootFontSize: 24,
+  rootFontWeight: 700,
+  // 节点样式分级：一级分支 > 二级节点 > 细节节点（3 层及以下），逐级缩小字号与字重，
+  // 让层级结构无需依赖连线也能被快速读懂；level2 与历史默认值一致，保证旧导图观感不变。
+  level1FontSize: 19,
+  level1FontWeight: 650,
+  level2FontSize: 16,
+  level2FontWeight: 600,
+  detailFontSize: 14,
+  detailFontWeight: 500,
   lineHeightMultiplier: 1.55,
   horizontalPadding: 36,
   verticalPadding: 20,
@@ -486,12 +497,36 @@ function getBranchControlPoints(
   return points;
 }
 
-export function getNodeSize(nodeId: string, label: string, rootId: string): NodeSize {
-  void nodeId;
-  void rootId;
+export function getNodeFontMetricsByDepth(depth: number): { fontSize: number; fontWeight: number } {
+  if (depth <= 0) {
+    return { fontSize: NODE_VISUAL_TOKENS.rootFontSize, fontWeight: NODE_VISUAL_TOKENS.rootFontWeight };
+  }
+  if (depth === 1) {
+    return { fontSize: NODE_VISUAL_TOKENS.level1FontSize, fontWeight: NODE_VISUAL_TOKENS.level1FontWeight };
+  }
+  if (depth === 2) {
+    return { fontSize: NODE_VISUAL_TOKENS.level2FontSize, fontWeight: NODE_VISUAL_TOKENS.level2FontWeight };
+  }
+  return { fontSize: NODE_VISUAL_TOKENS.detailFontSize, fontWeight: NODE_VISUAL_TOKENS.detailFontWeight };
+}
+
+export function getNodeFontMetrics(
+  nodeId: string,
+  rootId: string,
+  depth?: number,
+): { fontSize: number; fontWeight: number } {
+  if (nodeId === rootId) {
+    return { fontSize: NODE_VISUAL_TOKENS.rootFontSize, fontWeight: NODE_VISUAL_TOKENS.rootFontWeight };
+  }
+  if (depth === undefined) {
+    return { fontSize: NODE_VISUAL_TOKENS.fontSize, fontWeight: NODE_VISUAL_TOKENS.fontWeight };
+  }
+  return getNodeFontMetricsByDepth(depth);
+}
+
+export function getNodeSize(nodeId: string, label: string, rootId: string, depth?: number): NodeSize {
   const text = label || '';
-  const fontSize = NODE_VISUAL_TOKENS.fontSize;
-  const fontWeight = NODE_VISUAL_TOKENS.fontWeight;
+  const { fontSize, fontWeight } = getNodeFontMetrics(nodeId, rootId, depth);
   const lineHeight = fontSize * NODE_VISUAL_TOKENS.lineHeightMultiplier;
   const horizontalPadding = NODE_VISUAL_TOKENS.horizontalPadding;
   const verticalPadding = NODE_VISUAL_TOKENS.verticalPadding;
@@ -569,9 +604,56 @@ export function getEdgeRenderStyle(edge: Pick<EdgeData, 'type' | 'style'>) {
   };
 }
 
+export const COLLAPSE_BADGE_TOKENS = {
+  backgroundFill: '#8A867E',
+  fill: '#FFFFFF',
+  fontSize: 12,
+  fontWeight: 600,
+  padding: [2, 6] as [number, number],
+  backgroundRadius: 9,
+  offsetX: 12,
+  offsetY: 0,
+} as const;
+
+function getBadgePlacement(direction: LayoutDirection): 'top' | 'right' | 'bottom' | 'left' {
+  switch (direction) {
+    case 'RL':
+      return 'left';
+    case 'TB':
+      return 'bottom';
+    case 'BT':
+      return 'top';
+    case 'LR':
+    default:
+      return 'right';
+  }
+}
+
+/**
+ * 折叠节点：子树不进图数据（渲染层剪枝），同时记录被折叠的直接子节点数，
+ * 供节点徽标显示「折叠了多少个子节点」。
+ */
+function pruneCollapsedHierarchy(
+  node: HierarchyNode,
+  collapsedChildCounts: Map<string, number>,
+): HierarchyNode {
+  if (node.collapsed) {
+    collapsedChildCounts.set(node.id, node.children.length);
+    return { ...node, children: [] };
+  }
+
+  if (node.children.length === 0) return node;
+  return {
+    ...node,
+    children: node.children.map((child) => pruneCollapsedHierarchy(child, collapsedChildCounts)),
+  };
+}
+
 export function toG6GraphData(tree: MindMapTree, direction: LayoutDirection = 'LR'): GraphData {
-  const hierarchy = toHierarchyNode(tree.root);
+  const collapsedChildCounts = new Map<string, number>();
+  const hierarchy = pruneCollapsedHierarchy(toHierarchyNode(tree.root), collapsedChildCounts);
   const portConfig = getPortConfig(direction);
+  const badgePlacement = getBadgePlacement(direction);
   const childCounts = new Map<string, number>();
   collectChildCounts(hierarchy, childCounts);
   const graph = treeToGraphData(hierarchy, {
@@ -583,7 +665,8 @@ export function toG6GraphData(tree: MindMapTree, direction: LayoutDirection = 'L
         position?: { x: number; y: number };
         children?: string[];
       };
-      const size = getNodeSize(data.id, data.content || '', tree.root.id);
+      const size = getNodeSize(data.id, data.content || '', tree.root.id, depth);
+      const collapsedCount = collapsedChildCounts.get(data.id) ?? 0;
       const nodeData: NodeData = {
         id: data.id,
         depth,
@@ -591,11 +674,39 @@ export function toG6GraphData(tree: MindMapTree, direction: LayoutDirection = 'L
         data: {
           label: data.content || '',
           collapsed: Boolean(data.collapsed),
+          collapsedChildCount: collapsedCount,
+          _depth: depth,
           _width: size.width,
           _height: size.height,
         },
         style: {
           collapsed: Boolean(data.collapsed),
+          ...(collapsedCount > 0
+            ? {
+                badge: true,
+                badges: [
+                  {
+                    text: String(collapsedCount),
+                    placement: badgePlacement,
+                    background: true,
+                    backgroundFill: COLLAPSE_BADGE_TOKENS.backgroundFill,
+                    backgroundRadius: COLLAPSE_BADGE_TOKENS.backgroundRadius,
+                    padding: COLLAPSE_BADGE_TOKENS.padding,
+                    fill: COLLAPSE_BADGE_TOKENS.fill,
+                    fontSize: COLLAPSE_BADGE_TOKENS.fontSize,
+                    fontWeight: COLLAPSE_BADGE_TOKENS.fontWeight,
+                    offsetX:
+                      direction === 'TB' || direction === 'BT'
+                        ? 0
+                        : COLLAPSE_BADGE_TOKENS.offsetX,
+                    offsetY:
+                      direction === 'TB' || direction === 'BT'
+                        ? COLLAPSE_BADGE_TOKENS.offsetX
+                        : COLLAPSE_BADGE_TOKENS.offsetY,
+                  },
+                ],
+              }
+            : {}),
           port: true,
           ports: [
             {

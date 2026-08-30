@@ -6,6 +6,7 @@ import {
   EDGE_VISUAL_TOKENS,
   getEdgeRenderStyle,
   getEdgeRenderType,
+  getNodeFontMetrics,
   getNodeSize,
   NODE_VISUAL_TOKENS,
   toG6GraphData,
@@ -170,15 +171,33 @@ function singleWordTree(): MindMapTree {
 }
 
 describe('toG6GraphData node positions', () => {
-  it('uses the same rounded-card sizing model for root nodes, phrase nodes, and single-word nodes', () => {
+  it('renders the root node title with a significantly larger, bolder font than every other node', () => {
+    const rootFont = getNodeFontMetrics('root', 'root');
+    const childFont = getNodeFontMetrics('child', 'root');
+
+    expect(rootFont.fontSize).toBe(NODE_VISUAL_TOKENS.rootFontSize);
+    expect(rootFont.fontWeight).toBe(NODE_VISUAL_TOKENS.rootFontWeight);
+    expect(rootFont.fontSize).toBeGreaterThan(childFont.fontSize * 1.3);
+    expect(rootFont.fontWeight).toBeGreaterThan(childFont.fontWeight);
+    expect(childFont.fontSize).toBe(NODE_VISUAL_TOKENS.fontSize);
+    expect(childFont.fontWeight).toBe(NODE_VISUAL_TOKENS.fontWeight);
+  });
+
+  it('sizes the root node box larger than an identical non-root node so the emphasized title fits', () => {
     const rootPhrase = getNodeSize('root', '积分生态+数字消费营销', 'root');
+    const childPhrase = getNodeSize('child', '积分生态+数字消费营销', 'root');
+
+    expect(rootPhrase.width).toBeGreaterThan(childPhrase.width);
+    expect(rootPhrase.height).toBeGreaterThanOrEqual(childPhrase.height);
+  });
+
+  it('uses the same rounded-card sizing model for non-root phrase nodes and single-word nodes', () => {
     const childPhrase = getNodeSize('child', '积分生态+数字消费营销', 'root');
     const singleWord = getNodeSize('child', '营销', 'root');
 
-    expect(rootPhrase).toEqual(childPhrase);
     expect(singleWord.height).toBe(NODE_VISUAL_TOKENS.minNodeHeight);
     expect(singleWord.width).toBeGreaterThanOrEqual(NODE_VISUAL_TOKENS.minNodeWidth);
-    expect(singleWord.width).toBeLessThan(rootPhrase.width);
+    expect(singleWord.width).toBeLessThan(childPhrase.width);
   });
 
   it('maps persisted node positions into G6 style coordinates', () => {

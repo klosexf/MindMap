@@ -10,3 +10,17 @@ dist
 .env.test.local
 .env.production.local
 *.log
+
+# 调试截图与缓存
+tests/screenshots/
+.cache/
+
+# 临时调试文件
+tmp-*.cjs
+tmp-*.json
+
+# 构建缓存
+*.tsbuildinfo
+
+# 运行时导图数据
+data/mindmaps/

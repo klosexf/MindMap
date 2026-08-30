@@ -1,5 +1,6 @@
 import { GenerateForm } from '@/components/generate-form';
 import { SavedMindMaps } from '@/components/saved-mindmaps';
+import { TemplateGallery } from '@/components/template-gallery';
 
 export default function HomePage() {
   return (
@@ -31,6 +32,8 @@ export default function HomePage() {
         <section className="home-input-block">
           <GenerateForm />
         </section>
+
+        <TemplateGallery />
 
         <section className="home-examples" aria-label="快速示例">
           <p className="examples-label">试试这些：</p>

@@ -32,6 +32,35 @@ import {
   generateWeChatMindMapViaZhipuWebSearch,
   generateWeChatMindMapViaHunyuan,
 } from '@/lib/wechat/client';
+import {
+  PAGE_LABEL_RE,
+  cleanMarkdownForLLM,
+  cleanMarkdownText,
+  isGarbledText,
+  isLikelyNoisyMixedText,
+  isReadableSentence,
+  sanitizeSentence,
+} from '@/lib/llm/text-clean';
+import {
+  ANTI_HALLUCINATION_SYSTEM,
+  BRANCH_EXPANSION_SYSTEM,
+  DOCUMENT_SUMMARY_SYSTEM,
+  MARKDOWN_SUMMARY_SYSTEM,
+  TREE_OPTIMIZE_SYSTEM,
+  buildBranchExpansionPrompt,
+  buildCompatJsonPrompt,
+  buildMarkdownPreviewPrompt,
+  buildPrompt,
+  buildTreeOptimizePrompt,
+  resolveModelProfile,
+  type BranchExpansionInput,
+  type TreeOptimizeMode,
+  type TreeOptimizationInput,
+} from '@/lib/llm/prompts';
+
+// Prompt 资产的公共出口（测试与路由经 generate.ts 统一引用）
+export { buildPrompt, buildCompatJsonPrompt, buildMarkdownPreviewPrompt };
+export type { BranchExpansionInput, TreeOptimizeMode, TreeOptimizationInput };
 
 export type GenerateStreamEvent =
   | { type: 'skeleton'; data: { tree: MindMapTree } }
@@ -283,491 +312,6 @@ function createHeuristicNode(
   };
 }
 
-function cleanMarkdownText(text: string): string {
-  return text
-    .replace(/^#{1,6}\s+.*$/gm, '')
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/**
- * Clean markdown for LLM input: remove garbled/OCR-noise lines while
- * preserving readable content and document structure (headings, etc).
- *
- * Key design: instead of discarding entire noisy lines (which loses valid
- * CJK text mixed with OCR noise), we try to extract readable sub-segments.
- */
-function cleanMarkdownForLLM(markdown: string): string {
-  const lines = markdown.split('\n');
-  const result: string[] = [];
-  let totalContentLines = 0;
-  let totalKeptLines = 0;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    // Keep empty lines (paragraph separators)
-    if (!trimmed) {
-      result.push('');
-      continue;
-    }
-
-    // Keep markdown headings
-    if (/^#{1,6}\s+/.test(trimmed)) {
-      const headingText = trimmed.replace(/^#{1,6}\s+/, '').trim();
-      if (PAGE_LABEL_RE.test(headingText)) {
-        continue;
-      }
-      if (/\.(pdf|doc|docx|txt|md|ppt|pptx|xlsx|xls|html)$/i.test(headingText)) {
-        continue;
-      }
-      result.push(trimmed);
-      continue;
-    }
-
-    if (/^---$/.test(trimmed) || /^\[(?:page|ocr-page):\d+\]$/.test(trimmed)) {
-      continue;
-    }
-
-    if (/\.(pdf|doc|docx|txt|md|ppt|pptx|xlsx|xls|html)$/i.test(trimmed) || /[^\n]{8,60}\.(pdf|doc|docx)\b/i.test(trimmed)) {
-      continue;
-    }
-
-    totalContentLines++;
-
-    // Strip common punctuation for analysis
-    const analysisText = trimmed
-      .replace(/[,;:|.!?，。！？、：；|｜\-—–()（）\[\]【】{}\/\\]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // If the line has enough CJK content (>=20%), it's likely readable — keep as-is
-    const cjkChars = (analysisText.match(/[\u3400-\u9fff]/g) || []).length;
-    const totalNonSpace = analysisText.replace(/\s/g, '').length;
-    if (totalNonSpace > 0 && cjkChars / totalNonSpace >= 0.2) {
-      const compacted = sanitizeSentence(trimmed);
-      const candidate = compacted || trimmed;
-      const candidateTokens = candidate.split(/\s+/).filter(Boolean);
-      const noiseTokenCount = candidateTokens.filter((token) => isLikelyNoiseToken(token, true)).length;
-      const hasHeavyNoise = candidateTokens.length >= 4 && noiseTokenCount / candidateTokens.length > 0.45;
-
-      result.push(hasHeavyNoise ? compacted || trimmed : candidate);
-      totalKeptLines++;
-      continue;
-    }
-
-    // If the line is short and mostly numbers/dates/phones, keep it
-    const digitAndPunct = (analysisText.match(/[\d\s\-/:.]/g) || []).length;
-    if (totalNonSpace > 0 && digitAndPunct / analysisText.length >= 0.7 && analysisText.length < 80) {
-      result.push(trimmed);
-      totalKeptLines++;
-      continue;
-    }
-
-    // Check if the line contains ANY meaningful CJK content mixed with noise.
-    // If so, try to extract readable segments instead of discarding the whole line.
-    if (cjkChars >= 3) {
-      const extracted = extractReadableSegmentsFromLine(trimmed);
-      if (extracted) {
-        result.push(extracted);
-        totalKeptLines++;
-        continue;
-      }
-    }
-
-    // Check for garbled text using existing detector
-    if (isGarbledText(analysisText)) {
-      continue; // Skip this line
-    }
-
-    // Filter out lines that are dominated by long numeric IDs / phone numbers
-    // These are common in OCR noise from forms and PDF headers
-    const tokens = analysisText.split(/\s+/).filter(Boolean);
-    if (tokens.length >= 3) {
-      const hasCjkContext = tokens.some((t) => CJK_CHAR_RE.test(t));
-      const noiseTokens = tokens.filter((t) => isLikelyNoiseToken(t, hasCjkContext)).length;
-      // Also count standalone long-number tokens as noise
-      const longNumericTokens = tokens.filter((t) => /^\d{7,}$/.test(t)).length;
-      const totalNoise = noiseTokens + longNumericTokens;
-      // If more than 50% of tokens are noise (including long numbers), skip
-      if (totalNoise / tokens.length > 0.5) {
-        continue;
-      }
-    }
-
-    result.push(trimmed);
-    totalKeptLines++;
-  }
-
-  const cleaned = result.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-
-  // Safety net: if we filtered out too aggressively (>70% of content lines dropped),
-  // fall back to a lighter cleaning that only removes clearly-garbled tokens
-  if (totalContentLines > 2 && totalKeptLines / totalContentLines < 0.3) {
-    return lightCleanMarkdown(markdown);
-  }
-
-  return cleaned;
-}
-
-/**
- * Attempt to extract readable sub-segments from a noisy OCR line that contains
- * both real CJK text and garbage. Splits on boundaries and keeps segments that
- * pass readability checks.
- */
-function extractReadableSegmentsFromLine(line: string): string | null {
-  // Split the line into segments on common delimiters that separate logical units
-  // OCR often outputs: [garble] [real content] [garble] | [more content] [garble]
-  const segments = line.split(/(\s*[|｜]\s*|\s{2,}|\s+(?=[\u3400-\u9fff])|(?<=[\u3400-\u9fff])\s+)/);
-
-  const keptSegments: string[] = [];
-
-  for (const seg of segments) {
-    const trimmedSeg = seg.trim();
-    if (!trimmedSeg || trimmedSeg.length < 2) continue;
-
-    // Analyze segment quality
-    const segAnalysis = trimmedSeg
-      .replace(/[,;:|.!?，。！？、：；\-—–()（）\[\]【】{}\/\\]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    const segCJK = (segAnalysis.match(/[\u3400-\u9fff]/g) || []).length;
-    const segTotal = segAnalysis.replace(/\s/g, '').length;
-
-    // Keep segments with good CJK ratio or short clean segments
-    if (segTotal > 0 && segCJK / segTotal >= 0.25) {
-      keptSegments.push(trimmedSeg);
-      continue;
-    }
-
-    // Short numeric/date-like segments
-    if (trimmedSeg.length < 30 && /^[\d\s\-/:.+@]+$/.test(trimmedSeg.replace(/[()（）]/g, ''))) {
-      keptSegments.push(trimmedSeg);
-      continue;
-    }
-
-    // Extract numeric sub-segments from mixed segments (e.g. "REE 1993.07.04" → "1993.07.04")
-    const numericParts = segAnalysis.split(/\s+/).filter((p) => isNumericToken(p));
-    if (numericParts.length > 0) {
-      keptSegments.push(...numericParts);
-      // If segment has no CJK at all, numeric parts are all we can salvage
-      if (segCJK === 0) continue;
-    }
-
-    // Segment with any CJK and not detected as garbled
-    if (segCJK >= 1 && !isGarbledText(segAnalysis)) {
-      keptSegments.push(trimmedSeg);
-      continue;
-    }
-
-    // Pure ASCII segment: drop if every token looks like noise
-    if (segCJK === 0) {
-      const segTokens = segAnalysis.split(/\s+/).filter(Boolean);
-      if (segTokens.length === 0) continue;
-      const noiseCount = segTokens.filter((t) => isLikelyNoiseToken(t, false)).length;
-      if (noiseCount === segTokens.length) {
-        continue; // All tokens are noise — drop the segment
-      }
-      // Partially clean: keep conservatively
-      keptSegments.push(trimmedSeg);
-    }
-  }
-
-  if (keptSegments.length === 0) return null;
-  if (keptSegments.length === 1) return keptSegments[0].length >= 4 ? keptSegments[0] : null;
-
-  // Join kept segments with spaces
-  const joined = keptSegments.join(' ');
-  return joined.length >= 4 ? joined : null;
-}
-
-/**
- * Lighter cleaning pass used as fallback when aggressive filtering removed too much.
- * Only removes obviously garbled tokens/sentences, preserves most content.
- */
-function lightCleanMarkdown(markdown: string): string {
-  const lines = markdown.split('\n');
-  const result: string[] = [];
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      result.push('');
-      continue;
-    }
-
-    // Always keep headings (except page-label headings)
-    if (/^#{1,6}\s+/.test(trimmed)) {
-      const headingText = trimmed.replace(/^#{1,6}\s+/, '').trim();
-      if (PAGE_LABEL_RE.test(headingText)) {
-        continue;
-      }
-      result.push(trimmed);
-      continue;
-    }
-
-    if (/^---$/.test(trimmed) || /^\[(?:page|ocr-page):\d+\]$/.test(trimmed)) {
-      continue;
-    }
-
-    // Apply sanitizeSentence which does per-token cleaning
-    const sanitized = sanitizeSentence(trimmed);
-    if (sanitized && sanitized.length >= 2 && !isGarbledText(sanitized)) {
-      result.push(sanitized);
-    } else if (trimmed.length >= 2) {
-      // Even if garbled, try keeping original for LLM to make sense of
-      const hasAnyCJK = /[\u3400-\u9fff]/.test(trimmed);
-      if (hasAnyCJK) {
-        result.push(trimmed);
-      }
-    }
-  }
-
-  return result.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-}
-
-const CJK_CHAR_RE = /[\u3400-\u9fff]/;
-const ASCII_TOKEN_ALLOWLIST = new Set(['AI', 'AIGC', 'API', 'APP', 'B2B', 'B2C', 'KPI', 'OKR', 'PDF', 'SQL', 'UI', 'UX']);
-
-function normalizeToken(token: string): string {
-  return token.replace(/^[^\p{L}\p{N}\u3400-\u9fff]+|[^\p{L}\p{N}\u3400-\u9fff]+$/gu, '');
-}
-
-function isNumericToken(token: string): boolean {
-  return /^[\d]+([./:\-][\d]+)*$/.test(token);
-}
-
-function collapseCjkSpacing(text: string): string {
-  let output = text;
-  let prev = '';
-  while (output !== prev) {
-    prev = output;
-    output = output.replace(/([\u3400-\u9fff])\s+([\u3400-\u9fff])/g, '$1$2');
-  }
-  return output;
-}
-
-function isLikelyNoiseToken(token: string, hasCjkContext: boolean): boolean {
-  if (!token) return true;
-  if (token.length > 18) return true;
-  if (/[A-Za-z]/.test(token) && /\d/.test(token) && token.length >= 8) return true;
-  if (/[_@]/.test(token) && token.length >= 6) return true;
-  if (/([A-Za-z])\1{4,}/.test(token)) return true;
-
-  // Long numeric sequences (phone numbers, IDs, form codes) are noise
-  // unless they look like plausible dates or short counts
-  if (/^\d+$/.test(token) && token.length >= 7) {
-    // Allow common date-like patterns: YYYY, YYYYMM, YYYYMMDD, MMDD
-    if (/^(19|20)\d{2}([01]\d)?([0-3]\d)?$/.test(token)) return false;
-    if (/^[0-3]?\d[0-3]?\d$/.test(token) && token.length <= 4) return false;
-    // Everything else 7+ digits is likely an ID/phone/form code → noise
-    return true;
-  }
-
-  const upper = token.toUpperCase();
-  const allUpperAscii = /^[A-Z]{3,}$/.test(token);
-  if (allUpperAscii && !ASCII_TOKEN_ALLOWLIST.has(upper)) return true;
-
-  if (/^[A-Za-z]{2,}$/.test(token)) {
-    const vowelCount = (token.match(/[aeiou]/gi) || []).length;
-    const vowelRatio = vowelCount / token.length;
-    // Extremely low vowel ratio → garbled regardless of CJK context
-    if (vowelRatio < 0.15 && token.length >= 4) {
-      return true;
-    }
-    // 4+ consecutive consonants → garbled regardless of CJK context
-    const consonantClusters = token.match(/[bcdfghjklmnpqrstvwxyz]{4,}/gi) || [];
-    if (consonantClusters.length > 0) {
-      return true;
-    }
-    // Only apply strict upper-case check when there IS a CJK context
-    if (hasCjkContext) {
-      const upperChars = (token.match(/[A-Z]/g) || []).length;
-      const upperRatio = upperChars / token.length;
-      if (upperRatio >= 0.6 && !ASCII_TOKEN_ALLOWLIST.has(upper)) {
-        return true;
-      }
-    }
-  }
-
-  if (/[A-Za-z]/.test(token) && /\d/.test(token) && token.length >= 5) {
-    const letterCount = (token.match(/[A-Za-z]/g) || []).length;
-    const digitCount = (token.match(/\d/g) || []).length;
-    if (letterCount >= 3 && digitCount >= 2 && !/^[A-Za-z]+\d+$/.test(token) && !/^\d+[A-Za-z]+$/.test(token)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-/**
- * Detect whether a CJK token looks like garbled/noisy text.
- * Garbled OCR output often produces CJK strings that don't contain any
- * recognizable words or meaningful patterns — just random characters mashed together.
- */
-function isGarbledCjkToken(token: string): boolean {
-  if (!CJK_CHAR_RE.test(token)) return false;
-  if (token.length < 4) return false;
-
-  // Very long CJK tokens without any common punctuation or structure are suspicious
-  if (token.length >= 12) {
-    // Check for common Chinese function words that indicate real text
-    const hasFunctionWord = /的|是|在|和|了|有|不|这|为|与|对|以|到|从|及|等|中|上|下|人|大|小|好|用|进行|通过|可以|需要|应该|能够/.test(token);
-    if (!hasFunctionWord) return true;
-  }
-
-  // CJK tokens with repeated characters are often OCR errors
-  if (/(.)\1{2,}/.test(token)) return true;
-
-  return false;
-}
-
-function shouldKeepAsciiTokenInCjkContext(token: string): boolean {
-  const upper = token.toUpperCase();
-  if (ASCII_TOKEN_ALLOWLIST.has(upper)) return true;
-  if (isNumericToken(token)) return true;
-
-  if (token.length < 5) return false;
-  if (!/^[a-z]+$/.test(token)) return false;
-  if (!/[aeiou]/.test(token)) return false;
-  if (isLikelyNoiseToken(token, true)) return false;
-  return true;
-}
-
-function isGarbledText(text: string): boolean {
-  if (!text || text.length < 5) return false;
-
-  const tokens = text.split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return false;
-
-  let garbledCount = 0;
-  for (const token of tokens) {
-    if (/^[A-Za-z]+$/.test(token)) {
-      const vowelCount = (token.match(/[aeiou]/gi) || []).length;
-      const vowelRatio = vowelCount / token.length;
-      if (vowelRatio < 0.15 && token.length >= 4) {
-        garbledCount++;
-        continue;
-      }
-      const consonantClusters = token.match(/[bcdfghjklmnpqrstvwxyz]{4,}/gi) || [];
-      if (consonantClusters.length > 0) {
-        garbledCount++;
-        continue;
-      }
-    }
-    if (/[A-Z]{3,}/.test(token) && /[a-z]/.test(token)) {
-      const upperRatio = (token.match(/[A-Z]/g) || []).length / token.length;
-      if (upperRatio > 0.5) {
-        garbledCount++;
-      }
-    }
-  }
-
-  return garbledCount / tokens.length >= 0.4;
-}
-
-function sanitizeSentence(sentence: string): string {
-  const normalizedTokens = sentence
-    .split(/\s+/)
-    .map((token) => normalizeToken(token))
-    .filter(Boolean);
-
-  const hasCjkContext = normalizedTokens.some((token) => CJK_CHAR_RE.test(token));
-  const keptTokens = normalizedTokens.filter((token) => {
-    // Preserve ALL CJK tokens in general sanitization — they're almost always
-    // legitimate content. Garbled CJK detection should only happen at the
-    // final tree-node level where we have more context.
-    if (CJK_CHAR_RE.test(token)) return true;
-    if (isLikelyNoiseToken(token, hasCjkContext)) return false;
-    if (!hasCjkContext) {
-      // Without CJK context, still filter: keep numbers, allowlist, and
-      // normal-looking English words (have lowercase + vowels)
-      if (isNumericToken(token)) return true;
-      if (ASCII_TOKEN_ALLOWLIST.has(token.toUpperCase())) return true;
-      const hasLowercase = /[a-z]/.test(token);
-      const hasVowel = /[aeiou]/i.test(token);
-      return hasLowercase && hasVowel;
-    }
-    return shouldKeepAsciiTokenInCjkContext(token);
-  });
-
-  const merged = collapseCjkSpacing(keptTokens.join(' '))
-    .replace(/\s+([,.;:!?，。！？、：；）\]】])/g, '$1')
-    .replace(/([（(\[【])\s+/g, '$1')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-
-  return merged;
-}
-
-function isReadableSentence(sentence: string): boolean {
-  if (!sentence) return false;
-  
-  if (isGarbledText(sentence)) return false;
-
-  const cjkChars = sentence.match(/[\u3400-\u9fff]/g)?.length ?? 0;
-  const totalChars = sentence.replace(/\s/g, '').length;
-  if (cjkChars >= 2) {
-    const cjkRatio = cjkChars / totalChars;
-    if (cjkRatio >= 0.3) return true;
-  }
-
-  const tokens = sentence
-    .split(/\s+/)
-    .map((token) => normalizeToken(token))
-    .filter(Boolean);
-
-  const asciiAlphaTokens = tokens.filter((token) => /[A-Za-z]/.test(token));
-  if (asciiAlphaTokens.length < 3) return false;
-
-  const lowercaseChars = sentence.match(/[a-z]/g)?.length ?? 0;
-  const uppercaseTokens = asciiAlphaTokens.filter((token) => /^[A-Z]{2,}$/.test(token)).length;
-  const uppercaseRatio = uppercaseTokens / asciiAlphaTokens.length;
-  const noVowelLongTokenRatio =
-    asciiAlphaTokens.filter((token) => token.length >= 6 && !/[aeiou]/i.test(token)).length / asciiAlphaTokens.length;
-
-  if (lowercaseChars < 3 && uppercaseRatio >= 0.5) return false;
-  if (uppercaseRatio >= 0.75) return false;
-  if (noVowelLongTokenRatio >= 0.4) return false;
-
-  const asciiWords = sentence
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => /^[A-Za-z][A-Za-z-]*$/.test(token));
-  return asciiWords.length >= 3;
-}
-
-function isLikelyNoisyMixedText(text: string): boolean {
-  if (!text) return false;
-
-  const tokens = text
-    .split(/\s+/)
-    .map((token) => normalizeToken(token))
-    .filter(Boolean);
-  if (tokens.length === 0) return false;
-
-  const cjkTokenCount = tokens.filter((token) => CJK_CHAR_RE.test(token)).length;
-  if (cjkTokenCount === 0) return false;
-
-  const asciiTokens = tokens.filter((token) => /^[A-Za-z]+$/.test(token));
-  if (asciiTokens.length < 4) return false;
-
-  const suspiciousAscii = asciiTokens.filter((token) => {
-    const upper = token.toUpperCase();
-    if (ASCII_TOKEN_ALLOWLIST.has(upper)) return false;
-    if (token.length <= 2) return true;
-    if (isLikelyNoiseToken(token, true)) return true;
-    if (token.length <= 4 && !/[aeiou]/i.test(token)) return true;
-    return false;
-  }).length;
-
-  return suspiciousAscii / asciiTokens.length >= 0.5;
-}
-
 function sanitizeTreeNodeForOutput(node: MindMapNode): MindMapNode[] {
   const sanitizedChildren = (node.children || []).flatMap((child) => sanitizeTreeNodeForOutput(child));
   const content = sanitizeSentence(node.content) || node.content.trim();
@@ -908,8 +452,74 @@ function normalizeExpansionSentenceKey(text: string): string {
     .toLowerCase();
 }
 
+const GENERIC_CONTAINER_LABEL_RE = /^(明细|详情|细节|附录|补充|其他|说明|正文|内容|概要|要点|备注)/;
+
+function isGenericContainerLabel(text: string): boolean {
+  return GENERIC_CONTAINER_LABEL_RE.test(text.trim());
+}
+
+/**
+ * 将容器型分支（如「明细」「详情」）下「标签：值」形式的子节点，
+ * 迁移到与标签匹配的一级类别叶节点下，避免类别节点空心化。
+ */
+function redistributeContainerDetails(topChildren: MindMapNode[]): MindMapNode[] {
+  const targets = topChildren.filter(
+    (child) => (child.children || []).length === 0 && isCategoryLikeLabel(child.content),
+  );
+  if (targets.length === 0) return topChildren;
+
+  const movedByTargetId = new Map<string, MindMapNode[]>();
+
+  const nextChildren = topChildren.flatMap((branch): MindMapNode[] => {
+    const grandChildren = branch.children || [];
+    if (grandChildren.length === 0 || !isGenericContainerLabel(branch.content)) return [branch];
+
+    const kept: MindMapNode[] = [];
+    for (const child of grandChildren) {
+      const childKey = normalizeExpansionSentenceKey(child.content);
+      const target = childKey
+        ? targets.find((item) => {
+            const labelKey = normalizeExpansionSentenceKey(item.content);
+            return Boolean(labelKey) && childKey !== labelKey && childKey.startsWith(labelKey);
+          })
+        : undefined;
+
+      if (target) {
+        const bucket = movedByTargetId.get(target.id) ?? [];
+        bucket.push(child);
+        movedByTargetId.set(target.id, bucket);
+      } else {
+        kept.push(child);
+      }
+    }
+
+    if (kept.length === grandChildren.length) return [branch];
+    if (kept.length === 0) return [];
+    return [{ ...branch, children: kept }];
+  });
+
+  if (movedByTargetId.size === 0) return topChildren;
+
+  return nextChildren.map((branch) => {
+    const moved = movedByTargetId.get(branch.id);
+    if (!moved || moved.length === 0) return branch;
+    return { ...branch, children: [...(branch.children || []), ...moved] };
+  });
+}
+
 function ensureFirstLayerDetails(tree: MindMapTree, doc: NormalizedDocument): MindMapTree {
-  const topChildren = tree.root.children || [];
+  const initialChildren = redistributeContainerDetails(tree.root.children || []);
+  if (initialChildren.length === 0) return tree;
+
+  const treeWithRedistribution: MindMapTree = {
+    ...tree,
+    root: {
+      ...tree.root,
+      children: initialChildren,
+    },
+  };
+
+  const topChildren = treeWithRedistribution.root.children || [];
   if (topChildren.length === 0) return tree;
 
   const pool = collectChunkSentences(doc);
@@ -1629,8 +1239,6 @@ export function preferDocumentTitleForRoot(tree: MindMapTree, documentTitle?: st
   };
 }
 
-const PAGE_LABEL_RE = /^(Page\s+\d+|OCR\s+Page\s+\d+|OCR\s+第\d+页|page:\d+|ocr-page:\d+|第\d+页)$/i;
-
 function titleFromChunk(text: string, index: number): string {
   const heading = text
     .split(/\n+/)
@@ -1903,518 +1511,6 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
   return mindMapTreeSchema.parse(splitOversizedNodeContent(expanded));
 }
 
-const ANTI_HALLUCINATION_SYSTEM = [
-  '你是一名结构化信息提炼专家，不是创作助手。',
-  '你的唯一工作是从用户提供的文档中精准提炼信息并组织为思维导图结构。',
-  '',
-  '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-  '## 核心方法论：金字塔原理（Pyramid Principle）',
-  '你必须将文档内容组织为**总分结构**的思维导图，严格遵循以下四原则：',
-  '',
-  '### 原则一 · 结论先行（Conclusion First）',
-  '- 根节点不应机械复用文档标题；只有当标题本身已经概括核心判断、且不只是文档类型名时，才可直接使用标题，否则应改写为全文核心结论/中心思想',
-  '- 每个父节点都是其所有子节点的**概括性结论**——读者只看父节点就能理解该分支的核心要点',
-  '- 禁止父节点仅为分类标签（如"概述""分析""总结""特点"），必须包含实质性结论信息',
-  '- 示例：❌"技术架构"→ ✅"微服务+事件驱动架构支撑高并发场景"',
-  '',
-  '### 原则二 · 以上统下（Upper-Level Summarizes Lower-Level）',
-  '- 上层节点是下层节点的**思想概括**，下层节点是上层节点的**具体支撑**',
-  '- 每一层节点必须能回答上一层的"为什么"或"如何做到"',
-  '- 自顶向下验证：任一父节点 → 能否自然涵盖所有子节点内容？',
-  '- 自底向上验证：任一子节点 → 是否直接支撑/解释/例证其父节点的结论？',
-  '- 禁止出现"父子脱节"——父节点说A、子节点说B的情况',
-  '',
-  '### 原则三 · 归类分组（MECE Categorization）',
-  '- 同级节点之间必须**互斥且完全穷尽**（Mutually Exclusive, Collectively Exhaustive）',
-  '- 分组依据必须是**同一逻辑维度**（时间顺序/结构组成/程度高低/类别属性）',
-  '- 每组内的要素属于同一逻辑范畴，不同组之间不交叉、不重叠',
-  '- 常见违规：将"方法"和"结果"混入同一父节点、将"原因"和"对策"混入同一分组',
-  '',
-  '### 原则四 · 逻辑递进（Logical Progression）',
-  '- 同级节点的排列必须有**明确的逻辑顺序**，禁止随机排列',
-  '- 可选递进模式（根据文档内容选择最合适的一种）：',
-  '  ① 演绎顺序：大前提→小前提→结论（适用于推理论证类文档）',
-  '  ② 时间顺序：第一步→第二步→第三步（适用于流程/操作/历史类文档）',
-  '  ③ 结构顺序：按空间/组成/模块排列（适用于系统拆解/架构类文档）',
-  '  ④ 程度顺序：最重要→次重要（适用于优先级/重要性排序）',
-  '- 一级节点之间的排序必须体现所选递进模式',
-  '',
-  '## 总分结构生成范式',
-  '- 根节点（总）：全文核心结论，1句话高度概括',
-  '- 一级节点（分）：2-8个核心支撑论点，共同论证根节点结论',
-  '- 二级节点（分）：对一级节点的具体展开，提供事实/数据/案例',
-  '- 三级节点（细节）：必要时对二级节点的补充说明',
-  '- 每一层都是上一层的"分述"，同时是下一层的"总括"',
-  '',
-  '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-  '',
-  '绝对禁止编造、推测、补充、合理化任何文档中未明确出现的信息。',
-  '遇到模糊或无法识别的内容，直接忽略，不要猜测。',
-  '文档中没有的分类维度，不要创建节点。',
-  '同一信息多次出现时只保留一次，归入最相关父节点。',
-  '文末被截断时以最后一个完整段落为准，不补全断尾。',
-  '每个子节点必须属于其父节点的语义范畴——禁止将不同类别的内容混入同一个父节点下（如"专业技能"下只能放技能相关内容，不能混入项目成果、运营指标、业务操作等）',
-  '输出前必须逐条自检：每个子节点的关键词能否直接推导出它属于父节点定义的范畴？若不能，立即删除或移到正确父节点。',
-  '任何父节点的直接子节点不得超过8个。当某节点下信息超过8条时，必须创建中间归纳节点（如"后端技术""前端技术"等分组名），将相关内容归入二级分组，核心信息作为三级节点。',
-  '节点标题必须唯一：任何父节点与其直接子节点的 content 不能完全相同或高度相似。同一父节点下的同级节点之间 content 也不能重复——每个节点必须表达该层级下独特的信息维度。',
-  '',
-  '## 【核心约束】二级节点标题质量保障（最高优先级）',
-  '',
-  '### 1. 🚫 标题绝对禁止使用文件名（违反即失败）',
-  '- 🚫 禁止：产品经理_深圳 15-20K】谭艳丽 9年.pdf  → 这是文件名，立即删除',
-  '- 🚫 禁止：简历模板.docx(1)、论文最终版.pdf  → 文件格式统统禁止',
-  '- 🚫 禁止：任何包含 .pdf .doc .docx .txt .md .html 的文本作为节点标题',
-  '- 🚫 禁止：使用"主题1""主题2""分块1""分块2"等无意义编号作为标题',
-  '- ✅ 正确："工作经历 · 9年产品经理，覆盖社交/电商/工具赛道"',
-  '- ✅ 正确："教育背景 · 深圳大学 计算机科学 本科"',
-  '- 规则：如果输入中包含文件名，必须忽略，只提练文档正文内容做标题',
-  '',
-  '### 2. 标题唯一性',
-  '- 同一层级的所有节点标题必须互不相同',
-  '- 禁止出现3个或以上相同或高度相似（相似度>70%）的标题',
-  '- 如果多个段落讨论相似主题，必须用不同的角度或侧重点来区分标题',
-  '- 示例：不能用"工作经历""工作经验""工作背景"三个相似标题，应合并为一个或用"前期经历""近期项目"等明确区分',
-  '',
-  '### 3. 内容相关性强制验证',
-  '- 每个节点的content必须能在原文中找到对应的依据（允许同义改写）',
-  '- 禁止生成与文档主题关联度低的泛化描述（如"提高效率""优化体验"等空话）',
-  '- 禁止生成无法代表文档实质内容的概括性标题',
-  '- 如果某部分内容无法提炼出有意义的标题，宁可删除该节点也不要用模糊标题填充',
-  '',
-  '### 4. 语义价值评估标准',
-  '- 高价值节点：包含具体数据、专有名词、方法论、明确结论或可操作建议',
-  '- 中价值节点：包含概括性但有意义的信息描述',
-  '- 低价值节点（必须删除）：纯编号、纯文件名、重复内容、空话套话、与主题无关的内容',
-  '- 每个节点必须通过"删除后是否损失关键信息"测试——如果删除后不影响理解，则说明该节点价值不足',
-  '',
-  '### 5. 📏 节点内容长度硬约束',
-  '- 每个节点的 content 严格控制在 35 字以内（中文按字符计）',
-  '- 当单个信息点超过 35 字时，必须拆为父子结构：提取 10-20 字作为父节点概要，详细内容拆为 1-3 个子节点',
-  '- 示例：原文"负责从0到1搭建用户增长体系，通过裂变+投放组合拳实现6个月DAU从0到50万" → 正确拆分为：',
-  '  父："用户增长体系搭建 · DAU从0到50万"',
-  '  子1："裂变增长：设计邀请+拼团机制"',
-  '  子2："付费投放：信息流+KOL组合策略"',
-  '- 严禁为节省空间而截断关键信息，必须通过拆分保留全部信息',
-].join('\n');
-
-const MARKDOWN_SUMMARY_SYSTEM = [
-  '你是一名 Markdown 文档总结助手，不是思维导图生成器。',
-  '你的任务是基于用户提供的原文，输出一份结构化、可读、忠于原文的 Markdown 总结。',
-  '你只能提炼、归纳、压缩原文，不得编造、推断、补充外部知识。',
-  '除非原文明示，否则不要主动补充行动建议、风险判断或延伸分析。',
-  '输出必须服务于“文档总结”本身，而不是为思维导图节点生成做准备。',
-].join('\n');
-
-const DOCUMENT_SUMMARY_SYSTEM = [
-  '你是一名文档事实总结助手，不是思维导图生成器。',
-  '你的任务是基于用户提供的原文片段输出简洁摘要点，严格忠于原文。',
-  '只允许做压缩总结，不得编造、推断、补充外部知识。',
-  '如果原文存在 OCR 噪声、截断或歧义，只能弱化表述或跳过，不能自行补完。',
-  '除非原文明示，否则不要主动输出风险、建议、行动项。',
-].join('\n');
-
-const PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK = [
-  '## 文档总结与思维导图构建目标',
-  '请先在内部形成一份符合金字塔原理的结构化总结，再据此生成思维导图结构：',
-  '- 顶层：明确中心主题与中心思想；只有当文档标题本身已经概括核心判断、且不只是文档类型名时，根节点才可直接使用标题；否则应改写为全文核心结论',
-  '- 中层：构建3-5个主要分支作为关键论点；信息不足时可少于3个，但必须忠实原文，不得凑数',
-  '- 底层：每个关键论点必须由原文中的具体论据、数据、案例或事实支撑',
-  '- 展开要求：所有二级节点必须至少展开一层，二级节点不得保持叶子状态；子节点必须来自原文',
-  '- 逻辑关系：明确判断各层级之间是演绎、归纳、因果、并列或递进关系',
-  '- 结构输出：思维导图节点应体现“中心主题→关键论点→支撑依据”的金字塔层级',
-].join('\n');
-
-const HIGH_VALUE_EXTRACTION_WORKFLOW = [
-  '## 高价值信息提炼流程（先做，再生成）',
-  '1. 先识别文档真正要回答的核心问题，以及作者/原文给出的核心结论。',
-  '2. 从原文中优先提取高信息密度内容：明确结论、关键事实、数字指标、因果关系、步骤方法、风险限制、案例证据、建议动作、对比差异、前提条件。',
-  '3. 对提取出的信息做重要性排序：优先保留“最影响理解结果”的信息，而不是按原文出现顺序平均摘抄。',
-  '4. 将同一逻辑角色的信息分别处理：结论放父节点，证据/做法/数据/例子放子节点，不要混写。',
-  '5. 如果原文同时包含“是什么/为什么/怎么做/结果如何/有哪些限制”，应优先保留这些高价值维度；缺失的维度才允许不写。',
-].join('\n');
-
-const COVERAGE_CHECKLIST = [
-  '## 关键信息覆盖检查',
-  '- 输出前检查原文是否出现以下高价值信号：核心主张、背景前提、问题痛点、原因机制、方法步骤、关键数据、案例证据、结果影响、风险限制、建议结论。',
-  '- 哪类信号在原文中明确出现，就应该在导图中留下对应节点或支撑信息；不要只保留章节名而漏掉真正重要的判断。',
-  '- 如果原文是教程/方案/复盘/观点/研究/新闻，需优先保留最能帮助用户理解与复述的内容，而不是平均分配篇幅。',
-].join('\n');
-
-const NODE_WRITING_RULES = [
-  '## 节点写法优化',
-  '- 节点优先写成“对象 + 判断/动作/结果”的高信息表达，不要只写宽泛主题词。',
-  '- 优先保留原文中的专有名词、阈值、比例、时间、对象、条件、对比项，让节点脱离上下文也能读懂。',
-  '- 父节点应回答“这一组信息的核心意思是什么”，子节点应回答“这个结论凭什么成立/如何展开”。',
-  '- 如果一个节点只是在重复章节标题、空泛概念或泛化套话，应继续压缩/改写，直到包含可理解的实质信息。',
-].join('\n');
-
-const PYRAMID_SELF_CHECK_LOOP = [
-  '## 智能自检测闭环（最终输出前必须执行）',
-  '自检测是内容生成的最后验证环节，必须在最终输出前逐项完成：',
-  '1. 结构完整性检查：验证金字塔结构是否完整，顶层中心主题/中心思想、中层关键论点、底层论据/数据/案例是否齐全',
-  '2. 内容相关性检查：确认所有总结内容均来源于原文档，无无关信息、外部信息、主观解读或无依据推断',
-  '3. 逻辑一致性检查：确保中心思想、关键论点与支撑依据之间存在合理的演绎/归纳/因果/并列/递进关系',
-  '4. 表达准确性检查：验证关键术语使用准确，数据引用无误，人名、机构、时间、金额、比例与原文一致',
-  '5. 二级节点展开检查：检查所有二级节点是否均已展开，且无重要内容节点被遗漏',
-  '6. 自我提问环节：自动生成并回答“这是对文档内容最准确、最有效的总结方式吗？”',
-  '自检测未通过：必须自动返回修改并重新生成，直至满足结构完整、内容相关、逻辑一致、表达准确后方可输出最终结果',
-  '注意：JSON 思维导图生成场景中，自检测过程只作为内部质量保障，不要在 JSON 之外输出检测报告或解释文字',
-].join('\n');
-
-export function buildPrompt(doc: NormalizedDocument): string {
-  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, 12000);
-  return [
-    '你是一名结构化信息提炼专家。任务：运用金字塔原理，从原文中精准提炼信息并组织为**总分结构**思维导图。',
-    '',
-    PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK,
-    '',
-    HIGH_VALUE_EXTRACTION_WORKFLOW,
-    '',
-    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-    '## 金字塔原理 · 总分结构生成框架',
-    '',
-    '### 核心四原则（必须同时满足）',
-    '',
-    '**原则一 · 结论先行**：根节点不应机械复用文档标题；只有当标题本身已经概括核心判断、且不只是文档类型名时，才可直接使用标题。否则应改写为全文核心结论。每个父节点 = 子节点的高度概括性结论。读者只看任一父节点，就能理解该分支的核心要点。禁止父节点仅写分类标签（如"概述""分析""特点"），必须包含实质性信息。',
-    '',
-    '**原则二 · 以上统下**：上层是下层的思想概括（总），下层是上层的具体支撑（分）。每一层都能回答上一层的"为什么"或"如何做到"。自顶向下能自然推导，自底向上能归纳收束。禁止父子脱节——父说A、子说B。',
-    '',
-    '**原则三 · 归类分组**：同级节点 MECE——互斥且完全穷尽。同一逻辑维度分组（时间/结构/程度/类别），不同组之间不交叉不重叠。',
-    '',
-    '**原则四 · 逻辑递进**：同级节点排列有明确逻辑顺序。演绎（大前提→小前提→结论）/ 时间（步骤顺序）/ 结构（空间/模块）/ 程度（最重要→次要），根据文档类型选择最合适模式。',
-    '',
-    '### 总分结构范式',
-    '- 根节点【总】：全文核心结论，1句话高度概括',
-    '- 一级节点【分】：2-8个支撑论点，共同论证根节点结论，按逻辑递进排列',
-    '- 二级节点【分】：对一级节点的具体展开，提供事实/数据/案例/论证',
-    '- 三级节点【细节】：必要时对二级节点的补充',
-    '- 关键：每一层既是上层的"分述"，又是下层的"总括"',
-    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-    '',
-    '## 第一步 · 金字塔构建规划（不输出，只用于自检）',
-    '1. **确定根节点文案**：先判断文档标题是否已经概括核心判断，而不只是文档类型名；只有满足这一条件时，根节点才直接使用标题。若标题只是文件名、下载名、编号、文档类型名或信息价值低于正文结论，则提炼1句话核心结论作为根节点',
-    '2. **拆解支撑论点**：核心结论需要哪2-8个分论点来支撑？这些成为一级节点，每个分论点也是一个结论性陈述',
-    '3. **MECE验证**：分论点是否互斥且穷尽？粒度是否一致？',
-    '4. **确定递进逻辑**：一级节点之间按什么逻辑排序（演绎/时间/结构/程度）？标记排序依据',
-    '5. **逐层展开**：每个分论点下需要哪些具体事实/数据/案例来支撑？展开为二级节点',
-    '6. **上下统合自检**：抽任一子节点 → 能否回答父节点"为什么"或支撑其结论？不能→调整',
-    '7. 完成自检后再开始输出，思考过程不写入最终结果',
-    '',
-    '## 绝对规则（违反任何一条即视为失败）',
-    '1. 内容层须忠实：每个节点的字面信息必须源自原文',
-    '   - 允许：同义压缩、合并相邻句、删去口语化修饰',
-    '   - 禁止：新增任何原文未出现的事实、数据、人名、案例、术语',
-    '2. 模糊、乱码、不完整的句子直接忽略，不要猜测含义',
-    '3. 文档中没有对应内容的维度，不创建节点',
-    '4. 文末若被截断，以最后一个完整段落为准，不补全断尾',
-    '5. 同一信息在原文多次出现时，只保留一次，归入最相关父节点',
-    '   - 同一事实/经历/数据/句意全树只能出现一次，不得在不同分支重复挂载',
-    '   - 如果同一条信息同时可归入多个父节点，只保留在“最具体、最贴切”的那个分支，其余分支不得复述',
-    '   - 不得在父节点和子节点中重复复述同一条信息：父节点负责概括，子节点负责补充新的支撑事实',
-    '   - 禁止用“(1)”“(2)”或近似后缀为重复节点强行区分；遇到重复只能删除、合并或改写为不同信息维度',
-    '6. 分类边界不可逾越：每个父节点下的子节点必须属于同一语义类别',
-    '   - 核心原则：先确定父节点定义的语义范畴，再判断每条信息是否属于该范畴',
-    '   - 判定方法：抽取子节点关键词 → 问"这描述的是父节点范畴内的事吗？"→ 不是则不可放入',
-    '   - 常见违规：将"结果/指标"放入"方法/手段"类父节点，将"背景/原因"放入"结论/建议"类父节点',
-    '   - 如果某条信息无法归入任何已有父节点的语义范畴，不要强行放入——宁可减少节点也不污染分类',
-    '7. 🚫 文件名禁令：任何节点的 content 禁止包含文件名或文件扩展名',
-    '   - 禁止：产品经理_深圳.pdf、简历.pdf(1)、论文.docx 等任何含文件扩展名的文本',
-    '   - 禁止：直接复制输入开头的文件名作为任何节点标题',
-    '   - 遇到文件名时，从该文件对应的正文内容中提取有意义的标题',
-    '   - 即使文档标题本身正常，只要它主要是在说明“这是什么文档”而非“文档的核心判断”，根节点也应改写为更有信息量的结论句',
-    '8. 📏 内容长度约束：每个节点的 content 必须 ≤ 35 字',
-    '   - 超过 35 字的信息必须拆分为父子结构',
-    '   - 父节点用 10-20 字概括核心语义，子节点承载详细描述',
-    '   - 严禁截断——必须通过拆分保留全部信息',
-    '9. 🏛️ 结论先行约束：根节点和每个父节点必须是结论性陈述，不得仅为分类标签',
-    '   - 禁止：根节点="思维导图"/"文档内容"/"文章概述"等无信息量标题',
-    '   - 禁止：一级节点="概述"/"分析"/"总结"/"背景"/"方法"/"结果"等空洞分类名',
-    '   - 正确：根节点应概括文档核心主张，一级节点应体现具体维度的结论',
-    '10. 🔗 以上统下约束：每个子节点必须直接支撑/解释其父节点',
-    '    - 自检：删除父节点后，子节点列表能否向上归纳为一个统一的结论？能→正确',
-    '    - 自检：只看父节点文字，能否预见子节点的大致内容范围？不能→父节点概括不足',
-    '',
-    '## 语义归属判定规则（输出前必须逐条对照）',
-    '下面定义每类父节点"只能"包含的子节点类型。请严格对照执行：',
-    '- "技能"类父节点（含"专业技能""技术栈""能力"等）：只能放工具名、语言名、方法论、证书、能力名称，禁止放业务操作/运营指标/项目成果',
-    '- "项目/经历"类父节点（含"工作经历""项目经验"等）：只能放具体项目名称、项目描述、担任角色',
-    '- "成果/业绩"类父节点（含"工作成果""业绩"等）：只能放量化结果、关键产出',
-    '- "职责"类父节点：只能放具体职责描述',
-    '- "教育"类父节点：只能放学历、学校、专业',
-    '判定口诀：读子节点内容 → 问"这句话描述的是父节点定义的范畴吗？"→ 不是则删除或移到正确位置',
-    '',
-    '## 结构层可优化',
-    '1. 层级、归类、合并、顺序均可重组，目标是"读者一眼看懂结构"',
-    '2. 关联紧密的信息合并为一个节点（如"概念名 · 核心定义"合一），细节作 children',
-    '3. 重组的依据是语义关联与金字塔逻辑，而非原文章节顺序',
-    '',
-    COVERAGE_CHECKLIST,
-    '',
-    NODE_WRITING_RULES,
-    '',
-    '## 子节点数量管理（重要）',
-    '- 任何节点的直接子节点数 ≤ 8 个，保持视觉清爽',
-    '- 当某节点下信息 > 8 条时：在父节点与叶子之间插入归纳节点（二级分组）',
-    '- 归纳方法：按语义相似度将子节点分为 2-4 组，每组用一个简洁词组命名（4-8 字）',
-    '- 示例："专业技能"下有 Python、Java、Spring Boot、React、Vue、Node.js、Docker、K8s、MySQL、Redis 时 → 分为"后端技术"和"前端与运维"两个中间节点',
-    '- 禁止为凑整而删除信息——信息多时用"增加层级"而非"减少节点"',
-    '',
-    '## 好导图的判定标准（输出前自检）',
-    '- ✅ 结论先行：只有当文档标题本身已经表达核心判断时，根节点才沿用标题；若标题只是文档类型名或信息量偏低，根节点必须改写为核心结论。每个父节点都是子节点的概括性结论而非标签',
-    '- ✅ 以上统下：上层概括下层，下层支撑上层，任何父子关系可双向验证',
-    '- ✅ 归类分组：一级节点之间互斥不重叠（MECE），同层粒度一致',
-    '- ✅ 逻辑递进：同级节点按明确逻辑排序（演绎/时间/结构/程度），非随机排列',
-    '- ✅ 叶子节点自含（脱离上下文也能读懂）',
-    '- ✅ 无空标签节点（禁止只写分类名而无实质内容，如"特点 / 优点 / 其他"）',
-    '- ✅ 节点语言与原文一致（中文文档输出中文，英文文档输出英文）',
-    '- ✅ 节点标题唯一：父节点与子节点 content 不能相同或高度相似；同级节点间 content 不可重复',
-    '',
-    PYRAMID_SELF_CHECK_LOOP,
-    '',
-    '## 【强制执行】生成后自测验证流程（必须逐项检查）',
-    '',
-    '### 验证步骤 1：结论先行检查（金字塔顶层验证）',
-    '1. 检查根节点：文档标题是否真的表达了核心判断，而不只是文档类型名？若没有，根节点是否已改写为准确的全文核心结论/中心思想？',
-    '2. 检查每个一级节点：是否包含实质性结论信息？（不是"概述""分析""总结"等空标签）',
-    '3. 检查每个父节点：提取其关键词 → 看其子节点是否在围绕这个结论展开支撑？',
-    '4. 不合格节点必须重写：将"标签式标题"改为"结论式标题"',
-    '',
-    '### 验证步骤 2：以上统下检查（金字塔纵向验证）',
-    '1. 对每个父-子关系：父节点能否自然概括所有子节点内容？',
-    '2. 对每个子-父关系：子节点是否直接支撑/解释父节点的结论？',
-    '3. 检查组：是否存在"父说A、子说B"的脱节情况？→ 立即修复',
-    '4. 检查组：是否存在子节点内容比父节点更宏观？（层级倒置）→ 交换或调整',
-    '',
-    '### 验证步骤 3：归类分组与逻辑递进检查（金字塔横向验证）',
-    '1. 同级节点是否 MECE（互斥且穷尽）？',
-    '2. 同级节点粒度是否一致？',
-    '3. 同级节点排列是否有明确逻辑顺序（演绎/时间/结构/程度）？',
-    '4. 节点标题唯一性：无重复，无高度相似（<3个相似）',
-    '5. 特别检查：是否出现文件名、编号 → 立即替换',
-    '6. 全树去重扫描：检查是否有同一事实被父子重复、跨分支重复，或仅靠“(1)”“(2)”区分的伪去重节点',
-    '',
-    '### 验证步骤 4：内容质量与过滤',
-    '逐个检查所有节点，标记以下类型并删除：',
-    '- [ ] 纯文件名/路径/URL',
-    '- [ ] 纯编号（如"(1)"、"主题 1"、"分块2"、"内容3"、"Chunk1"）',
-    '- [ ] 空话套话（如"提高效率""优化体验"而无具体内容）',
-    '- [ ] 重复内容（与其他节点信息重叠>80%）',
-    '- [ ] 与文档主题无关的内容',
-    '- [ ] 标签式标题（如"概述""分析""总结""方法""结果"等无信息量标签）',
-    '过滤后如果某父节点下无子节点，考虑删除或合并',
-    '',
-    '### 验证步骤 5：总分结构完整性评估',
-    '回答以下问题（任一答案为"否"则需调整）：',
-    '- [ ] 根节点是否准确概括了全文核心结论？',
-    '- [ ] 所有一级节点共同支撑根节点结论？（覆盖率≥80%）',
-    '- [ ] 每个一级节点下的二级节点是否充分展开支撑？',
-    '- [ ] 整体结构是否可以自顶向下顺畅阅读？（总→分→细节）',
-    '- [ ] 整体结构是否可以自底向上归纳收束？（细节→分→总）',
-    '- [ ] 节点层级深度是否合理？（3-4层为宜）',
-    '- [ ] 信息分布是否均衡？',
-    '',
-    '### 验证通过标准',
-    '✅ 结论先行：根节点和所有父节点均为结论性陈述，无空标签',
-    '✅ 以上统下：所有父子关系可双向验证，无脱节',
-    '✅ 归类分组：MECE成立，粒度一致',
-    '✅ 逻辑递进：同级节点有明确排序逻辑',
-    '✅ 内容质量：无意义内容已全部过滤',
-    '✅ 总分结构：可自顶向下阅读、自底向上归纳',
-    '✅ 如果任何一项不通过，必须返回重新规划，直到全部通过',
-    '',
-    '## 约束条件',
-    `- 最大层级：${MAX_TREE_DEPTH}`,
-    `- 最大节点数：${MAX_TREE_NODES}`,
-    '- 节点文本目标 15-25 字，上限 35 字',
-    '- 超过 35 字必须拆为父子结构，严禁截断意思',
-    '- 一级节点 2-8 个，由内容决定，不凑数，不为美观补足',
-    '- 每个节点的直接子节点数 ≤ 8 个，超过时自动创建中间归纳分组',
-    '',
-    '## 兜底规则',
-    '- 原文 <100 字或无明显结构：输出"单根节点 + 1-2 个子节点"的最小合法结构，不强行拼凑',
-    '- 原文全为乱码 / 无法识别：输出 {"content": "无法识别的内容","children": []}',
-    '',
-    '## Few-shot（注意：每个正例均展示结论先行 + 以上统下 + 归类分组 + 逻辑递进）',
-    '',
-    '✅ 正例 1 · 学术论文风（演绎递进 · 概念→原理→实现）：',
-    '// 根=核心结论（非标签），一级=三大支撑维度（按概念→原理→实现递进）',
-    '{"content":"Transformer通过自注意力机制取代循环结构，实现并行化序列建模","children":[',
-    '  {"content":"核心机制：Scaled Dot-Product Attention实现全局依赖捕捉","children":[]},',
-    '  {"content":"多头并行：8个attention head从不同子空间联合学习","children":[]},',
-    '  {"content":"位置编码：正弦函数显式注入序列顺序信息","children":[]}',
-    ']}',
-    '点评：根节点是结论（"取代循环结构+并行化建模"）而非标签（"模型架构"），一级节点按概念→原理→实现递进',
-    '',
-    '✅ 正例 2 · 简历风（结构递进 · 按能力维度归类）：',
-    '// 根=综合能力画像（结论），一级=技能→项目→成果（结构递进）',
-    '{"content":"全栈工程师 · 后端为主/前端为辅，具备独立交付能力","children":[',
-    '  {"content":"后端技术栈：Spring Boot微服务 + Python数据处理","children":[]},',
-    '  {"content":"前端能力：React组件库开发 + Vue管理后台","children":[]},',
-    '  {"content":"数据工程：SQL优化 + Redis缓存策略","children":[]}',
-    ']}',
-    '点评：根=结论（"全栈+独立交付"），一级=支撑根结论的技能方向（结构递进），所有子节点严格属于技能范畴',
-    '',
-    '✅ 正例 3 · 方法论文章风（程度递进 · 强信号→辅助信号→反信号）：',
-    '// 根=核心判断结论，一级=按信号强度递进排列（强→中→反）',
-    '{"content":"PMF达成的关键标志是用户主动留存与自发传播，而非付费增长","children":[',
-    '  {"content":"核心信号：D30留存率>40%且自然增长占比>60%","children":[]},',
-    '  {"content":"辅助信号：NPS>50，用户主动推荐行为频发","children":[]},',
-    '  {"content":"伪信号识别：主要靠付费投放维持的增长不构成PMF","children":[]}',
-    ']}',
-    '点评：根=判断结论（"留存+传播>付费增长"），一级按信号强度递进（核心→辅助→反信号），每层上下统合',
-    '',
-    '❌ 反例 1（结论缺失 + 空标签 + 父子脱节）：',
-    '{"content":"PMF","children":[',
-    '  {"content":"信号","children":[{"content":"留存","children":[]}]},',
-    '  {"content":"指标","children":[{"content":"NPS","children":[]}]},',
-    '  {"content":"判断","children":[{"content":"自然增长","children":[]}]}',
-    ']}',
-    '反例错在：①根节点"PMF"是标签非结论 ②"信号/指标/判断"为空标签违反结论先行 ③子节点丢失阈值违反以上统下（"留存"不能支撑"信号"的判断）',
-    '',
-    '❌ 反例 2（分类边界污染 · 不同语义类别混入同一父节点）：',
-    '{"content":"专业技能","children":[',
-    '  {"content":"Python开发","children":[]},',
-    '  {"content":"平台活跃度维持","children":[]},',
-    '  {"content":"项目周期缩短30%","children":[]},',
-    '  {"content":"送礼策略优化","children":[]},',
-    '  {"content":"交易结算","children":[]}',
-    ']}',
-    '反例错在：①"平台活跃度维持"是运营指标 ②"项目周期缩短"是项目成果 ③"送礼策略优化"是业务手段 ④"交易结算"是业务操作——均不是技能，应分别归入"运营成果""项目成果""业务策略""工作职责"等对应父节点',
-    '',
-    '❌ 反例 3（子节点过度扁平 · 超过8个直接子节点未分组）：',
-    '{"content":"专业技能 · Python/Java/Spring Boot/React/Vue/Node.js/Docker/K8s/MySQL/Redis","children":[',
-    '  {"content":"Python","children":[]},',
-    '  {"content":"Java","children":[]},',
-    '  {"content":"Spring Boot","children":[]},',
-    '  {"content":"React","children":[]},',
-    '  {"content":"Vue","children":[]},',
-    '  {"content":"Node.js","children":[]},',
-    '  {"content":"Docker","children":[]},',
-    '  {"content":"Kubernetes","children":[]},',
-    '  {"content":"MySQL","children":[]},',
-    '  {"content":"Redis","children":[]}',
-    ']}',
-    '反例错在：1个父节点下直接挂了10个叶子，视觉拥挤、难以扫描。✅ 正确做法：应插入中间归纳层——',
-    '{"content":"专业技能 · Python/Java/.../Redis","children":[',
-    '  {"content":"后端技术 · Java / Python / Spring Boot","children":[',
-    '    {"content":"Java：Spring Boot微服务","children":[]},',
-    '    {"content":"Python：数据处理与API","children":[]},',
-    '    {"content":"Node.js：中间层服务","children":[]}',
-    '  ]},',
-    '  {"content":"前端技术 · React / Vue","children":[',
-    '    {"content":"React：组件库与状态管理","children":[]},',
-    '    {"content":"Vue：管理后台快速开发","children":[]}',
-    '  ]},',
-    '  {"content":"基础设施 · Docker / K8s / MySQL / Redis","children":[',
-    '    {"content":"Docker + K8s：容器化部署","children":[]},',
-    '    {"content":"MySQL：关系型数据存储","children":[]},',
-    '    {"content":"Redis：缓存与消息队列","children":[]}',
-    '  ]}',
-    ']}',
-    '',
-    '❌ 反例 4（节点标题重复 · 父子内容相同/同级内容相同）：',
-    '{"content":"专业技能","children":[',
-    '  {"content":"专业技能","children":[]},',
-    '  {"content":"Python开发","children":[]},',
-    '  {"content":"Python开发","children":[]}',
-    ']}',
-    '反例错在：①子节点"专业技能"与父节点 content 完全相同 ②两个"Python开发"同级重复——✅ 正确：删除重复子节点，合并去重为 {"content":"专业技能","children":[{"content":"Python开发","children":[]}]}',
-    '',
-    '❌ 反例 5（文件名作为节点标题 · 最严重错误）：',
-    '{"content":"思维导图","children":[',
-    '  {"content":"产品经理_深圳 15-20K】谭艳丽 9年.pdf","children":[]},',
-    '  {"content":"产品经理_深圳 15-20K】谭艳丽 9年.pdf(1)","children":[]},',
-    '  {"content":"产品经理_深圳 15-20K】谭艳丽 9年.pdf(2)","children":[]}',
-    ']}',
-    '反例错在：所有二级节点用了原始文件名！完全无意义。✅ 正确做法：从PDF正文内容中提取实际章节标题，如 "工作经历 · 9年产品经理/社交电商赛道""专业技能 · Python/数据分析/SQL""教育背景 · 深圳大学 本科"',
-    '',
-    '❌ 反例 6（节点内容过长未拆分 · 违反35字约束）：',
-    '{"content":"专业技能","children":[',
-    '  {"content":"负责从0到1搭建用户增长体系通过裂变投放组合拳实现6个月DAU从0到50万同时搭建了AB实验平台和数据看板","children":[]}',
-    ']}',
-    '反例错在：子节点内容 60+ 字远超 35 字上限。✅ 正确：拆分为父子结构——',
-    '{"content":"专业技能","children":[',
-    '  {"content":"用户增长体系搭建 · DAU 0→50万/6个月","children":[',
-    '    {"content":"裂变增长：邀请+拼团机制","children":[]},',
-    '    {"content":"付费投放：信息流+KOL策略","children":[]},',
-    '    {"content":"数据基建：AB实验平台+看板","children":[]}',
-    '  ]}',
-    ']}',
-    '',
-    '❌ 反例 7（结论先行违反 · 根节点和一级节点均为空标签）：',
-    '{"content":"2024年Q4工作总结","children":[',
-    '  {"content":"概述","children":[{"content":"本季度完成了A项目上线","children":[]}]},',
-    '  {"content":"数据分析","children":[{"content":"用户增长20%","children":[]}]},',
-    '  {"content":"问题与改进","children":[{"content":"服务器响应慢","children":[]}]}',
-    ']}',
-    '反例错在：①根节点仅重复标题无结论 ②一级节点"概述/数据分析/问题与改进"全是空标签。✅ 正确：根="Q4核心成果：A项目上线驱动用户增长20%，技术债务仍需解决"，一级含实质性结论。',
-    '',
-    `## 文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
-    '',
-    '## 输入内容',
-    cleanedMarkdown,
-  ].join('\n');
-}
-
-export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
-  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, 8000);
-  return [
-    '你是一名结构化信息提炼专家。任务：运用金字塔原理，从原文中精准提炼信息并组织为**总分结构**思维导图 JSON。',
-    '',
-    PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK,
-    '',
-    HIGH_VALUE_EXTRACTION_WORKFLOW,
-    '',
-    '## 核心四原则',
-    '- 结论先行：根节点不应机械复用文档标题；只有当标题本身已经概括核心判断、且不只是文档类型名时，根节点才可直接使用标题。否则必须改写为全文核心结论。每个父节点都必须是结论性陈述，不得仅为分类标签。',
-    '- 以上统下：上层是下层的思想概括，下层是上层的具体支撑；禁止父说A、子说B。',
-    '- 归类分组：同级节点按同一逻辑维度分组，满足 MECE，互斥且完全穷尽。',
-    '- 逻辑递进：同级节点必须按演绎、时间、结构或程度之一排序，不得随机排列。',
-    '',
-    '## 生成规则',
-    '- 内容必须忠实原文；允许压缩改写，不允许新增事实、数据、人名、案例、术语。',
-    '- 模糊、乱码、不完整句子直接忽略；文档没有的维度不要创建节点。',
-    '- 同一信息多次出现时只保留一次，放到最相关父节点下。',
-    '- 同一事实/经历/数据/句意全树只能出现一次；如果可放入多个分支，只保留在最贴切的那个分支。',
-    '- 不得在父节点和子节点中重复复述同一条信息；父节点做概括，子节点必须补充新的支撑事实。',
-    '- 禁止用“(1)”“(2)”或其他编号后缀来制造伪去重节点；重复内容只能删除、合并或改写为不同维度。',
-    '- 文件名禁令：任何节点 content 禁止包含文件名或文件扩展名。',
-    '- 即使文档标题本身正常，只要它主要是在说明“这是什么文档”而非“文档的核心判断”，根节点也应改写为更有信息量的结论句。',
-    '- 每个子节点必须属于其父节点语义范畴；如果不属于，就删除或移到正确位置。',
-    '- 根节点和每个父节点都必须包含实质信息，不得使用“概述”“分析”“总结”“背景”“方法”等空标签。',
-    '- 节点标题必须唯一；父子、同级之间不得重复或高度相似。',
-    '',
-    COVERAGE_CHECKLIST,
-    '',
-    NODE_WRITING_RULES,
-    '',
-    '## 约束条件',
-    `- 最大层级：${MAX_TREE_DEPTH}`,
-    `- 最大节点数：${MAX_TREE_NODES}`,
-    '- 节点文本目标 15-25 字，上限 35 字。',
-    '- 超过 35 字必须拆为父子结构，严禁截断意思。',
-    '- 一级节点 2-8 个，由内容决定，不凑数。',
-    '- 每个节点的直接子节点数 ≤ 8 个；超过时自动创建中间归纳分组。',
-    '- 所有二级节点必须至少展开一层；二级节点不得保持叶子状态；子节点必须来自原文。',
-    '',
-    '## 输出要求',
-    '- 只输出合法 JSON，不要输出 Markdown、解释、自检过程或额外文字。',
-    '- JSON 结构：{"title":"...","root":{"content":"...","children":[...]}}。',
-    '- 生成前先在内部完成规划与自检，再一次性输出最终 JSON。',
-    '- 输出前执行一次全树去重扫描，确认没有跨分支重复、父子复述或“(1)/(2)”伪去重节点。',
-    '',
-    PYRAMID_SELF_CHECK_LOOP,
-    '',
-    '## 兜底规则',
-    '- 原文 <100 字或无明显结构：输出“单根节点 + 1-2 个子节点”的最小合法结构。',
-    '- 原文全为乱码或无法识别：输出 {"content":"无法识别的内容","children":[]}。',
-    '',
-    `## 文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
-    '',
-    '## 输入内容',
-    cleanedMarkdown,
-  ].join('\n');
-}
 
 function extractJsonCandidates(text: string): string[] {
   const trimmed = text.trim();
@@ -2763,39 +1859,6 @@ function buildDocumentSummaryPrompt(doc: NormalizedDocument): string {
   ].join('\n');
 }
 
-export function buildMarkdownPreviewPrompt(doc: NormalizedDocument): string {
-  return [
-    '你是资深文档分析助手。请基于输入内容，运用金字塔原理输出一份中文 Markdown 结构化总结。',
-    '要求：',
-    '1. 仅基于输入内容，不要编造事实。',
-    '2. 直接输出 Markdown 文本，不要输出 JSON，不要代码块包裹。',
-    '3. 结构必须包含：',
-    '   - 一级标题：中心主题',
-    '   - 二级标题：中心思想（1-3句话，结论先行）',
-    '   - 二级标题：关键论点（3-5个主要分支；信息不足时说明原因，不凑数）',
-    '   - 二级标题：支撑依据（每个论点列出原文事实、数据或案例）',
-    '   - 二级标题：逻辑关系（说明归纳/演绎/因果/并列/递进关系）',
-    '4. 每条 bullet 尽量 8~30 字。',
-    '5. 输出语言：简体中文。',
-    '',
-    PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK,
-    '',
-    '质量控制：',
-    '- 确保每个节点内容完整且有意义',
-    '- 避免重复内容',
-    '- 保持层级逻辑清晰',
-    '- 重要信息优先级更高',
-    '',
-    PYRAMID_SELF_CHECK_LOOP,
-    '',
-    `文档标题：${doc.sourceMeta.title || '未命名文档'}`,
-    `来源类型：${doc.sourceMeta.type}`,
-    '',
-    '输入内容：',
-    cleanMarkdownForLLM(doc.markdown).slice(0, 14000),
-  ].join('\n');
-}
-
 function normalizeMarkdownPreview(rawText: string, fallbackTitle: string): { title: string; markdown: string } {
   const cleaned = rawText.trim();
   if (!cleaned) {
@@ -3136,13 +2199,16 @@ export async function* generateMindMapStream(
   }
 
   const model = llmConfig.model;
-  const prompt = buildPrompt(doc);
+  // 模型能力画像决定输出通道（stream-object / text-json）与 prompt 密度（lean / full），
+  // 新增 provider 只需在 profiles.ts 登记画像，不改生成链路
+  const modelProfile = resolveModelProfile(llmConfig.resolvedProvider);
+  const prompt = buildPrompt(doc, { density: modelProfile.density });
   const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
   let workingTree = buildHeuristicMindMapTree(doc);
   let skeletonSent = false;
   let latestStableTree = workingTree;
 
-  if (llmConfig.resolvedProvider && llmConfig.resolvedProvider !== 'openai') {
+  if (modelProfile.outputMode === 'text-json') {
     console.log('[MindMap Debug] 走路径3: 非OpenAI Provider -', llmConfig.resolvedProvider);
     console.log('[MindMap Debug] 使用提示词: buildCompatJsonPrompt()');
     skeletonSent = true;
@@ -3305,4 +2371,316 @@ export async function* generateMindMapStream(
       },
     };
   }
+}
+
+export interface BranchExpansionResult {
+  children: string[];
+  provider: string;
+  model: string;
+  source: 'llm' | 'heuristic';
+}
+
+function parseBranchExpansionChildren(rawText: string): string[] {
+  const cleaned = rawText.trim();
+  if (!cleaned) return [];
+
+  const candidates: string[] = [];
+  try {
+    const direct = JSON.parse(cleaned);
+    candidates.push(cleaned, JSON.stringify(direct));
+  } catch {
+    candidates.push(cleaned);
+  }
+
+  for (const candidate of extractJsonCandidates(cleaned)) {
+    candidates.push(candidate);
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      const list = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.children)
+          ? parsed.children
+          : null;
+      if (!list) continue;
+
+      const children = list
+        .map((item: unknown) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item === 'object' && typeof (item as { content?: unknown }).content === 'string') {
+            return (item as { content: string }).content;
+          }
+          return '';
+        })
+        .map((content: string) => content.trim().slice(0, 120))
+        .filter((content: string) => content.length > 0);
+
+      if (children.length > 0) return children.slice(0, 8);
+    } catch {
+      // try next candidate
+    }
+  }
+
+  // Lenient fallback: one phrase per non-empty line.
+  return cleaned
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[-*\d.\s"{}\[\]]+/, '').replace(/["\[\]{},]$/, '').trim())
+    .filter((line) => line.length > 0 && line.length <= 120)
+    .slice(0, 8);
+}
+
+function buildHeuristicBranchExpansion(input: BranchExpansionInput): string[] {
+  if (!input.documentMarkdown || !input.documentMarkdown.trim()) return [];
+
+  const sentences = input.documentMarkdown
+    .split(/(?<=[。！？.!?\n])/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length >= 8 && sentence.length <= 160);
+
+  const focusLabel = input.focusContent;
+  const existing = new Set(
+    [...input.existingChildren, ...input.siblingTitles, focusLabel].map((title) =>
+      normalizeExpansionSentenceKey(title),
+    ),
+  );
+
+  const scored = sentences
+    .map((sentence) => ({ sentence, score: scoreSentenceForBranch(focusLabel, sentence) }))
+    .filter((item) => item.score > 0 && !existing.has(normalizeExpansionSentenceKey(item.sentence)))
+    .sort((a, b) => b.score - a.score);
+
+  const children: string[] = [];
+  for (const item of scored) {
+    if (children.length >= 5) break;
+    if (children.some((child) => normalizeExpansionSentenceKey(child) === normalizeExpansionSentenceKey(item.sentence))) {
+      continue;
+    }
+    children.push(item.sentence.slice(0, 120));
+  }
+
+  return children;
+}
+
+export async function generateBranchExpansion(
+  input: BranchExpansionInput,
+  options: {
+    abortSignal?: AbortSignal;
+  } = {},
+): Promise<BranchExpansionResult> {
+  const focus = input.focusContent.trim();
+  if (!focus) {
+    throw new Error('选中节点内容为空，无法扩展。');
+  }
+
+  const llmConfig = resolveLLMConfig();
+  const heuristicChildren = buildHeuristicBranchExpansion(input);
+  const hasApiKey = Boolean(llmConfig.apiKey);
+
+  if (!llmConfig.supported || !hasApiKey) {
+    if (heuristicChildren.length === 0) {
+      const keyHint = llmConfig.keyEnv || '对应 provider 的 API key';
+      throw new Error(`LLM 未配置且原文中无可提炼的相关内容：请配置 ${keyHint} 后重试。`);
+    }
+    return {
+      children: heuristicChildren,
+      provider: 'local',
+      model: 'heuristic-v1',
+      source: 'heuristic',
+    };
+  }
+
+  const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
+  const expandTimeoutSeconds = parseNonNegativeInt(process.env.LLM_EXPAND_TIMEOUT, 45);
+  const expandTimeoutMs = expandTimeoutSeconds > 0 ? expandTimeoutSeconds * 1000 : undefined;
+  const expandMaxRetries = parseNonNegativeInt(process.env.LLM_EXPAND_MAX_RETRIES, requestConfig.maxRetries);
+  const modelProvider = createProviderClient(llmConfig);
+
+  const languageModel =
+    llmConfig.resolvedProvider === 'openai'
+      ? modelProvider(llmConfig.model)
+      : modelProvider.chat(llmConfig.model as any);
+
+  const result = await generateText({
+    model: languageModel,
+    system: BRANCH_EXPANSION_SYSTEM,
+    prompt: buildBranchExpansionPrompt(input),
+    maxRetries: expandMaxRetries,
+    timeout: expandTimeoutMs ?? requestConfig.timeoutMs,
+    abortSignal: options.abortSignal,
+    temperature: 0.4,
+    maxOutputTokens: 800,
+  });
+
+  let children = parseBranchExpansionChildren(result.text);
+  if (children.length === 0 && heuristicChildren.length > 0) {
+    children = heuristicChildren;
+  }
+  if (children.length === 0) {
+    throw new Error('AI 扩展结果为空，请重试或换个节点。');
+  }
+
+  return {
+    children,
+    provider: llmConfig.resolvedProvider || llmConfig.provider,
+    model: llmConfig.model,
+    source: 'llm',
+  };
+}
+
+export interface TreeOptimizationResult {
+  tree: LLMMindMapTree;
+  provider: string;
+  model: string;
+  source: 'llm' | 'local';
+}
+
+function pruneTreeToDepth(node: LLMMindMapTree['root'], maxDepth: number): LLMMindMapTree['root'] {
+  const next: LLMMindMapTree['root'] = { content: node.content };
+  if (maxDepth > 0 && node.children && node.children.length > 0) {
+    next.children = node.children.map((child) => pruneTreeToDepth(child, maxDepth - 1));
+    if (next.children.length === 1 && next.children[0].children && next.children[0].children.length > 0) {
+      // Collapse single-child chains to keep the simplified outline tight.
+      const only = next.children[0];
+      return { content: `${next.content}：${only.content}`, children: only.children };
+    }
+  }
+  return next;
+}
+
+function llmTreeFromMindMapTree(tree: MindMapTree): LLMMindMapTree {
+  const convert = (node: MindMapNode): LLMMindMapTree['root'] => ({
+    content: node.content,
+    children: (node.children || []).map((child) => convert(child)),
+  });
+
+  return {
+    title: tree.meta.title || tree.root.content,
+    root: convert(tree.root),
+  };
+}
+
+function applyLocalTreeOptimization(
+  tree: MindMapTree,
+  mode: TreeOptimizeMode,
+): TreeOptimizationResult {
+  const llmTree = llmTreeFromMindMapTree(tree);
+  let nextTree = llmTree;
+
+  if (mode === 'simplify') {
+    nextTree = { title: llmTree.title, root: pruneTreeToDepth(llmTree.root, 2) };
+  } else {
+    const restructured = restructureOversizedBranches(
+      deduplicateNodeTitles(llmTreeToMindMapTreeForOptimize(llmTree, tree)),
+    );
+    nextTree = llmTreeFromMindMapTree(restructured);
+  }
+
+  return {
+    tree: nextTree,
+    provider: 'local',
+    model: mode === 'simplify' ? 'prune-v1' : 'restructure-v1',
+    source: 'local',
+  };
+}
+
+function llmTreeToMindMapTreeForOptimize(llmTree: LLMMindMapTree, reference: MindMapTree): MindMapTree {
+  const now = Date.now();
+  const sourceRef = reference.root.meta.sourceRef;
+
+  const convert = (node: LLMMindMapTree['root']): MindMapNode => ({
+    id: nanoid(),
+    content: node.content.trim().slice(0, 120) || '未命名节点',
+    collapsed: false,
+    children: (node.children || []).map((child) => convert(child)),
+    meta: {
+      sourceRef,
+      type: 'detail',
+      confidence: 0.7,
+      createdAt: now,
+      createdBy: 'ai',
+    },
+  });
+
+  return {
+    id: reference.id,
+    root: convert(llmTree.root),
+    meta: {
+      ...reference.meta,
+      updatedAt: now,
+      version: reference.meta.version + 1,
+    },
+  };
+}
+
+export async function generateTreeOptimization(
+  tree: MindMapTree,
+  input: Omit<TreeOptimizationInput, 'outline' | 'rootTitle'>,
+  options: {
+    abortSignal?: AbortSignal;
+  } = {},
+): Promise<TreeOptimizationResult> {
+  const outline = collectOutlineLines(tree, 80).join('\n');
+  if (!outline.trim()) {
+    throw new Error('导图为空，无法优化。');
+  }
+
+  const fullInput: TreeOptimizationInput = {
+    ...input,
+    outline,
+    rootTitle: tree.meta.title || tree.root.content,
+  };
+
+  const llmConfig = resolveLLMConfig();
+  const hasApiKey = Boolean(llmConfig.apiKey);
+
+  if (!llmConfig.supported || !hasApiKey) {
+    return applyLocalTreeOptimization(tree, input.mode);
+  }
+
+  const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
+  const optimizeTimeoutSeconds = parseNonNegativeInt(process.env.LLM_OPTIMIZE_TIMEOUT, 90);
+  const optimizeTimeoutMs = optimizeTimeoutSeconds > 0 ? optimizeTimeoutSeconds * 1000 : undefined;
+  const optimizeMaxRetries = parseNonNegativeInt(process.env.LLM_OPTIMIZE_MAX_RETRIES, requestConfig.maxRetries);
+  const modelProvider = createProviderClient(llmConfig);
+
+  const languageModel =
+    llmConfig.resolvedProvider === 'openai'
+      ? modelProvider(llmConfig.model)
+      : modelProvider.chat(llmConfig.model as any);
+
+  const result = await generateText({
+    model: languageModel,
+    system: TREE_OPTIMIZE_SYSTEM,
+    prompt: buildTreeOptimizePrompt(fullInput),
+    maxRetries: optimizeMaxRetries,
+    timeout: optimizeTimeoutMs ?? requestConfig.timeoutMs,
+    abortSignal: options.abortSignal,
+    temperature: 0.3,
+    maxOutputTokens: 4000,
+  });
+
+  const parsed = parseLLMTreeFromText(result.text);
+  if (!parsed) {
+    const localFallback = applyLocalTreeOptimization(tree, input.mode);
+    if (localFallback.tree.root.children && localFallback.tree.root.children.length > 0) {
+      return localFallback;
+    }
+    throw new Error('AI 优化返回内容不是有效思维导图 JSON，请重试。');
+  }
+
+  return {
+    tree: parsed,
+    provider: llmConfig.resolvedProvider || llmConfig.provider,
+    model: llmConfig.model,
+    source: 'llm',
+  };
+}
+
+export function convertOptimizedTreeToMindMapTree(
+  llmTree: LLMMindMapTree,
+  reference: MindMapTree,
+): MindMapTree {
+  return llmTreeToMindMapTreeForOptimize(llmTree, reference);
 }

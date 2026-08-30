@@ -122,6 +122,17 @@ export function findNode(root: MindMapNode, nodeId: string): MindMapNode | undef
   return undefined;
 }
 
+export function getNodeDepth(root: MindMapNode, nodeId: string): number | null {
+  if (root.id === nodeId) return 0;
+
+  for (const child of root.children || []) {
+    const depth = getNodeDepth(child, nodeId);
+    if (depth !== null) return depth + 1;
+  }
+
+  return null;
+}
+
 export function findParentInfo(root: MindMapNode, nodeId: string): ParentInfo | null {
   if (!root.children?.length) return null;
 
@@ -511,28 +522,4 @@ export function clearNodePositions(node: MindMapNode): void {
   delete node.position;
   if (!node.children?.length) return;
   node.children.forEach((child) => clearNodePositions(child));
-}
-
-export function balanceChildren(tree: MindMapTree): MindMapTree {
-  const nextTree = structuredClone(tree);
-  const root = nextTree.root;
-
-  if (!root.children?.length) return nextTree;
-
-  const leftGroup: MindMapNode[] = [];
-  const rightGroup: MindMapNode[] = [];
-
-  root.children.forEach((child, index) => {
-    if (index % 2 === 0) {
-      leftGroup.push(child);
-    } else {
-      rightGroup.push(child);
-    }
-  });
-
-  root.children = [...leftGroup, ...rightGroup.reverse()];
-
-  nextTree.meta.updatedAt = Date.now();
-  nextTree.meta.version += 1;
-  return nextTree;
 }

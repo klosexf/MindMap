@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest';
 import type { MindMapTree } from '../lib/types/mindmap';
 import {
   applyTreePatch,
-  balanceChildren,
   findClosestRectByBorderProximity,
   findParentInfo,
   inferDropModeFromPoint,
@@ -194,112 +193,6 @@ describe('removeNode', () => {
     const tree = sampleTree();
     const removed = removeNode(tree.root, 'nonexistent');
     expect(removed).toBeNull();
-  });
-});
-
-describe('balanceChildren', () => {
-  it('balances even number of children', () => {
-    const tree = sampleTree();
-    const balanced = balanceChildren(tree);
-
-    expect(balanced.root.children?.map((c) => c.id)).toEqual(['a', 'c', 'd', 'b']);
-  });
-
-  it('balances odd number of children', () => {
-    const now = Date.now();
-    const tree: MindMapTree = {
-      id: 'tree',
-      root: {
-        id: 'root',
-        content: 'Root',
-        children: [makeNode('a', 'A'), makeNode('b', 'B'), makeNode('c', 'C')],
-        collapsed: false,
-        meta: {
-          sourceRef: { type: 'text', text: 'root' },
-          createdAt: now,
-          createdBy: 'ai',
-          type: 'main',
-        },
-      },
-      meta: {
-        sourceType: 'text',
-        title: 'demo',
-        createdAt: now,
-        updatedAt: now,
-        version: 1,
-        truncated: false,
-      },
-    };
-
-    const balanced = balanceChildren(tree);
-    expect(balanced.root.children?.map((c) => c.id)).toEqual(['a', 'c', 'b']);
-  });
-
-  it('handles single child', () => {
-    const now = Date.now();
-    const tree: MindMapTree = {
-      id: 'tree',
-      root: {
-        id: 'root',
-        content: 'Root',
-        children: [makeNode('a', 'A')],
-        collapsed: false,
-        meta: {
-          sourceRef: { type: 'text', text: 'root' },
-          createdAt: now,
-          createdBy: 'ai',
-          type: 'main',
-        },
-      },
-      meta: {
-        sourceType: 'text',
-        title: 'demo',
-        createdAt: now,
-        updatedAt: now,
-        version: 1,
-        truncated: false,
-      },
-    };
-
-    const balanced = balanceChildren(tree);
-    expect(balanced.root.children?.map((c) => c.id)).toEqual(['a']);
-  });
-
-  it('handles empty children', () => {
-    const now = Date.now();
-    const tree: MindMapTree = {
-      id: 'tree',
-      root: {
-        id: 'root',
-        content: 'Root',
-        children: [],
-        collapsed: false,
-        meta: {
-          sourceRef: { type: 'text', text: 'root' },
-          createdAt: now,
-          createdBy: 'ai',
-          type: 'main',
-        },
-      },
-      meta: {
-        sourceType: 'text',
-        title: 'demo',
-        createdAt: now,
-        updatedAt: now,
-        version: 1,
-        truncated: false,
-      },
-    };
-
-    const balanced = balanceChildren(tree);
-    expect(balanced.root.children).toEqual([]);
-  });
-
-  it('does not mutate original tree', () => {
-    const tree = sampleTree();
-    const originalIds = tree.root.children?.map((c) => c.id);
-    balanceChildren(tree);
-    expect(tree.root.children?.map((c) => c.id)).toEqual(originalIds);
   });
 });
 

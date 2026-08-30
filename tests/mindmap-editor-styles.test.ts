@@ -61,6 +61,19 @@ describe('mindmap drag preview styles', () => {
     expect(source).toMatch(/stroke:\s*NODE_VISUAL_TOKENS\.stroke/);
   });
 
+  it('drives label font size and weight from per-node metrics so the root title is emphasized', () => {
+    const source = readFileSync(
+      path.join(process.cwd(), 'components/mindmap-editor.tsx'),
+      'utf8',
+    );
+
+    expect(source).toMatch(/getNodeFontMetrics\(datum\.id \|\| '', rootId, depth\)/);
+    expect(source).toMatch(/labelFontSize:/);
+    expect(source).toMatch(/labelFontWeight:/);
+    expect(source).toMatch(/fontSize: editingFontMetrics\?\.fontSize \?\? NODE_VISUAL_TOKENS\.fontSize/);
+    expect(source).toMatch(/fontWeight: editingFontMetrics\?\.fontWeight \?\? NODE_VISUAL_TOKENS\.fontWeight/);
+  });
+
   it('limits node dragging to the right mouse button and suppresses the canvas context menu', () => {
     const source = readFileSync(
       path.join(process.cwd(), 'components/mindmap-editor.tsx'),

@@ -3,11 +3,15 @@ import { readFileSync, writeFileSync } from 'node:fs';
 
 import { parseInput } from '../lib/parsers';
 
+// Manual debug test: only runs when REAL_PDF_PATH is provided, so regular
+// `npm run test` never spawns real OCR python processes or depends on
+// machine-local files.
+const realPdfPath = process.env.REAL_PDF_PATH;
+const itReal = realPdfPath ? it : it.skip;
+
 describe('real pdf debug', () => {
-  it('prints parse debug for provided resume pdf', async () => {
-    const pdfPath =
-      process.env.REAL_PDF_PATH ||
-      '/Users/chenxiaofeng/Downloads/【产品经理_深圳 15-20K】谭艳丽 9年.pdf';
+  itReal('prints parse debug for provided resume pdf', async () => {
+    const pdfPath = realPdfPath as string;
     const buf = readFileSync(pdfPath);
     const base64 = buf.toString('base64');
 

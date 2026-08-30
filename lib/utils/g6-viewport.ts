@@ -142,6 +142,234 @@ export async function focusGraphViewportOnNode(
   }
 }
 
+export type ArrowPanDirection = 'up' | 'down' | 'left' | 'right';
+
+export type ZoomStepDirection = 'in' | 'out';
+
+export interface GraphContentBounds {
+  min: [number, number];
+  max: [number, number];
+}
+
+export interface ArrowPanViewportContext {
+  /** 画布原点在视口坐标系下的位置（graph.getPosition()） */
+  position: ArrayLike<number>;
+  zoom: number;
+  /** 画布尺寸 [宽, 高]（graph.getSize()） */
+  canvasSize: ArrayLike<number>;
+  /** 图内容整体包围盒（画布坐标系，不含视口变换） */
+  contentBounds: GraphContentBounds | null;
+}
+
+/** 方向键拖动画布的最大速度（视口像素 / 秒） */
+export const ARROW_PAN_MAX_SPEED = 600;
+/** 起步速度占最大速度的比例，避免按下瞬间起跳 */
+export const ARROW_PAN_INITIAL_SPEED_RATIO = 0.25;
+/** 从起步速度平滑加速到最大速度的时长（毫秒） */
+export const ARROW_PAN_RAMP_DURATION = 200;
+/** 轻点一下方向键时，画布至少滑行的距离（视口像素） */
+export const ARROW_PAN_TAP_MIN_STEP = 50;
+/** 轻点后收尾滑行的速度（视口像素 / 秒） */
+export const ARROW_PAN_TAIL_SPEED = 420;
+/** 边界检查：内容至少保留在视口内的像素宽度 */
+export const ARROW_PAN_MIN_VISIBLE_MARGIN = 60;
+/** 单帧最大时长（毫秒），防止后台标签页恢复时产生跳变 */
+export const ARROW_PAN_MAX_FRAME_DELTA = 100;
+
+const ARROW_KEY_DIRECTIONS: Record<string, ArrowPanDirection> = {
+  ArrowUp: 'up',
+  ArrowDown: 'down',
+  ArrowLeft: 'left',
+  ArrowRight: 'right',
+};
+
+export function getArrowPanDirection(key: string): ArrowPanDirection | null {
+  return ARROW_KEY_DIRECTIONS[key] ?? null;
+}
+
+/**
+ * 由当前按下的方向集合计算归一化的画布内容平移单位向量。
+ * 方向键语义为"视口向按键方向平移"（与滚轮/滚动条一致），
+ * 因此内容向按键的反方向移动：上键内容向下移（dy > 0），下键向上移（dy < 0），
+ * 左键向右移（dx > 0），右键向左移（dx < 0）。
+ * 斜向（|unit| = √2）归一化为单位向量，保证任意组合的移动速率一致；
+ * 无任何方向时返回 [0, 0]。
+ */
+export function getArrowPanUnit(activeDirections: ReadonlySet<ArrowPanDirection>): [number, number] {
+  let unitX = 0;
+  let unitY = 0;
+  if (activeDirections.has('left')) unitX += 1;
+  if (activeDirections.has('right')) unitX -= 1;
+  if (activeDirections.has('up')) unitY += 1;
+  if (activeDirections.has('down')) unitY -= 1;
+
+  const unitLength = Math.hypot(unitX, unitY);
+  if (unitLength > 1) {
+    unitX /= unitLength;
+    unitY /= unitLength;
+  }
+  return [unitX, unitY];
+}
+
+/**
+ * 计算一帧内方向键拖动画布的位移量（视口像素）。
+ * 方向键指向哪边，视口就向哪边平移，画布内容向反方向移动：
+ * 上键内容向下移（dy > 0），下键向上移（dy < 0），
+ * 左键向右移（dx > 0），右键向左移（dx < 0）。
+ * 速度从起步比例在 ARROW_PAN_RAMP_DURATION 内平滑加速到最大值，
+ * 斜向组合时归一化，保证任意方向的移动速率一致。
+ */
+export function computeArrowPanOffset(
+  activeDirections: ReadonlySet<ArrowPanDirection>,
+  heldMs: number,
+  frameDeltaMs: number,
+): [number, number] {
+  if (activeDirections.size === 0 || !Number.isFinite(frameDeltaMs) || frameDeltaMs <= 0) {
+    return [0, 0];
+  }
+
+  const [unitX, unitY] = getArrowPanUnit(activeDirections);
+  if (unitX === 0 && unitY === 0) return [0, 0];
+
+  const rampProgress =
+    Number.isFinite(heldMs) && heldMs > 0 ? Math.min(heldMs / ARROW_PAN_RAMP_DURATION, 1) : 0;
+  const speedRatio = ARROW_PAN_INITIAL_SPEED_RATIO + (1 - ARROW_PAN_INITIAL_SPEED_RATIO) * rampProgress;
+  const speed = ARROW_PAN_MAX_SPEED * speedRatio;
+  const dtSeconds = Math.min(frameDeltaMs, ARROW_PAN_MAX_FRAME_DELTA) / 1000;
+
+  return [unitX * speed * dtSeconds, unitY * speed * dtSeconds];
+}
+
+/**
+ * 计算轻点方向键后收尾滑行的单帧位移（视口像素）。
+ * 按键已松开但累计位移未达到轻点最小步距时，以固定速度沿原方向继续滑行，
+ * 最后一帧不超过剩余距离，保证精确停在目标步距上。
+ */
+export function computeArrowPanTailOffset(
+  unit: ArrayLike<number>,
+  remainingDistance: number,
+  frameDeltaMs: number,
+): [number, number] {
+  const unitX = Number(unit?.[0]);
+  const unitY = Number(unit?.[1]);
+  if (!Number.isFinite(unitX) || !Number.isFinite(unitY) || (unitX === 0 && unitY === 0)) {
+    return [0, 0];
+  }
+  if (!Number.isFinite(remainingDistance) || remainingDistance <= 0) return [0, 0];
+  if (!Number.isFinite(frameDeltaMs) || frameDeltaMs <= 0) return [0, 0];
+
+  const dtSeconds = Math.min(frameDeltaMs, ARROW_PAN_MAX_FRAME_DELTA) / 1000;
+  const magnitude = Math.min(ARROW_PAN_TAIL_SPEED * dtSeconds, remainingDistance);
+  return [unitX * magnitude, unitY * magnitude];
+}
+
+/** +/- 键缩放的最小比例（与滚轮缩放限制一致） */
+export const ZOOM_KEY_MIN = 0.1;
+/** +/- 键缩放的最大比例（与滚轮缩放限制一致） */
+export const ZOOM_KEY_MAX = 5;
+/** 每按一次 +/- 键的缩放倍率（乘法步进） */
+export const ZOOM_KEY_STEP_RATIO = 1.2;
+
+const ZOOM_IN_KEYS = new Set(['+', '=']);
+const ZOOM_OUT_KEYS = new Set(['-', '_']);
+
+/**
+ * 识别键盘缩放键：+ / = 触发放大，- / _ 触发缩小。
+ * 其余按键返回 null。小键盘的 + / - 同样以 '+' / '-' 命中。
+ */
+export function getZoomStepDirection(key: string): ZoomStepDirection | null {
+  if (ZOOM_IN_KEYS.has(key)) return 'in';
+  if (ZOOM_OUT_KEYS.has(key)) return 'out';
+  return null;
+}
+
+/**
+ * 计算按一次 +/- 键后的目标缩放比例。
+ * 放大乘以 ZOOM_KEY_STEP_RATIO，缩小除以它，结果钳制在
+ * [ZOOM_KEY_MIN, ZOOM_KEY_MAX]；已到达边界时返回当前值，
+ * 调用方据此跳过缩放，避免触发无意义的动画。
+ */
+export function computeZoomStepTarget(currentZoom: number, direction: ZoomStepDirection): number {
+  if (!Number.isFinite(currentZoom) || currentZoom <= 0) return currentZoom;
+
+  const raw =
+    direction === 'in' ? currentZoom * ZOOM_KEY_STEP_RATIO : currentZoom / ZOOM_KEY_STEP_RATIO;
+  return Math.min(Math.max(raw, ZOOM_KEY_MIN), ZOOM_KEY_MAX);
+}
+
+function clampAxisPanOffset(
+  position: number,
+  offset: number,
+  contentMin: number,
+  contentMax: number,
+  zoom: number,
+  viewportSize: number,
+): number {
+  const contentLength = (contentMax - contentMin) * zoom;
+  if (!(contentLength > 0)) return offset;
+
+  // 内容至少保留 minOverlap 像素在视口内，防止把画布完全拖出视野
+  const minOverlap = Math.min(ARROW_PAN_MIN_VISIBLE_MARGIN, contentLength);
+  const lower = minOverlap - contentMax * zoom;
+  const upper = viewportSize - minOverlap - contentMin * zoom;
+  // 视口过小的退化场景，放弃该轴限制
+  if (lower > upper) return offset;
+
+  const next = position + offset;
+  let clampedNext: number;
+  if (position >= lower && position <= upper) {
+    clampedNext = clamp(next, lower, upper);
+  } else {
+    // 已越过边界（例如鼠标拖拽本就无边界）：只阻止继续外移，
+    // 允许朝有效区间移动，且位移量不会超过请求值，因此不会产生回弹跳变
+    clampedNext = clamp(next, Math.min(lower, position), Math.max(upper, position));
+  }
+  return clampedNext - position;
+}
+
+/**
+ * 对方向键拖动画布的单帧位移做边界钳制：
+ * 保证图内容包围盒与视口始终保留最小可见重叠。
+ * 视口信息缺失或非法时退化为不做限制。
+ */
+export function clampArrowPanOffset(
+  offset: ArrayLike<number>,
+  context: ArrowPanViewportContext,
+): [number, number] {
+  const rawX = Number(offset?.[0]);
+  const rawY = Number(offset?.[1]);
+  const fallback: [number, number] = [
+    Number.isFinite(rawX) ? rawX : 0,
+    Number.isFinite(rawY) ? rawY : 0,
+  ];
+
+  const { position, zoom, canvasSize, contentBounds } = context;
+  if (
+    !contentBounds ||
+    !position ||
+    position.length < 2 ||
+    !canvasSize ||
+    canvasSize.length < 2 ||
+    !isFiniteNumber(position[0]) ||
+    !isFiniteNumber(position[1]) ||
+    !isFiniteNumber(canvasSize[0]) ||
+    !isFiniteNumber(canvasSize[1]) ||
+    !isFiniteNumber(zoom)
+  ) {
+    return fallback;
+  }
+
+  const [minX, minY] = contentBounds.min;
+  const [maxX, maxY] = contentBounds.max;
+  if (!isFiniteNumber(minX) || !isFiniteNumber(minY) || !isFiniteNumber(maxX) || !isFiniteNumber(maxY)) {
+    return fallback;
+  }
+
+  const dx = clampAxisPanOffset(position[0], fallback[0], minX, maxX, zoom, canvasSize[0]);
+  const dy = clampAxisPanOffset(position[1], fallback[1], minY, maxY, zoom, canvasSize[1]);
+  return [dx, dy];
+}
+
 export function getViewportLockedEditorRect(
   rect: RectLike,
   viewportRect: RectLike,
