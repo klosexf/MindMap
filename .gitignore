@@ -31,3 +31,4 @@ tmp-*
 
 # 运行时导图数据
 data/
+.matplotlib/
