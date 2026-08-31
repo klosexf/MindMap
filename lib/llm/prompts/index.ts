@@ -8,7 +8,7 @@
  *   的快照与 token 预算门禁
  */
 
-export const PROMPT_VERSION = 'v2.3.0';
+export const PROMPT_VERSION = 'v2.6.0';
 
 export {
   BRANCH_EXPANSION_SYSTEM,
@@ -27,7 +27,12 @@ export {
   STYLE_FRAMEWORK_RULES,
 } from './modules';
 
-export { buildPrompt, buildCompatJsonPrompt } from './mindmap';
+export { buildPrompt, buildCompatJsonPrompt, PROMPT_MARKDOWN_LIMIT } from './mindmap';
+export {
+  detectDocumentGenre,
+  buildGenreHintLines,
+  type DocumentGenreHint,
+} from './genre';
 export { buildMarkdownPreviewPrompt } from './markdown';
 export { buildBranchExpansionPrompt, type BranchExpansionInput } from './branch';
 export {

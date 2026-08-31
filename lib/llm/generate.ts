@@ -7,6 +7,12 @@ import type { FetchFunction } from '@ai-sdk/provider-utils';
 import { Agent } from 'undici';
 
 import {
+  ensureEnumerationRetention,
+  repairCompositeOrdinalBranches,
+  repairNumericUnitsTree,
+} from '@/lib/llm/postprocess';
+
+import {
   llmTreeSchema,
   mindMapTreeSchema,
   type LLMMindMapTree,
@@ -22,9 +28,13 @@ import {
   clampTree,
   countNodes,
   createSourceRefFallback,
+  dedupeSiblingSubtrees,
   getDefaultMindMapTree,
   progressiveTreePatches,
+  repairUnclosedDateBracket,
   rootOnlyTree,
+  sanitizeTreeContent,
+  stripTrailingDanglingPunctuation,
   traverseTree,
 } from '@/lib/utils/tree';
 import {
@@ -95,8 +105,8 @@ const OPENAI_COMPATIBLE_PROVIDER_MAP: Record<OpenAICompatibleProvider, OpenAICom
   hunyuan: {
     keyEnv: 'HUNYUAN_API_KEY',
     baseEnv: 'HUNYUAN_BASE_URL',
-    defaultModel: 'hunyuan-turbos-latest',
-    defaultBaseUrl: 'https://api.hunyuan.cloud.tencent.com/v1',
+    defaultModel: 'hy3-preview',
+    defaultBaseUrl: 'https://tokenhub.tencentmaas.com/v1',
   },
   kimi: {
     keyEnv: 'MOONSHOT_API_KEY',
@@ -151,6 +161,21 @@ function isCompatTimingDebugEnabled(): boolean {
 function logCompatTiming(phase: string, payload: Record<string, unknown>): void {
   if (!isCompatTimingDebugEnabled()) return;
   console.log(`[Compat Timing] ${phase}`, payload);
+}
+
+/**
+ * 生成降级时给用户的失败原因摘要（供 error 事件文案使用）。
+ * 不直接透出原始 error.message——像「The operation was aborted due to
+ * timeout」这类英文技术报错对普通用户观感很差；按常见失败类别归一为
+ * 简短中文描述，未识别的类别给通用文案。
+ */
+export function describeGenerationFailure(error: Error): string {
+  const message = error.message || '';
+  if (/timeout|timed out|aborted|abort/i.test(message)) return 'AI 响应超时，';
+  if (/network|fetch|ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i.test(message)) return '网络连接异常，';
+  if (/401|403|unauthorized|api key|invalid.*key/i.test(message)) return 'AI 服务鉴权失败，';
+  if (/429|rate limit/i.test(message)) return 'AI 服务繁忙，';
+  return 'AI 生成出现异常，';
 }
 
 export interface MarkdownPreviewResult {
@@ -312,7 +337,8 @@ function createHeuristicNode(
 function sanitizeTreeNodeForOutput(node: MindMapNode): MindMapNode[] {
   const sanitizedChildren = (node.children || []).flatMap((child) => sanitizeTreeNodeForOutput(child));
   const content = sanitizeSentence(node.content) || node.content.trim();
-  const trimmed = content.slice(0, 120).trim();
+  // 机械清理（代码层兜底）：悬垂标点剥离 → 日期区间括号闭合（LLM 常见截断残留）
+  const trimmed = repairUnclosedDateBracket(stripTrailingDanglingPunctuation(content.slice(0, 120).trim()));
 
   if (!trimmed) {
     return sanitizedChildren;
@@ -350,7 +376,8 @@ function sanitizeMindMapTreeForOutput(tree: MindMapTree, fallbackTitle: string):
 
   return {
     ...tree,
-    root,
+    // 同父重复子树去重（保留首个）：修复 LLM 重复生成同一分支的问题
+    root: dedupeSiblingSubtrees(root),
   };
 }
 
@@ -1004,17 +1031,23 @@ const MAX_CONTENT_LENGTH = 40;
 export function splitOversizedNodeContent(tree: MindMapTree): MindMapTree {
   function splitText(text: string): string[] {
     if (text.length <= MAX_CONTENT_LENGTH) return [text];
-    
-    const sentenceParts = text.split(/(?<=[。！？.!?])/);
+
+    // 保护日期/版本号中的数字间句点（如 2021.06、v1.2.3），
+    // 避免被当作句末边界拆碎（历史 badcase：（2021 / 06-2022 / 07））
+    const DOT_SENTINEL = '\u0000\u0001\u0000';
+    const guarded = text.replace(/(?<=\d)\.(?=\d)/g, DOT_SENTINEL);
+    const restore = (s: string) => s.split(DOT_SENTINEL).join('.');
+
+    const sentenceParts = guarded.split(/(?<=[。！？.!?])/);
     if (sentenceParts.length >= 2 && sentenceParts[0].trim().length >= 4) {
-      return sentenceParts.map((p) => p.trim()).filter(Boolean);
+      return sentenceParts.map((p) => restore(p.trim())).filter(Boolean);
     }
-    
-    const commaParts = text.split(/(?<=[，,；;：:])/);
+
+    const commaParts = guarded.split(/(?<=[，,；;：:])/);
     if (commaParts.length >= 2 && commaParts[0].trim().length >= 4) {
-      return commaParts.map((p) => p.trim()).filter(Boolean);
+      return commaParts.map((p) => restore(p.trim())).filter(Boolean);
     }
-    
+
     return [text];
   }
 
@@ -1026,9 +1059,9 @@ export function splitOversizedNodeContent(tree: MindMapTree): MindMapTree {
     }
 
     const parts = splitText(node.content);
-    // 深度不足（拆分会超出层级上限）或文本无分隔点时，退化为截断兜底：
+    // 深度不足（拆分会超出 clampTree 允许的层级上限）或文本无分隔点时，退化为截断兜底：
     // 叶层超长内容（如 OCR 原文段落）不允许原样保留
-    if (parts.length <= 1 || depth >= MAX_TREE_DEPTH - 1) {
+    if (parts.length <= 1 || depth >= MAX_TREE_DEPTH) {
       return {
         ...node,
         content: node.content.slice(0, MAX_CONTENT_LENGTH - 1) + '…',
@@ -1329,7 +1362,13 @@ function sanitizePartialNode(raw: unknown): { content: string; children?: any[] 
   const node = raw as { content?: unknown; children?: unknown };
   if (typeof node.content !== 'string' || !node.content.trim()) return null;
 
-  const normalized: { content: string; children?: any[] } = { content: node.content.trim() };
+  // 流式 partial 节点同样做机械清理，保证逐节点流入的预览与终树一致
+  const cleanedContent = repairUnclosedDateBracket(
+    stripTrailingDanglingPunctuation(node.content.trim()),
+  );
+  if (!cleanedContent) return null;
+
+  const normalized: { content: string; children?: any[] } = { content: cleanedContent };
   if (Array.isArray(node.children)) {
     normalized.children = node.children
       .map((child) => sanitizePartialNode(child))
@@ -1361,9 +1400,17 @@ function llmTreeToMindMapTree(llmTree: LLMMindMapTree, doc: NormalizedDocument, 
   const expanded = ensureFirstLayerDetails(filtered, doc);
   const split = splitOversizedNodeContent(expanded);
   const finalTree = removeLeafLabelNodes(split);
+  // 机械清理收尾：截断兜底/超长再拆分可能在 sanitize 之后重新产生
+  // 悬垂标点与未闭合日期括号，必须在管线末端再清理一次
+  const cleanedTree = sanitizeTreeContent(finalTree);
+  // 复合标签守卫：「策略一 / 策略二」式合并节点展平并聚合为主题父分支
+  const compositesRepaired = repairCompositeOrdinalBranches(cleanedTree);
+  // 原文回溯型修复：数字单位守卫（%缺失）+ 枚举清单回补（技能/工具等）
+  const unitRepaired = repairNumericUnitsTree(compositesRepaired, doc.markdown);
+  const enumBackfilled = ensureEnumerationRetention(unitRepaired, doc, sourceRef);
   // 会话级 tree.id：同一流式生成内 skeleton 与 complete 树共享 id，
   // 保证客户端 URL 与存储记录不错位
-  return baseTreeId ? { ...finalTree, id: baseTreeId } : finalTree;
+  return baseTreeId ? { ...enumBackfilled, id: baseTreeId } : enumBackfilled;
 }
 
 /**
@@ -1700,7 +1747,16 @@ async function generateTreeWithCompatProvider(
   });
 
   if (!parsedTreeWithMeta) {
-    throw new Error('兼容模式无法解析智谱返回的导图 JSON');
+    const finishReason = (result as { finishReason?: unknown }).finishReason;
+    const providerLabel = `${llmConfig.resolvedProvider || llmConfig.provider}/${llmConfig.model}`;
+    if (!result.text.trim() && finishReason === 'length') {
+      throw new Error(
+        `兼容模式输出为空：${providerLabel} 在 maxOutputTokens=${jsonMaxTokens} 内耗尽 token（疑似推理模型把额度用于 reasoning 未产出正文，或长文超出上限）。请更换非推理模型或调高 LLM_JSON_MAX_TOKENS`,
+      );
+    }
+    throw new Error(
+      `兼容模式无法解析导图 JSON（provider=${providerLabel} textLength=${result.text.length} finishReason=${String(finishReason)}）`,
+    );
   }
 
   const treeStartedAt = Date.now();
@@ -1769,7 +1825,7 @@ function collectDocumentSummaryLines(doc: NormalizedDocument, maxLines = 24): st
 
 function buildHeuristicDocumentSummaryPoints(doc: NormalizedDocument): string[] {
   const title = doc.sourceMeta.title || '当前文档';
-  const lines = collectDocumentSummaryLines(doc, 6);
+  const lines = collectDocumentSummaryLines(doc, 5);
 
   if (lines.length === 0) {
     const warning = normalizeSummaryPoint(doc.sourceMeta.parseWarning || '');
@@ -1783,7 +1839,7 @@ function buildHeuristicDocumentSummaryPoints(doc: NormalizedDocument): string[] 
   if (doc.sourceMeta.parseWarning) {
     summaryPoints.push(`解析提示：${normalizeSummaryPoint(doc.sourceMeta.parseWarning)}`);
   }
-  return summaryPoints.slice(0, 8);
+  return summaryPoints.slice(0, 5);
 }
 
 function parseSummaryPointsFromText(text: string): string[] {
@@ -1800,13 +1856,13 @@ function parseSummaryPointsFromText(text: string): string[] {
   try {
     const parsed = JSON.parse(jsonCandidate) as unknown;
     if (Array.isArray(parsed)) {
-      return parsed.map((item) => normalizeSummaryPoint(String(item))).filter(Boolean).slice(0, 8);
+      return parsed.map((item) => normalizeSummaryPoint(String(item))).filter(Boolean).slice(0, 5);
     }
     if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { points?: unknown[] }).points)) {
       return (parsed as { points: unknown[] }).points
         .map((item) => normalizeSummaryPoint(String(item)))
         .filter(Boolean)
-        .slice(0, 8);
+        .slice(0, 5);
     }
   } catch {
     // Fallback to bullet parsing.
@@ -1816,7 +1872,7 @@ function parseSummaryPointsFromText(text: string): string[] {
     .split('\n')
     .map((line) => normalizeSummaryPoint(line))
     .filter(Boolean)
-    .slice(0, 8);
+    .slice(0, 5);
 
   return bulletPoints;
 }
@@ -1830,7 +1886,7 @@ function buildDocumentSummaryPrompt(doc: NormalizedDocument): string {
     '你是文档事实总结助手。请直接基于给定原文片段输出简洁中文摘要。',
     '输出要求：',
     '1. 输出 JSON：{"points":["..."]}，不要输出其它字段。',
-    '2. points 数量 3-8 条；若原文信息有限，可少于 3 条。',
+    '2. points 数量 3-5 条；若原文信息有限，可少于 3 条。',
     '3. 只基于给定原文片段，不要编造外部事实，不要补充推断。',
     '4. 重点提炼：核心主题、关键事实、明确结论；仅当原文明示时才写风险、问题或建议。',
     '5. 优先保留高信息密度内容：结论、数字、因果、步骤、差异、限制条件、案例证据。',
@@ -1992,7 +2048,7 @@ export async function generateMindMapJsonPreview(
             parsedJson: parsed.parsedJson,
             rawText: rawJson,
             provider: 'hunyuan-search-enhancement',
-            model: process.env.HUNYUAN_MODEL?.trim() || 'hunyuan-turbos-latest',
+            model: process.env.HUNYUAN_MODEL?.trim() || 'hy3-preview',
           };
         }
       } catch (hunyuanError) {
@@ -2228,8 +2284,8 @@ export async function* generateMindMapStream(
         data: {
           message:
             error instanceof Error
-              ? `${error.message}. 已返回本地启发式结果（节点数 ${countNodes(heuristicTree.root)}）。`
-              : '生成失败，已返回本地启发式结果。',
+              ? `${describeGenerationFailure(error)}已自动生成本地大纲结果（${countNodes(heuristicTree.root)} 个节点）。`
+              : '生成失败，已自动生成本地大纲结果。',
         },
       };
       yield { type: 'complete', data: { tree: heuristicTree } };
@@ -2399,8 +2455,8 @@ export async function* generateMindMapStream(
         data: {
           message:
             error instanceof Error
-              ? `${error.message}. 已返回已生成的部分结果（节点数 ${countNodes(lastPreviewTree.root)}）。`
-              : '生成失败，已返回已生成的部分结果。',
+              ? `${describeGenerationFailure(error)}已保留已生成的部分结果（${countNodes(lastPreviewTree.root)} 个节点）。`
+              : '生成失败，已保留已生成的部分结果。',
         },
       };
       yield { type: 'complete', data: { tree: lastPreviewTree } };
@@ -2412,8 +2468,8 @@ export async function* generateMindMapStream(
         data: {
           message:
             error instanceof Error
-              ? `${error.message}. 已返回本地启发式结果（节点数 ${countNodes(heuristicTree.root)}）。`
-              : '生成失败，已返回本地启发式结果。',
+              ? `${describeGenerationFailure(error)}已自动生成本地大纲结果（${countNodes(heuristicTree.root)} 个节点）。`
+              : '生成失败，已自动生成本地大纲结果。',
         },
       };
       yield { type: 'complete', data: { tree: heuristicTree } };

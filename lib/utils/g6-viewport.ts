@@ -142,6 +142,21 @@ export async function focusGraphViewportOnNode(
   }
 }
 
+/**
+ * 生成回放的镜头跟随：把视口瞬间平移到以目标节点为画面中心。
+ * 刻意不用动画——生成期每拍（~120ms）都会冻结帧并恢复视口，若跟随用
+ * 动画实现，运行中的视口动画会与下一拍的瞬时恢复相互竞态导致抖动；
+ * 瞬时对准配合冻结帧交换，呈现为稳定的步进追踪。
+ */
+export function snapViewportToNode(graph: GraphNodeViewportLike, nodeId: string): void {
+  const targetPosition = getViewportCenterPositionForNode(graph, nodeId);
+  if (!targetPosition) return;
+
+  graph.translateTo(targetPosition, false).catch(() => {
+    // Best-effort viewport follow should not interrupt generation playback.
+  });
+}
+
 export type ArrowPanDirection = 'up' | 'down' | 'left' | 'right';
 
 export type ZoomStepDirection = 'in' | 'out';

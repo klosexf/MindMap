@@ -64,6 +64,7 @@ export function EditorPage({ id }: EditorPageProps) {
   const setLayoutDirection = useMindMapStore((s) => s.setLayoutDirection);
   const moveNode = useMindMapStore((s) => s.moveNode);
   const updateNodePosition = useMindMapStore((s) => s.updateNodePosition);
+  const applyPatches = useMindMapStore((s) => s.applyPatches);
   const canUndo = useMindMapStore((s) => s.canUndo);
   const canRedo = useMindMapStore((s) => s.canRedo);
   const undo = useMindMapStore((s) => s.undo);
@@ -341,6 +342,11 @@ export function EditorPage({ id }: EditorPageProps) {
   const handleApplyAiText = useCallback(
     (nodeId: string, text: string) => {
       updateNodeContent(nodeId, text);
+      // 应用后保持视觉焦点：选中该节点（重渲染完成后补挂高亮），
+      // 并把聚焦挂到下一次全量渲染尾部，让节点按新布局居中，
+      // 避免立即聚焦被 setData+render 的布局重算抵消。
+      setSelectedNode(nodeId);
+      editorRef.current?.focusNodeAfterRender(nodeId);
       const nextTree = useMindMapStore.getState().tree;
       if (nextTree) {
         void saveTreeSnapshot(nextTree);
@@ -348,7 +354,7 @@ export function EditorPage({ id }: EditorPageProps) {
       setNotice('已应用到节点，可撤销');
       setTimeout(() => setNotice(null), 1500);
     },
-    [saveTreeSnapshot, updateNodeContent],
+    [saveTreeSnapshot, setSelectedNode, updateNodeContent],
   );
 
   // AI 生成的问题列表插入为子节点
@@ -382,7 +388,14 @@ export function EditorPage({ id }: EditorPageProps) {
     (updates: Array<{ id: string; position: NodePosition }>) => {
       if (updates.length === 0) return;
       const timestamp = Date.now();
-      applyPatches(updates.map(({ id, position }) => ({ type: 'position' as const, nodeId: id, position, timestamp })));
+      applyPatches(
+        updates.map(({ id, position }) => ({
+          type: 'position' as const,
+          nodeId: id,
+          position,
+          timestamp,
+        })),
+      );
       const nextTree = useMindMapStore.getState().tree;
       if (nextTree) {
         void saveTreeSnapshot(nextTree);
@@ -750,10 +763,6 @@ export function EditorPage({ id }: EditorPageProps) {
         }}
         onAddChild={handleAddChild}
         onAddSibling={handleAddSibling}
-        onToggleCollapse={() => {
-          if (!selectedNodeId) return;
-          toggleNodeCollapse(selectedNodeId);
-        }}
         onDelete={() => {
           if (!selectedNodeId || selectedNodeId === tree.root.id) return;
           deleteNode(selectedNodeId);
@@ -824,6 +833,7 @@ export function EditorPage({ id }: EditorPageProps) {
               layoutDirection={layoutDirection}
               onMoveNode={moveNode}
               onUpdateNodePosition={handleUpdateNodePosition}
+              onUpdateNodePositions={handleUpdateNodePositions}
               onEditEnd={handleEditEnd}
               onEnterWithoutText={handleEnterWithoutText}
               onSelectionChange={handleSelectionChange}

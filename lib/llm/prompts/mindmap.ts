@@ -2,6 +2,8 @@ import type { NormalizedDocument } from '@/lib/types/mindmap';
 import { MAX_TREE_DEPTH, MAX_TREE_NODES } from '@/lib/utils/tree';
 
 import { cleanMarkdownForLLM } from '../text-clean';
+import { buildGenreHintLines } from './genre';
+import { buildStructurePromiseHintLines } from './structure-promises';
 import {
   COVERAGE_CHECKLIST,
   HIGH_VALUE_EXTRACTION_WORKFLOW,
@@ -12,6 +14,9 @@ import {
   STYLE_FRAMEWORK_RULES,
 } from './modules';
 import type { PromptDensity } from './profiles';
+
+/** 注入 prompt 的正文上限：流式与兼容路径共用，避免长文尾部信息单侧丢失 */
+export const PROMPT_MARKDOWN_LIMIT = 12000;
 
 /**
  * 思维导图生成 User Prompt（流式主路径，配 streamObject + llmTreeSchema）。
@@ -29,7 +34,9 @@ import type { PromptDensity } from './profiles';
  */
 export function buildPrompt(doc: NormalizedDocument, opts: { density?: PromptDensity } = {}): string {
   const density: PromptDensity = opts.density ?? 'full';
-  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, 12000);
+  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, PROMPT_MARKDOWN_LIMIT);
+  const genreHintLines = buildGenreHintLines(doc);
+  const promiseHintLines = buildStructurePromiseHintLines(doc);
 
   const fewShotBlock =
     density === 'lean'
@@ -102,6 +109,7 @@ export function buildPrompt(doc: NormalizedDocument, opts: { density?: PromptDen
     `- 最大节点数：${MAX_TREE_NODES}`,
     '- 节点文本目标 15-25 字，上限 35 字；超过 35 字必须拆为父子结构，严禁截断意思',
     '- 一级节点 2-8 个，由内容决定，不凑数；每个节点的直接子节点数 ≤ 8 个，超过时在父节点与叶子之间插入归纳分组',
+    '- 当同类实体数量使一级节点超出 8 个时，正解是把它们聚合进一个主题父分支（见系统指令 §8 并列实体聚合），而不是两两合并成复合标签来凑数',
     '',
     PYRAMID_SELF_CHECK_LOOP,
     '',
@@ -112,6 +120,8 @@ export function buildPrompt(doc: NormalizedDocument, opts: { density?: PromptDen
     ...fewShotBlock,
     `## 文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
+    ...(genreHintLines.length ? [...genreHintLines, ''] : []),
+    ...(promiseHintLines.length ? [...promiseHintLines, ''] : []),
     '## 输入内容',
     cleanedMarkdown,
   ].join('\n');
@@ -119,10 +129,13 @@ export function buildPrompt(doc: NormalizedDocument, opts: { density?: PromptDen
 
 /**
  * 思维导图生成 User Prompt（兼容模式，full 密度档，配 generateText + 手动 JSON 解析）。
- * 与流式版共用 System；差异：显式 JSON 输出要求 + 正文截断 8000 字。
+ * 与流式版共用 System；差异：显式 JSON 输出要求。
+ * 正文截断与流式版共用同一上限（PROMPT_MARKDOWN_LIMIT），避免长文尾部信息丢失。
  */
 export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
-  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, 8000);
+  const cleanedMarkdown = cleanMarkdownForLLM(doc.markdown).slice(0, PROMPT_MARKDOWN_LIMIT);
+  const genreHintLines = buildGenreHintLines(doc);
+  const promiseHintLines = buildStructurePromiseHintLines(doc);
   return [
     '你是一名结构化信息提炼专家。任务：严格遵循系统指令中的金字塔原理四原则，从原文中精准提炼信息并组织为**总分结构**思维导图 JSON。',
     '',
@@ -157,6 +170,7 @@ export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '- 节点文本目标 15-25 字，上限 35 字。',
     '- 超过 35 字必须拆为父子结构，严禁截断意思。',
     '- 一级节点 2-8 个，由内容决定，不凑数。',
+    '- 同类实体过多时正解是聚合进一个主题父分支（见系统指令 §8），禁止两两合并成复合标签凑数。',
     '- 每个节点的直接子节点数 ≤ 8 个；超过时自动创建中间归纳分组。',
     '- 所有二级节点必须至少展开一层；二级节点不得保持叶子状态；子节点必须来自原文。',
     '',
@@ -174,6 +188,8 @@ export function buildCompatJsonPrompt(doc: NormalizedDocument): string {
     '',
     `## 文档标题：${doc.sourceMeta.title || '自动生成思维导图'}`,
     '',
+    ...(genreHintLines.length ? [...genreHintLines, ''] : []),
+    ...(promiseHintLines.length ? [...promiseHintLines, ''] : []),
     '## 输入内容',
     cleanedMarkdown,
   ].join('\n');

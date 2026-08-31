@@ -433,6 +433,103 @@ export function applyTreePatch(tree: MindMapTree, patch: TreePatch): MindMapTree
   return nextTree;
 }
 
+const TRAILING_DANGLING_RE = /[，、；;,.。]+$/;
+
+/** 剥离节点末尾的悬垂标点（逗号/顿号/分号等截断残留） */
+export function stripTrailingDanglingPunctuation(content: string): string {
+  return content.replace(TRAILING_DANGLING_RE, '').trim();
+}
+
+const TRAILING_CONNECTIVE_RE = /(?:[是与和或及的]\s*)+$/;
+
+/**
+ * 剥离节点末尾的连接词/结构助词残尾（句中截断特征，如「不公平是」→「不公平」、
+ * 「不公平的」→「不公平」）。
+ * 保守条件：剥离后剩余非空白字符 ≥ 2，避免误伤「目的」「总和」「于是」等
+ * 以连接字结尾的完整词（这类词剥离后只剩 1 字，会被长度守卫拦下）。
+ */
+export function stripTrailingConnectiveParticles(content: string): string {
+  const stripped = content.replace(TRAILING_CONNECTIVE_RE, '').trim();
+  if (stripped === content.trim()) return content.trim();
+  if (stripped.replace(/\s/g, '').length < 2) return content.trim();
+  return stripped;
+}
+
+/**
+ * 剥离节点开头的孤立数字残片（OCR/解析碎片，如「06 深圳产品羽兔网…」）。
+ * 保守条件：仅 1-4 位数字 + 空白 + 非数字正文，且剥离后剩余内容足够长；
+ * 不影响「3-5人团队」「199万」等以数字开头的正常信息。
+ */
+export function stripLeadingFragmentDigits(content: string): string {
+  const trimmed = content.trim();
+  const match = trimmed.match(/^(\d{1,4})(\s+)(\D.*)$/s);
+  if (!match) return trimmed;
+  const rest = match[3].trim();
+  // 剥离后必须仍是可读内容（≥4 个非空白字符）
+  if (rest.replace(/\s/g, '').length < 4) return trimmed;
+  // 首位数字后紧跟的正文若以日期/时间词开头则视为时间残片，一并不可依赖——仅剥离数字本身
+  return rest;
+}
+
+/** 未闭合括号尾部若为日期区间（如 `公司（2023.03-2023.06`），补齐右括号 */
+export function repairUnclosedDateBracket(content: string): string {
+  const fullOpen = (content.match(/（/g) ?? []).length;
+  const fullClose = (content.match(/）/g) ?? []).length;
+  if (
+    fullOpen > fullClose &&
+    /（[^（）]*\d{4}(?:\.\d{1,2})?\s*[-–—~至]\s*\d{4}(?:\.\d{1,2})?[^（）]*$/.test(content)
+  ) {
+    return `${content}）`;
+  }
+  const halfOpen = (content.match(/\(/g) ?? []).length;
+  const halfClose = (content.match(/\)/g) ?? []).length;
+  if (
+    halfOpen > halfClose &&
+    /\([^()]*\d{4}(?:\.\d{1,2})?\s*[-–—~至]\s*\d{4}(?:\.\d{1,2})?[^()]*$/.test(content)
+  ) {
+    return `${content})`;
+  }
+  return content;
+}
+
+/** 以 content + 子树结构生成签名（忽略 id/meta，用于同父去重） */
+function subtreeSignature(node: MindMapNode): string {
+  const children = (node.children ?? []).map(subtreeSignature).join('|');
+  return `${node.content}(${children})`;
+}
+
+/** 同父节点下结构完全相同的子树去重（保留首个）——修复 LLM 重复生成问题 */
+export function dedupeSiblingSubtrees(node: MindMapNode): MindMapNode {
+  if (!node.children?.length) return node;
+  const seen = new Set<string>();
+  const children = node.children
+    .map((child) => dedupeSiblingSubtrees(child))
+    .filter((child) => {
+      const signature = subtreeSignature(child);
+      if (seen.has(signature)) return false;
+      seen.add(signature);
+      return true;
+    });
+  return { ...node, children };
+}
+
+/**
+ * 树内容机械清理（代码层兜底，不依赖模型自检）：
+ * 悬垂标点剥离 + 连接词残尾剥离 + 开头数字残片剥离 + 日期区间括号闭合 + 同父重复子树去重。
+ */
+export function sanitizeTreeContent(tree: MindMapTree): MindMapTree {
+  const cleanNode = (node: MindMapNode): MindMapNode => ({
+    ...node,
+    content: repairUnclosedDateBracket(
+      stripTrailingConnectiveParticles(
+        stripTrailingDanglingPunctuation(stripLeadingFragmentDigits(node.content)),
+      ),
+    ),
+    children: (node.children ?? []).map(cleanNode),
+  });
+  return { ...tree, root: dedupeSiblingSubtrees(cleanNode(tree.root)) };
+}
+
 export function clampTree(tree: MindMapTree, maxDepth = MAX_TREE_DEPTH, maxNodes = MAX_TREE_NODES): MindMapTree {
   const next = structuredClone(tree);
   let visited = 0;

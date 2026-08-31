@@ -2,6 +2,7 @@ import { parsePdfInput } from '@/lib/parsers/pdf';
 import { parseTextInput } from '@/lib/parsers/text';
 import { parseUrlInput } from '@/lib/parsers/url';
 import { parseWeChatUrl, isWeChatArticleUrl } from '@/lib/parsers/wechat';
+import { normalizeOcrDocument } from '@/lib/parsers/normalize';
 import type { NormalizedDocument, SourceType } from '@/lib/types/mindmap';
 import type { PdfParseOptions } from '@/lib/parsers/pdf';
 
@@ -29,7 +30,8 @@ export async function parseInput(params: ParseInputParams): Promise<NormalizedDo
       }
       return parseUrlInput(params.content);
     case 'pdf':
-      return parsePdfInput(params.content, params.fileName, params.pdfOptions);
+      // OCR 输出归一化：康熙部首还原 + CJK 空格折叠（仅 PDF 链路需要）
+      return normalizeOcrDocument(await parsePdfInput(params.content, params.fileName, params.pdfOptions));
     case 'wechat':
       return parseWeChatUrl(params.content, params.wechatOptions);
     default:

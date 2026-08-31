@@ -383,6 +383,95 @@ describe('parseInput', () => {
     expect(doc.markdown).toContain('求职目标：产品经理');
   });
 
+  it('splits MinerU submissions into batches of at most 20 pages', async () => {
+    process.env.PDF_OCR_ENGINE = 'mineru';
+    process.env.PDF_OCR_MAX_PAGES = '25';
+    process.env.MINERU_RETRY_TIMES = '0';
+
+    const submissions: string[] = [];
+    const fetchMock = vi.fn(async (url: unknown, init?: { body?: unknown }) => {
+      const rawBody = typeof init?.body === 'string' ? init.body : null;
+      const body = rawBody ? (JSON.parse(rawBody) as { page_range?: string }) : null;
+      if (body && body.page_range) {
+        submissions.push(body.page_range);
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: {
+              task_id: `task-${submissions.length}`,
+              file_url: `https://upload.example.com/file-${submissions.length}`,
+            },
+          }),
+        };
+      }
+      const urlStr = String(url);
+      if (urlStr.includes('upload.example.com')) {
+        return { ok: true };
+      }
+      if (urlStr.includes('/parse/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: { state: 'done', markdown_url: 'https://result.example.com/out.md' },
+          }),
+        };
+      }
+      return { ok: true, text: async () => 'Mineru batch markdown with enough characters for acceptance.' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const doc = await parseInput({
+      type: 'pdf',
+      content: createMultiPagePdfBase64(Array<string>(25).fill('')),
+      fileName: 'scan-25p.pdf',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+    expect(submissions).toEqual(['1-20', '21-25']);
+    expect(doc.sourceMeta.ocrDebug?.provider).toBe('mineru');
+    expect(doc.sourceMeta.ocrUsed).toBe(true);
+    expect(doc.sourceMeta.ocrDebug?.attemptedPages).toBe(25);
+    expect(doc.sourceMeta.ocrDebug?.acceptedPages).toBe(2);
+    expect(doc.markdown).toContain('Mineru batch markdown');
+  });
+
+  it('supplements OCR only for pages missing a text layer in text-rich PDFs', async () => {
+    process.env.PDF_OCR_ENGINE = 'tesseract';
+    tesseractMocks.createWorker.mockResolvedValue({
+      recognize: tesseractMocks.recognize,
+      terminate: tesseractMocks.terminate,
+    });
+    tesseractMocks.recognize.mockResolvedValue({
+      data: { text: 'Missing page OCR content recovered from image-only page.' },
+    });
+    tesseractMocks.terminate.mockResolvedValue(undefined);
+
+    const doc = await parseInput({
+      type: 'pdf',
+      content: createMultiPagePdfBase64([
+        'Readable page one '.repeat(20),
+        '',
+        'Readable page three '.repeat(20),
+      ]),
+      fileName: 'mixed.pdf',
+    });
+
+    const ocrDebug = doc.sourceMeta.ocrDebug;
+    expect(ocrDebug?.attempted).toBe(true);
+    expect(ocrDebug?.attemptedPages).toBe(1);
+    expect(ocrDebug?.pages).toHaveLength(1);
+    expect(ocrDebug?.pages[0]?.page).toBe(2);
+    // 文本层仍是主要内容，不触发全文档 OCR
+    expect(doc.markdown).toContain('[page:1]');
+    expect(doc.markdown).toContain('[page:3]');
+    if (ocrDebug?.pages[0]?.accepted) {
+      expect(doc.sourceMeta.ocrUsed).toBe(true);
+      expect(doc.markdown).toContain('[ocr-page:2]');
+    }
+  });
+
   it('falls back to local OCR when MinerU fetch fails', async () => {
     process.env.PDF_OCR_ENGINE = 'mineru';
     process.env.MINERU_RETRY_TIMES = '0';

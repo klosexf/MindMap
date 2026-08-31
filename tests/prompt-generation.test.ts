@@ -5,6 +5,7 @@ import {
   buildCompatJsonPrompt,
   buildMarkdownPreviewPrompt,
   buildPrompt,
+  PROMPT_MARKDOWN_LIMIT,
 } from '../lib/llm/prompts';
 import type { NormalizedDocument } from '../lib/types/mindmap';
 import { MAX_TREE_DEPTH, MAX_TREE_NODES } from '../lib/utils/tree';
@@ -66,6 +67,52 @@ describe('Prompt Generation', () => {
       expect(ANTI_HALLUCINATION_SYSTEM).toContain('绝对禁止编造、推测、补充、合理化');
       expect(ANTI_HALLUCINATION_SYSTEM).toContain('同一信息多次出现时只保留一次');
       expect(ANTI_HALLUCINATION_SYSTEM).toContain('文末被截断时以最后一个完整段落为准');
+    });
+
+    it('should include node integrity rules (mechanically verifiable)', () => {
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('节点完整性');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('单一来源原则');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('数字与单位不可分割');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('枚举完整性');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('禁止节点以孤立数字、日期残片、地点碎片开头');
+    });
+
+    it('should include proper-noun verbatim red line', () => {
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('专名逐字红线');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('禁止改写、缩写、翻译或合理化');
+    });
+
+    it('should include genre-agnostic structure paradigm selection (not resume-specific)', () => {
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('结构范式选择');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('先判断文档体裁');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('平行结构一致性');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('事实层与评价层分离');
+      // 反过拟合：禁止把骨架写死在某一文体上
+      expect(ANTI_HALLUCINATION_SYSTEM).not.toContain('识别为简历');
+      expect(ANTI_HALLUCINATION_SYSTEM).not.toContain('个人简历时');
+    });
+
+    it('should forbid composite entity labels and truncated branch titles (§8 Tal badcase)', () => {
+      // 结构承诺兑现：编号/计数/重复模式三类形态，文体无关表述
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('结构承诺必须兑现');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('显式计数');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('禁止虚构编号');
+      // 并列实体聚合为独立主题父分支
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('并列实体聚合');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('主题父分支');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('禁止两两拆分');
+      // 同类实体逐项独立，禁止复合标签
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('逐项独立成节点');
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('复合标签');
+      // 分支标签与叶子同权适用语义完整性
+      expect(ANTI_HALLUCINATION_SYSTEM).toContain('分支标签与叶子同权');
+      // 反过拟合：§8 禁止出现任何具体文体的示例词
+      expect(ANTI_HALLUCINATION_SYSTEM).not.toContain('策略一');
+      expect(ANTI_HALLUCINATION_SYSTEM).not.toContain('不公平是');
+    });
+
+    it('should share the same markdown limit between stream and compat prompts', () => {
+      expect(PROMPT_MARKDOWN_LIMIT).toBe(12000);
     });
   });
 
@@ -213,6 +260,26 @@ describe('Prompt Generation', () => {
       // few-shot 压缩后，反例承载的规则必须仍以规则文本形式存在
       expect(leanPrompt).toContain('文件名禁令');
       expect(leanPrompt).toContain('语义归属');
+    });
+
+    it('should inject genre hint only when a genre is detected (体裁差异走 User 层)', () => {
+      const resumeDoc: NormalizedDocument = {
+        markdown: '工作经历：……\n教育背景：……\n专业技能：Figma、Axure',
+        chunks: [],
+        sourceMeta: { type: 'text', title: '某候选人简历' },
+      };
+
+      // 未检出文体：不注入任何提示，System 通用逻辑兜底
+      expect(buildPrompt(testDoc)).not.toContain('文档体裁提示');
+      expect(buildCompatJsonPrompt(testDoc)).not.toContain('文档体裁提示');
+
+      // 检出简历：注入体裁提示 + 范式建议，并声明仅供参考
+      const prompted = buildPrompt(resumeDoc);
+      expect(prompted).toContain('文档体裁提示');
+      expect(prompted).toContain('个人简历');
+      expect(prompted).toContain('实体→属性→量化证据');
+      expect(prompted).toContain('仅供参考');
+      expect(buildCompatJsonPrompt(resumeDoc)).toContain('文档体裁提示');
     });
   });
 });

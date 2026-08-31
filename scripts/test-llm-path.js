@@ -121,8 +121,8 @@ const providerKeys = {
   hunyuan: {
     key: process.env.HUNYUAN_API_KEY,
     keyEnv: 'HUNYUAN_API_KEY',
-    baseUrl: process.env.HUNYUAN_BASE_URL || 'https://api.hunyuan.cloud.tencent.com/v1',
-    defaultModel: 'hunyuan-turbos-latest',
+    baseUrl: process.env.HUNYUAN_BASE_URL || 'https://tokenhub.tencentmaas.com/v1',
+    defaultModel: 'hy3-preview',
   },
   deepseek: {
     key: process.env.DEEPSEEK_API_KEY,

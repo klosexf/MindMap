@@ -26,7 +26,6 @@ interface EditorToolbarProps {
   onAiOptimize: () => void;
   onAddChild: () => void;
   onAddSibling: () => void;
-  onToggleCollapse: () => void;
   onDelete: () => void;
   onSave: () => void;
   onExportMarkdown: () => void;
@@ -157,15 +156,6 @@ function IconAddSibling() {
       <rect x="14" y="2.5" width="6" height="6" rx="1.2" />
       <rect x="14" y="15.5" width="6" height="6" rx="1.2" />
       <path d="M9 12h2.5" />
-    </svg>
-  );
-}
-
-function IconCollapse() {
-  return (
-    <svg {...iconProps}>
-      <path d="M7 4v16M7 12h10" />
-      <path d="m14 8 3 4-3 4" />
     </svg>
   );
 }
@@ -460,7 +450,6 @@ export function EditorToolbar({
   onAiOptimize,
   onAddChild,
   onAddSibling,
-  onToggleCollapse,
   onDelete,
   onSave,
   onExportMarkdown,
@@ -565,13 +554,6 @@ export function EditorToolbar({
             onClick={onAddChild}
             disabled={!hasSelection || generating}
             title="添加细分主题 (Tab)"
-          />
-          <ToolButton
-            icon={<IconCollapse />}
-            label="折叠"
-            onClick={onToggleCollapse}
-            disabled={!hasSelection}
-            title="折叠 / 展开节点"
           />
           <ToolButton
             icon={<IconTrash />}

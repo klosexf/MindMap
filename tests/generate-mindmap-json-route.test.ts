@@ -68,7 +68,9 @@ describe('POST /api/generate/mindmap-json', () => {
   });
 
   it('falls back to heuristic json when llm json generation fails', async () => {
-    generateMindMapJsonPreviewMock.mockRejectedValue(new Error('LLM timeout'));
+    // 注意：route 会把含 timeout/aborted 的错误归一化为通用超时文案，
+    // 因此这里用非超时错误验证「原始错误透传 + 兜底树生效」。
+    generateMindMapJsonPreviewMock.mockRejectedValue(new Error('LLM json 解析失败'));
     buildHeuristicMindMapTreeMock.mockReturnValue({
       id: 'fallback-tree-id',
       root: {
@@ -105,7 +107,7 @@ describe('POST /api/generate/mindmap-json', () => {
     const json = await res.json();
 
     expect(res.status).toBe(200);
-    expect(json.warning).toContain('LLM timeout');
+    expect(json.warning).toContain('LLM json 解析失败');
     expect(json.json?.root?.content).toBe('候选人画像');
     expect(json.proof).toEqual({
       source: 'heuristic-fallback',

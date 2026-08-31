@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { readGraphViewportState, restoreGraphViewportState } from '../lib/utils/g6-viewport';
+import { readGraphViewportState, restoreGraphViewportState, snapViewportToNode } from '../lib/utils/g6-viewport';
 
 describe('g6 viewport helpers', () => {
   it('reads a valid viewport snapshot from the graph', () => {
@@ -91,5 +91,53 @@ describe('g6 viewport helpers', () => {
         zoom: 1.25,
       }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('snapViewportToNode (生成期镜头跟随)', () => {
+  const makeGraph = () => ({
+    getElementPosition: vi.fn((): ArrayLike<number> | null | undefined => [200, 100]),
+    getSize: vi.fn(() => [1200, 800]),
+    getZoom: vi.fn(() => 2),
+    translateTo: vi.fn(async () => {}),
+  });
+
+  it('瞬时平移视口使目标节点居中（无动画）', () => {
+    const graph = makeGraph();
+
+    snapViewportToNode(graph, 'node-1');
+
+    // position = canvas/2 - nodeXY * zoom = [600 - 400, 400 - 200]
+    expect(graph.translateTo).toHaveBeenCalledWith([200, 200], false);
+  });
+
+  it('节点位置不可读时不平移', () => {
+    const graph = makeGraph();
+    graph.getElementPosition = vi.fn(() => null);
+
+    snapViewportToNode(graph, 'missing-node');
+
+    expect(graph.translateTo).not.toHaveBeenCalled();
+  });
+
+  it('读取节点位置抛错时不平移且不向外抛出', () => {
+    const graph = makeGraph();
+    graph.getElementPosition = vi.fn(() => {
+      throw new Error('node not found');
+    });
+
+    expect(() => snapViewportToNode(graph, 'broken-node')).not.toThrow();
+    expect(graph.translateTo).not.toHaveBeenCalled();
+  });
+
+  it('translateTo 被拒绝时不向外抛出', async () => {
+    const graph = makeGraph();
+    graph.translateTo = vi.fn(async () => {
+      throw new Error('viewport busy');
+    });
+
+    expect(() => snapViewportToNode(graph, 'node-1')).not.toThrow();
+    // 等待被拒绝的 promise 微任务落地，确认 rejection 已被吞掉
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
   });
 });

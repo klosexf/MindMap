@@ -17,10 +17,13 @@ const PDF_TEXT_MIN_LENGTH = 200;
 const PDF_OCR_MIN_LENGTH = 30;
 const PDF_RENDER_SCALE = 3;
 const PDF_OCR_MAX_PAGES_DEFAULT = 3;
-const PDF_OCR_TIMEOUT_MS_DEFAULT = 120_000;
+const PDF_OCR_TIMEOUT_MS_DEFAULT = 300_000;
 const PDF_SIPS_TIMEOUT_MS_DEFAULT = 20_000;
 const PDF_VLM_OCR_TIMEOUT_MS_DEFAULT = 30_000;
-const PADDLE_OCR_PAGE_TIMEOUT_MS_DEFAULT = 120_000;
+const PADDLE_OCR_PAGE_TIMEOUT_MS_DEFAULT = 180_000;
+// Mineru agent API rejects tasks with more than 20 pages, so larger
+// documents must be submitted in batches of at most 20 pages.
+const MINERU_MAX_PAGES_PER_TASK = 20;
 const MINERU_POLL_INTERVAL_MS_DEFAULT = 2_000;
 const MINERU_POLL_TIMEOUT_MS_DEFAULT = 240_000;
 const MINERU_RETRY_TIMES_DEFAULT = 2;
@@ -661,7 +664,7 @@ function ensurePdfFileName(fileName: string): string {
 async function submitMineruTask(
   buffer: Uint8Array,
   fileName: string,
-  maxPages: number,
+  pageRange: string,
   config: MineruOcrConfig,
 ): Promise<string> {
   const requestFetch = getMineruFetchWithLocalCA();
@@ -676,7 +679,7 @@ async function submitMineruTask(
         file_name: ensurePdfFileName(fileName),
         is_ocr: config.isOcr,
         language: config.language,
-        page_range: maxPages > 1 ? `1-${maxPages}` : '1',
+        page_range: pageRange,
         enable_table: config.enableTable,
         enable_formula: config.enableFormula,
       }),
@@ -937,10 +940,9 @@ async function asyncPool<T>(concurrency: number, items: T[], fn: (item: T) => Pr
 
 async function ocrPdfPagesWithVlm(
   buffer: Uint8Array,
-  maxPages: number,
+  pages: number[],
   config: VlmOcrConfig,
 ): Promise<OcrPagesResult> {
-  const pages = Array.from({ length: maxPages }, (_, i) => i + 1);
   const results: Array<{
     page: number;
     rawText: string;
@@ -982,7 +984,7 @@ async function ocrPdfPagesWithVlm(
       accepted: r.accepted,
       ...(r.reason ? { reason: r.reason } : {}),
     })),
-    attemptedPages: maxPages,
+    attemptedPages: pages.length,
     errorMessages: results.filter((r) => !r.accepted).map((r) => `page_${r.page}:${r.reason}`),
     provider: config.provider,
     model: config.model,
@@ -991,10 +993,9 @@ async function ocrPdfPagesWithVlm(
 
 async function ocrPdfPagesWithPaddle(
   buffer: Uint8Array,
-  maxPages: number,
+  pages: number[],
   config: PaddleOcrConfig,
 ): Promise<OcrPagesResult> {
-  const pages = Array.from({ length: maxPages }, (_, i) => i + 1);
   const results: Array<{
     page: number;
     rawText: string;
@@ -1041,16 +1042,36 @@ async function ocrPdfPagesWithPaddle(
       accepted: r.accepted,
       ...(r.reason ? { reason: r.reason } : {}),
     })),
-    attemptedPages: maxPages,
+    attemptedPages: pages.length,
     errorMessages: results.filter((r) => !r.accepted).map((r) => `page_${r.page}:${r.reason}`),
     provider: 'paddleocr',
     model: `lang:${config.lang}`,
   };
 }
 
+function splitPagesIntoMineruBatches(pages: number[]): number[][] {
+  const sorted = [...pages].sort((a, b) => a - b);
+  const batches: number[][] = [];
+  let current: number[] = [];
+  for (const page of sorted) {
+    const prev = current[current.length - 1];
+    if (current.length > 0 && (page !== prev + 1 || current.length >= MINERU_MAX_PAGES_PER_TASK)) {
+      batches.push(current);
+      current = [];
+    }
+    current.push(page);
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+function toMineruPageRange(pages: number[]): string {
+  return pages.length > 1 ? `${pages[0]}-${pages[pages.length - 1]}` : `${pages[0]}`;
+}
+
 async function ocrPdfPagesWithMineru(
   buffer: Uint8Array,
-  maxPages: number,
+  pages: number[],
   fileName: string,
   config: MineruOcrConfig,
 ): Promise<OcrPagesResult> {
@@ -1066,80 +1087,61 @@ async function ocrPdfPagesWithMineru(
     );
   };
 
-  let lastError = '';
-  for (let attempt = 0; attempt <= config.retryTimes; attempt += 1) {
-    try {
-      const taskId = await submitMineruTask(buffer, fileName, maxPages, config);
-      const rawText = await pollMineruMarkdown(taskId, config);
-      const cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
-      const hasMeaningfulText = cleanedText.length >= 12;
+  const batches = splitPagesIntoMineruBatches(pages);
+  const pageTexts: Array<{ page: number; text: string }> = [];
+  const pageDebugs: OcrPageDebug[] = [];
+  const errorMessages: string[] = [];
+  let attemptedPages = 0;
 
-      return {
-        pageTexts: hasMeaningfulText ? [{ page: 1, text: cleanedText }] : [],
-        pageDebugs: [
-          {
-            page: 1,
-            rawText,
-            cleanedText,
-            accepted: hasMeaningfulText,
-            ...(hasMeaningfulText ? {} : { reason: 'mineru_ocr_text_too_short' }),
-          },
-        ],
-        attemptedPages: maxPages,
-        errorMessages: hasMeaningfulText ? [] : ['page_1:mineru_ocr_text_too_short'],
-        provider: 'mineru',
-        model: 'agent',
-      };
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : 'unknown_mineru_ocr_error';
-      const canRetry = attempt < config.retryTimes && isRetryableError(lastError);
-      if (canRetry) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * (attempt + 1), 8000)));
-        continue;
+  for (const batch of batches) {
+    const pageRange = toMineruPageRange(batch);
+    let lastError = '';
+    let accepted = false;
+    let rawText = '';
+    let cleanedText = '';
+
+    for (let attempt = 0; attempt <= config.retryTimes; attempt += 1) {
+      try {
+        const taskId = await submitMineruTask(buffer, fileName, pageRange, config);
+        rawText = await pollMineruMarkdown(taskId, config);
+        cleanedText = collapseCjkSpacing(rawText).replace(/[ \t]{2,}/g, ' ').trim();
+        accepted = cleanedText.length >= 12;
+        if (!accepted) lastError = 'mineru_ocr_text_too_short';
+        break;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : 'unknown_mineru_ocr_error';
+        const canRetry = attempt < config.retryTimes && isRetryableError(lastError);
+        if (canRetry) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * (attempt + 1), 8000)));
+          continue;
+        }
+        break;
       }
-      break;
+    }
+
+    attemptedPages += batch.length;
+
+    if (accepted) {
+      pageTexts.push({ page: batch[0], text: cleanedText });
+      pageDebugs.push({ page: batch[0], rawText, cleanedText, accepted: true });
+    } else {
+      const reason = lastError || 'unknown_mineru_ocr_error';
+      errorMessages.push(`page_${batch[0]}:${reason}`);
+      pageDebugs.push({ page: batch[0], rawText: '', cleanedText: '', accepted: false, reason });
     }
   }
 
-  try {
-    const message = lastError || 'unknown_mineru_ocr_error';
-    return {
-      pageTexts: [],
-      pageDebugs: [
-        {
-          page: 1,
-          rawText: '',
-          cleanedText: '',
-          accepted: false,
-          reason: message,
-        },
-      ],
-      attemptedPages: maxPages,
-      errorMessages: [`page_1:${message}`],
-      provider: 'mineru',
-      model: 'agent',
-    };
-  } catch {
-    return {
-      pageTexts: [],
-      pageDebugs: [
-        {
-          page: 1,
-          rawText: '',
-          cleanedText: '',
-          accepted: false,
-          reason: 'unknown_mineru_ocr_error',
-        },
-      ],
-      attemptedPages: maxPages,
-      errorMessages: ['page_1:unknown_mineru_ocr_error'],
-      provider: 'mineru',
-      model: 'agent',
-    };
-  }
+  return {
+    pageTexts,
+    pageDebugs,
+    attemptedPages,
+    errorMessages,
+    provider: 'mineru',
+    model: 'agent',
+  };
 }
 
-async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): Promise<OcrPagesResult> {
+async function ocrPdfPagesWithTesseract(buffer: Uint8Array, pages: number[]): Promise<OcrPagesResult> {
   const Tesseract = await import('tesseract.js');
   const langPath = process.env.TESSERACT_LANG_PATH?.trim();
   const cachePath = process.env.TESSERACT_CACHE_PATH?.trim();
@@ -1213,7 +1215,6 @@ async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): P
   };
 
   // Run pages in parallel with concurrency limit of 3 to avoid excessive Tesseract memory
-  const pages = Array.from({ length: maxPages }, (_, i) => i + 1);
   await asyncPool(3, pages, processPage);
 
   results.sort((a, b) => a.page - b.page);
@@ -1227,7 +1228,7 @@ async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): P
       accepted: r.accepted,
       ...(r.reason ? { reason: r.reason } : {}),
     })),
-    attemptedPages: maxPages,
+    attemptedPages: pages.length,
     errorMessages: results.filter((r) => !r.accepted).map((r) => `page_${r.page}:${r.reason}`),
     provider: 'tesseract',
     model: 'eng+chi_sim',
@@ -1236,7 +1237,7 @@ async function ocrPdfPagesWithTesseract(buffer: Uint8Array, maxPages: number): P
 
 async function ocrPdfPages(
   buffer: Uint8Array,
-  maxPages: number,
+  pages: number[],
   fileName: string,
   options?: { allowLocalFallback?: boolean },
 ): Promise<OcrPagesResult> {
@@ -1247,7 +1248,7 @@ async function ocrPdfPages(
   const allowLocalFallback = options?.allowLocalFallback !== false;
 
   if (engine === 'mineru') {
-    const mineruResult = await ocrPdfPagesWithMineru(buffer, maxPages, fileName, mineruConfig);
+    const mineruResult = await ocrPdfPagesWithMineru(buffer, pages, fileName, mineruConfig);
     if (mineruResult.pageTexts.length > 0) {
       return mineruResult;
     }
@@ -1256,21 +1257,21 @@ async function ocrPdfPages(
     }
 
     if (paddleConfig) {
-      const paddleResult = await ocrPdfPagesWithPaddle(buffer, maxPages, paddleConfig);
+      const paddleResult = await ocrPdfPagesWithPaddle(buffer, pages, paddleConfig);
       if (paddleResult.pageTexts.length > 0) {
         return {
           ...paddleResult,
           errorMessages: [...mineruResult.errorMessages, ...paddleResult.errorMessages],
         };
       }
-      const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+      const tesseractResult = await ocrPdfPagesWithTesseract(buffer, pages);
       return {
         ...tesseractResult,
         errorMessages: [...mineruResult.errorMessages, ...paddleResult.errorMessages, ...tesseractResult.errorMessages],
       };
     }
 
-    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, pages);
     return {
       ...tesseractResult,
       errorMessages: [...mineruResult.errorMessages, ...tesseractResult.errorMessages],
@@ -1287,16 +1288,16 @@ async function ocrPdfPages(
         provider: 'paddleocr',
       };
     }
-    return ocrPdfPagesWithPaddle(buffer, maxPages, paddleConfig);
+    return ocrPdfPagesWithPaddle(buffer, pages, paddleConfig);
   }
 
   if (engine !== 'tesseract' && vlmConfig) {
-    const vlmResult = await ocrPdfPagesWithVlm(buffer, maxPages, vlmConfig);
+    const vlmResult = await ocrPdfPagesWithVlm(buffer, pages, vlmConfig);
     if (vlmResult.pageTexts.length > 0 || engine === 'vlm') {
       return vlmResult;
     }
 
-    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, pages);
     return {
       ...tesseractResult,
       errorMessages: [...vlmResult.errorMessages, ...tesseractResult.errorMessages],
@@ -1314,26 +1315,26 @@ async function ocrPdfPages(
   }
 
   if (engine === 'auto') {
-    const mineruResult = await ocrPdfPagesWithMineru(buffer, maxPages, fileName, mineruConfig);
+    const mineruResult = await ocrPdfPagesWithMineru(buffer, pages, fileName, mineruConfig);
     if (mineruResult.pageTexts.length > 0) {
       return mineruResult;
     }
   }
 
   if (paddleConfig) {
-    const paddleResult = await ocrPdfPagesWithPaddle(buffer, maxPages, paddleConfig);
+    const paddleResult = await ocrPdfPagesWithPaddle(buffer, pages, paddleConfig);
     if (paddleResult.pageTexts.length > 0) {
       return paddleResult;
     }
 
-    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, maxPages);
+    const tesseractResult = await ocrPdfPagesWithTesseract(buffer, pages);
     return {
       ...tesseractResult,
       errorMessages: [...paddleResult.errorMessages, ...tesseractResult.errorMessages],
     };
   }
 
-  return ocrPdfPagesWithTesseract(buffer, maxPages);
+  return ocrPdfPagesWithTesseract(buffer, pages);
 }
 
 const PDF_TEXT_CACHE_DIR = path.join(process.cwd(), '.cache', 'pdf-text');
@@ -1432,18 +1433,41 @@ export async function parsePdfInput(
   const allowOCR = process.env.ENABLE_PDF_OCR !== 'false';
   const forceOcr = options?.forceOcr === true;
 
-  if (allowOCR && (forceOcr || mergedText.length < PDF_TEXT_MIN_LENGTH)) {
-    try {
+  // Decide which pages need OCR:
+  // - forceOcr: every page (Mineru submits in batches of <= 20 pages).
+  // - thin text layer: the first N pages as before.
+  // - rich text layer but pages without a text layer (e.g. image-only
+  //   pages): OCR only those missing pages so their content is not
+  //   silently dropped.
+  let ocrPages: number[] | null = null;
+  if (allowOCR) {
+    if (forceOcr) {
       const requestedMaxPages = options?.forceOcrMaxPages;
       const forceMaxPages =
         typeof requestedMaxPages === 'number' && Number.isFinite(requestedMaxPages) && requestedMaxPages > 0
           ? Math.floor(requestedMaxPages)
           : pdfPageCountHint;
-      const maxPages = forceOcr
-        ? Math.max(1, Math.min(forceMaxPages, pdfPageCountHint))
-        : Math.max(1, Math.min(getOcrMaxPages(), pdfPageCountHint));
+      const maxPages = Math.max(1, Math.min(forceMaxPages, pdfPageCountHint));
+      ocrPages = Array.from({ length: maxPages }, (_, i) => i + 1);
+    } else if (mergedText.length < PDF_TEXT_MIN_LENGTH) {
+      const maxPages = Math.max(1, Math.min(getOcrMaxPages(), pdfPageCountHint));
+      ocrPages = Array.from({ length: maxPages }, (_, i) => i + 1);
+    } else {
+      const presentPages = new Set(pageTexts.map((item) => item.page));
+      const missingPages: number[] = [];
+      for (let page = 1; page <= pdfPageCountHint; page += 1) {
+        if (!presentPages.has(page)) missingPages.push(page);
+      }
+      if (missingPages.length > 0) {
+        ocrPages = missingPages.slice(0, Math.max(1, getOcrMaxPages()));
+      }
+    }
+  }
+
+  if (ocrPages) {
+    try {
       const ocrResult = await withTimeout(
-        ocrPdfPages(rawBytes, maxPages, fileName, { allowLocalFallback: !forceOcr }),
+        ocrPdfPages(rawBytes, ocrPages, fileName, { allowLocalFallback: !forceOcr }),
         getOcrTimeoutMs(),
         'pdf_ocr',
       );
@@ -1540,7 +1564,7 @@ export async function parsePdfInput(
       ocrUsed,
       ocrDebug: {
         enabled: allowOCR,
-        attempted: allowOCR && (forceOcr || extracted.length < PDF_TEXT_MIN_LENGTH || textIsGarbled),
+        attempted: ocrPages !== null,
         provider: ocrProvider,
         model: ocrModel,
         attemptedPages: ocrAttemptedPages,

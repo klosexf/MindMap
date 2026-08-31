@@ -76,9 +76,9 @@ export async function POST(req: Request) {
     } catch (error) {
       const baseMessage = error instanceof Error ? error.message : 'LLM mindmap json generation failed';
       const message = timedOut
-        ? `JSON 预览等待超过 ${Math.round(timeoutMs / 1000)} 秒，已降级为本地启发式结果。`
+        ? `AI 响应超时（等待超过 ${Math.round(timeoutMs / 1000)} 秒），已自动生成本地大纲结果。`
         : /timeout/i.test(baseMessage) || /aborted/i.test(baseMessage)
-          ? `${baseMessage}。JSON 预览等待超过 ${Math.round(timeoutMs / 1000)} 秒，已降级为本地启发式结果。`
+          ? `AI 响应超时（等待超过 ${Math.round(timeoutMs / 1000)} 秒），已自动生成本地大纲结果。`
           : baseMessage;
       const fallbackTree = buildHeuristicMindMapTree(parseResult.data.normalizedDocument);
 

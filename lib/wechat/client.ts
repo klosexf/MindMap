@@ -865,9 +865,9 @@ interface HunyuanChatResponse {
  * 3. 无需 auth-key，只需腾讯云 API Key
  *
  * API 接入：
- * - base_url: https://api.hunyuan.cloud.tencent.com/v1
+ * - base_url: https://tokenhub.tencentmaas.com/v1（2026-06 起旧端点已下线，迁移 TokenHub）
  * - 接口: /chat/completions（OpenAI 兼容格式）
- * - API Key: 在腾讯云控制台 https://console.cloud.tencent.com/hunyuan/start 创建
+ * - API Key: 在 TokenHub 控制台 https://console.cloud.tencent.com/tokenhub/apikey 创建
  *
  * @param articleUrl 微信文章 URL
  * @param options 可选参数
@@ -884,9 +884,9 @@ export async function summarizeWeChatArticleViaHunyuan(
     throw new Error('腾讯混元 API Key 未配置，请设置 HUNYUAN_API_KEY 环境变量。');
   }
 
-  const baseUrl = process.env.HUNYUAN_BASE_URL?.trim() || 'https://api.hunyuan.cloud.tencent.com/v1';
+  const baseUrl = process.env.HUNYUAN_BASE_URL?.trim() || 'https://tokenhub.tencentmaas.com/v1';
   const chatUrl = `${baseUrl}/chat/completions`;
-  const model = options.model || process.env.HUNYUAN_MODEL?.trim() || 'hunyuan-turbos-latest';
+  const model = options.model || process.env.HUNYUAN_MODEL?.trim() || 'hy3-preview';
 
   // 从微信文章 URL 中提取标识信息
   const urlParams = extractWeChatUrlParams(articleUrl);
@@ -1040,9 +1040,9 @@ export async function generateWeChatMindMapViaHunyuan(
     throw new Error('腾讯混元 API Key 未配置，请设置 HUNYUAN_API_KEY 环境变量。');
   }
 
-  const baseUrl = process.env.HUNYUAN_BASE_URL?.trim() || 'https://api.hunyuan.cloud.tencent.com/v1';
+  const baseUrl = process.env.HUNYUAN_BASE_URL?.trim() || 'https://tokenhub.tencentmaas.com/v1';
   const chatUrl = `${baseUrl}/chat/completions`;
-  const model = process.env.HUNYUAN_MODEL?.trim() || 'hunyuan-turbos-latest';
+  const model = process.env.HUNYUAN_MODEL?.trim() || 'hy3-preview';
 
   // 从微信文章 URL 中提取标识信息
   const urlParams = extractWeChatUrlParams(articleUrl);

@@ -1,6 +1,15 @@
 'use client';
 
-import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type KeyboardEvent,
+} from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 
@@ -92,6 +101,42 @@ export function GenerateForm() {
   const [timingMarks, setTimingMarks] = useState<GenerationTimingMarks>({});
   const [timingNow, setTimingNow] = useState(Date.now());
 
+  // 分段控件滑动药丸：跟随激活 tab
+  const tabsRef = useRef<HTMLDivElement>(null);
+  const thumbRef = useRef<HTMLSpanElement>(null);
+
+  const moveThumb = useCallback((animate: boolean) => {
+    const thumb = thumbRef.current;
+    const container = tabsRef.current;
+    if (!thumb || !container) return;
+    const active = container.querySelector<HTMLButtonElement>('button.active');
+    if (!active) return;
+    if (!animate) thumb.style.transition = 'none';
+    thumb.style.left = `${active.offsetLeft}px`;
+    thumb.style.width = `${active.offsetWidth}px`;
+    if (!animate) {
+      void thumb.offsetWidth; // 强制 reflow，让初始定位跳过过渡
+      thumb.style.transition = '';
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    moveThumb(false);
+  }, [moveThumb]);
+
+  useEffect(() => {
+    moveThumb(true);
+  }, [mode, moveThumb]);
+
+  useEffect(() => {
+    const onResize = () => moveThumb(false);
+    window.addEventListener('resize', onResize);
+    if (document.fonts) {
+      document.fonts.ready.then(() => moveThumb(false)).catch(() => undefined);
+    }
+    return () => window.removeEventListener('resize', onResize);
+  }, [moveThumb]);
+
   function switchMode(nextMode: InputMode) {
     if (nextMode === mode) return;
     setMode((prev) => {
@@ -113,6 +158,12 @@ export function GenerateForm() {
     const delta = event.key === 'ArrowRight' ? 1 : -1;
     const nextIndex = (index + delta + MODE_TABS.length) % MODE_TABS.length;
     switchMode(MODE_TABS[nextIndex].mode);
+  }
+
+  function handlePdfDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    const file = event.dataTransfer.files?.[0];
+    if (file) setPdfFile(file);
   }
 
   const urlValidation = useMemo(() => {
@@ -344,7 +395,8 @@ export function GenerateForm() {
           ；再次提交将中断当前生成。
         </p>
       )}
-      <div className="input-tabs" role="tablist" aria-label="输入类型">
+      <div className="input-tabs" role="tablist" aria-label="输入类型" ref={tabsRef}>
+        <span className="input-tabs-thumb" ref={thumbRef} aria-hidden="true" />
         {MODE_TABS.map((tab, index) => (
           <button
             key={tab.mode}
@@ -393,13 +445,31 @@ export function GenerateForm() {
         )}
 
         {mode === 'pdf' && (
-          <label className="file-input-wrap">
+          <label
+            className="file-input-wrap"
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={handlePdfDrop}
+          >
             <input
               type="file"
               accept="application/pdf"
               onChange={(event) => setPdfFile(event.target.files?.[0] ?? null)}
             />
-            <span>{pdfFile ? `已选择: ${pdfFile.name}` : '选择 PDF 文件（<=20MB）'}</span>
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <path d="M14 2v6h6" />
+            </svg>
+            <span>{pdfFile ? `已选择: ${pdfFile.name}` : '选择或拖入 PDF 文件（<=20MB）'}</span>
           </label>
         )}
 

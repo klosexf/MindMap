@@ -10,14 +10,16 @@
  * 6. 均失败则给出配置指引
  *
  * 重要说明：
- * - 微信文章正文通过 JavaScript 动态渲染，服务端直接 fetch 只能获取空壳 HTML
+ * - 实测（2026-08）：微信文章正文随首屏 HTML 下发（js_content 容器），
+ *   直接 fetch 可获取全文；但首次请求会 302 至 ?nwr_flag=1 需跟随重定向，
+ *   且 node:https 回退需自行解压 gzip 响应（decompressBody）
  * - mptext download API 通过代理节点获取完整内容，但需要 auth-key
- * - 搜狗微信搜索是腾讯官方的微信文章搜索引擎，零配置可用
- * - 腾讯混元（元宝）是腾讯自家AI，拥有微信生态数据权限，成功率最高
- * - 如果以上方式均不可用，建议浏览器复制粘贴
+ * - 2026-06 起混元迁移 TokenHub 后已无搜索增强能力（参数被网关忽略），
+ *   智谱 web_search 工具实测也拿不到指定文章全文
  */
 
 import https from 'node:https';
+import zlib from 'node:zlib';
 import { Readability } from '@mozilla/readability';
 import { JSDOM } from 'jsdom';
 
@@ -47,22 +49,77 @@ function wechatHtmlToMarkdown(title: string, content: string): string {
 }
 
 /**
+ * 从微信正文容器（#js_content / .rich_media_content）提取带段落结构的文本
+ *
+ * 微信正文容器带内联 `visibility: hidden; opacity: 0` 样式（前端 JS 再揭示），
+ * Readability 会将其判为不可见内容而整体丢弃（实测仅剩 43 字作者行），
+ * 因此微信页面必须绕过 Readability 直接取容器。
+ */
+function extractWeChatContainerText(html: string): string | null {
+  try {
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+    const container =
+      doc.getElementById('js_content') || doc.querySelector('.rich_media_content');
+    if (!container) return null;
+
+    const text = container.innerHTML
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|section|div|h[1-6]|li|blockquote)>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      // 折叠行内空白但保留换行，再压缩 3+ 连续空行
+      .replace(/[ \t\u00a0]+/g, ' ')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    // 正文过短视为无效（可能只是空壳或占位），交回通用提取
+    return text.replace(/\s/g, '').length >= 100 ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 从 HTML 中提取可读文本
  *
- * 优先使用 Readability，失败则降级为纯文本提取
+ * 微信页面优先取正文容器（Readability 会丢弃 visibility:hidden 的正文）；
+ * 其他页面优先 Readability，失败则降级为纯文本提取
  */
 function extractTextFromHtml(html: string, url: string): { title: string; plainText: string } {
+  // 提取标题：og:title 最准，其次 Readability/document.title
+  let title = '微信公众号文章';
+  const ogTitle = html.match(/property="og:title"\s+content="([^"]*)"/);
+  if (ogTitle?.[1]) {
+    title = ogTitle[1].replace(/&amp;/g, '&').replace(/&quot;/g, '"').trim();
+  }
+
+  const wechatText = extractWeChatContainerText(html);
+  if (wechatText) {
+    return { title, plainText: wechatText };
+  }
+
   try {
     const dom = new JSDOM(html, { url });
     const reader = new Readability(dom.window.document);
     const article = reader.parse();
 
-    const title = article?.title?.trim() || dom.window.document.title || '微信公众号文章';
+    const resolvedTitle = title !== '微信公众号文章'
+      ? title
+      : article?.title?.trim() || dom.window.document.title || title;
     const plainText = (article?.textContent || dom.window.document.body?.textContent || '')
       .replace(/\s+/g, ' ')
       .trim();
 
-    return { title, plainText };
+    return { title: resolvedTitle, plainText };
   } catch {
     // 降级：直接从 HTML 中提取文本
     const textContent = html
@@ -78,7 +135,7 @@ function extractTextFromHtml(html: string, url: string): { title: string; plainT
       .replace(/\s+/g, ' ')
       .trim();
 
-    return { title: '微信公众号文章', plainText: textContent };
+    return { title, plainText: textContent };
   }
 }
 
@@ -201,6 +258,22 @@ async function singleFetch(url: string, headers: Record<string, string>, timeout
 }
 
 /**
+ * 解压 HTTP 响应体（node:https 不自动处理 gzip/deflate/br）
+ * 未压缩内容原样返回
+ */
+function decompressBody(buffer: Buffer, encoding?: string): Buffer {
+  const enc = (encoding || '').toLowerCase();
+  try {
+    if (enc.includes('br')) return zlib.brotliDecompressSync(buffer);
+    if (enc.includes('gzip')) return zlib.gunzipSync(buffer);
+    if (enc.includes('deflate')) return zlib.inflateSync(buffer);
+  } catch {
+    // 解压失败（可能是伪编码头或分块问题）时原样返回，交由上层校验
+  }
+  return buffer;
+}
+
+/**
  * 使用 node:https 的回退请求（跳过 SSL 证书验证）
  */
 function singleFetchHttpsFallback(url: string, headers: Record<string, string>, timeoutMs = 15_000): Promise<string> {
@@ -237,7 +310,7 @@ function singleFetchHttpsFallback(url: string, headers: Record<string, string>, 
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
-          const html = Buffer.concat(chunks).toString('utf-8');
+          const html = decompressBody(Buffer.concat(chunks), res.headers['content-encoding']).toString('utf-8');
 
           if (!html || html.trim().length === 0) {
             reject(new Error('返回内容为空'));
@@ -419,11 +492,12 @@ export async function parseWeChatUrl(
               '\n\n' +
               `💡 解决方案（推荐，无需扫码）：\n` +
               `  在浏览器中打开微信文章链接 → 全选复制 → 粘贴到「文本」模式生成思维导图\n\n` +
-              `推荐：使用腾讯混元（元宝）搜索增强（微信生态独家，成功率最高）：\n` +
-              `  1. 访问 https://console.cloud.tencent.com/hunyuan/start 创建 API Key\n` +
+              `推荐：使用腾讯混元（TokenHub）搜索增强（微信生态独家，成功率最高）：\n` +
+              `  1. 访问 https://console.cloud.tencent.com/tokenhub/models 开启 hy3-preview 模型\n` +
               `  2. 在 .env 文件中设置：\n` +
-              `     HUNYUAN_API_KEY=你的腾讯混元API Key\n` +
-              `     HUNYUAN_BASE_URL=https://api.hunyuan.cloud.tencent.com/v1\n\n` +
+              `     HUNYUAN_API_KEY=你的TokenHub API Key\n` +
+              `     HUNYUAN_BASE_URL=https://tokenhub.tencentmaas.com/v1\n` +
+              `     HUNYUAN_MODEL=hy3-preview\n\n` +
               `或使用智谱AI联网搜索（配置简单）：\n` +
               `  在 .env 文件中设置：\n` +
               `     ZHIPU_API_KEY=你的智谱AI API Key\n` +

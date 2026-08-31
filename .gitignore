@@ -13,14 +13,21 @@ dist
 
 # 调试截图与缓存
 tests/screenshots/
+screenshots/
 .cache/
+.matplotlib/
+.paddlex/
+.trae-tmp/
+
+# 本机 Python 缓存误写入工作区
+Library/
 
 # 临时调试文件
-tmp-*.cjs
-tmp-*.json
+tmp-*
+=
 
 # 构建缓存
 *.tsbuildinfo
 
 # 运行时导图数据
-data/mindmaps/
+data/
