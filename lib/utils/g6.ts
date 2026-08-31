@@ -7,6 +7,12 @@ interface HierarchyNode {
   id: string;
   content: string;
   collapsed: boolean;
+  hasNote: boolean;
+  /**
+   * 一级分支序号（0 起）。根节点为 -1；一级分支取其在父 children 中的下标，
+   * 其全部后代继承该值——用于「同一分支同色」的暖调手作视觉方案。
+   */
+  branchIndex: number;
   position?: {
     x: number;
     y: number;
@@ -14,14 +20,23 @@ interface HierarchyNode {
   children: HierarchyNode[];
 }
 
-function toHierarchyNode(node: MindMapNode): HierarchyNode {
+function toHierarchyNode(node: MindMapNode, branchIndex = -1): HierarchyNode {
   return {
     id: node.id,
     content: node.content,
     collapsed: node.collapsed ?? false,
+    hasNote: Boolean(node.note),
+    branchIndex,
     position: node.position,
-    children: (node.children || []).map((child) => toHierarchyNode(child)),
+    children: (node.children || []).map((child, index) =>
+      toHierarchyNode(child, branchIndex >= 0 ? branchIndex : index),
+    ),
   };
+}
+
+function collectBranchIndices(node: HierarchyNode, indices: Map<string, number>): void {
+  indices.set(node.id, node.branchIndex);
+  node.children.forEach((child) => collectBranchIndices(child, indices));
 }
 
 function collectChildCounts(node: HierarchyNode, counts: Map<string, number>): void {
@@ -32,11 +47,20 @@ function collectChildCounts(node: HierarchyNode, counts: Map<string, number>): v
 const _canvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
 
 export const NODE_VISUAL_TOKENS = {
+  // —— 暖调手作（Whimsical 系）视觉方案 ——
+  // 通用卡片底/描边/文字：编辑态输入框与选中反馈仍引用这三个值
   fill: '#FFFDF8',
-  stroke: '#DDD7CC',
-  text: '#4F4B45',
-  radius: 24,
-  lineWidth: 1.4,
+  stroke: '#F0E5D2',
+  text: '#5C4A38',
+  radius: 12,
+  lineWidth: 1,
+  // 根节点：陶土橙填充 + 暖白文字
+  rootFill: '#C75537',
+  rootText: '#FFF9F2',
+  // 二级节点：白底圆片 + 暖棕文字
+  level2Text: '#5C4A38',
+  // 细节节点（3 层及以下）：无框纯文字
+  detailText: '#9B8570',
   fontSize: 16,
   fontWeight: 600,
   // 根节点（导图源头）标题视觉层级：显著更大 + 加粗，确保一眼识别起点
@@ -58,13 +82,45 @@ export const NODE_VISUAL_TOKENS = {
   maxNodeWidth: 760,
 } as const;
 
+/** 各层级圆角：根 > 一级分支 > 二级 > 细节，弱化「卡片感」、强化层级轮廓差 */
+export const NODE_RADIUS_TOKENS = {
+  root: 26,
+  level1: 18,
+  level2: 12,
+  detail: 8,
+} as const;
+
+/**
+ * 一级分支色盘（暖调）：陶土橙 / 鼠尾草绿 / 雾蓝 / 赭黄。
+ * 节点填充与连线共用同一分支色，形成「同分支同色」的视觉分组。
+ */
+export const BRANCH_PALETTE = ['#E08A4E', '#7C9A6D', '#6B8FA3', '#C88A3D'] as const;
+
+export function getBranchColor(branchIndex: number): string {
+  if (branchIndex < 0) return NODE_VISUAL_TOKENS.rootFill;
+  return BRANCH_PALETTE[branchIndex % BRANCH_PALETTE.length];
+}
+
 export const EDGE_VISUAL_TOKENS = {
-  stroke: '#8A867E',
-  lineWidth: 2,
+  stroke: '#E0B58F',
+  lineWidth: 3,
   routerPadding: 28,
   polylineRadius: 10,
   minStraightEdgeGap: 40,
 } as const;
+
+// 笔记指示图标：节点保存笔记后，在文本右侧显示的便签图标。
+// 节点宽度额外预留 reserveWidth，保证图标不与文本重叠；
+// iconSrc 使用内联 SVG，避免引入外部图片资源。
+export const NOTE_ICON_TOKENS = {
+  iconWidth: 14,
+  iconHeight: 15,
+  reserveWidth: 22,
+} as const;
+
+const NOTE_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="15" viewBox="0 0 14 15"><path d="M2 2.2C2 1 2.9.1 4 .1h4.2c.4 0 .8.2 1.1.5l2.2 2.4c.3.3.5.7.5 1.1v8.7c0 1.2-.9 2.1-2 2.1H4c-1.1 0-2-.9-2-2.1V2.2z" fill="#F59E0B"/><path d="M8.2.1c.4 0 .8.2 1.1.5l2.2 2.4c.2.2.3.4.4.7H9.2c-.6 0-1-.5-1-1.1V.1z" fill="#FCD34D"/><rect x="4.1" y="7.1" width="5.8" height="1.25" rx="0.62" fill="#fff"/><rect x="4.1" y="9.9" width="4" height="1.25" rx="0.62" fill="#fff"/></svg>`;
+
+export const NOTE_ICON_SRC = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(NOTE_ICON_SVG)}`;
 
 type MindMapEdgeType = 'line' | 'polyline';
 
@@ -652,6 +708,8 @@ function pruneCollapsedHierarchy(
 export function toG6GraphData(tree: MindMapTree, direction: LayoutDirection = 'LR'): GraphData {
   const collapsedChildCounts = new Map<string, number>();
   const hierarchy = pruneCollapsedHierarchy(toHierarchyNode(tree.root), collapsedChildCounts);
+  const branchIndexByNodeId = new Map<string, number>();
+  collectBranchIndices(hierarchy, branchIndexByNodeId);
   const portConfig = getPortConfig(direction);
   const badgePlacement = getBadgePlacement(direction);
   const childCounts = new Map<string, number>();
@@ -662,9 +720,12 @@ export function toG6GraphData(tree: MindMapTree, direction: LayoutDirection = 'L
         id: string;
         content?: string;
         collapsed?: boolean;
+        hasNote?: boolean;
+        branchIndex?: number;
         position?: { x: number; y: number };
         children?: string[];
       };
+      const hasNote = Boolean(data.hasNote);
       const size = getNodeSize(data.id, data.content || '', tree.root.id, depth);
       const collapsedCount = collapsedChildCounts.get(data.id) ?? 0;
       const nodeData: NodeData = {
@@ -676,7 +737,9 @@ export function toG6GraphData(tree: MindMapTree, direction: LayoutDirection = 'L
           collapsed: Boolean(data.collapsed),
           collapsedChildCount: collapsedCount,
           _depth: depth,
-          _width: size.width,
+          _hasNote: hasNote,
+          _branchIndex: data.branchIndex ?? -1,
+          _width: size.width + (hasNote ? NOTE_ICON_TOKENS.reserveWidth : 0),
           _height: size.height,
         },
         style: {

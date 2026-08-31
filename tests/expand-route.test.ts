@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const generateBranchExpansionMock = vi.hoisted(() => vi.fn());
+const streamBranchExpansionMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@/lib/llm/generate', () => ({
-  generateBranchExpansion: generateBranchExpansionMock,
+  streamBranchExpansion: streamBranchExpansionMock,
 }));
 
 import { POST } from '../app/api/expand/route';
@@ -65,32 +65,76 @@ function makeReq(body: unknown): Request {
   });
 }
 
-describe('POST /api/expand', () => {
+interface SSEEvent {
+  type: string;
+  data: any;
+}
+
+function parseSSE(text: string): SSEEvent[] {
+  return text
+    .split('\n\n')
+    .filter((block) => block.trim().length > 0)
+    .map((block) => {
+      const lines = block.split('\n');
+      const eventLine = lines.find((line) => line.startsWith('event: '));
+      const dataLine = lines.find((line) => line.startsWith('data: '));
+      if (!eventLine || !dataLine) throw new Error(`bad SSE block: ${block}`);
+      return {
+        type: eventLine.replace('event: ', '').trim(),
+        data: JSON.parse(dataLine.replace('data: ', '')),
+      };
+    });
+}
+
+describe('POST /api/expand (SSE)', () => {
   beforeEach(() => {
-    generateBranchExpansionMock.mockReset();
+    streamBranchExpansionMock.mockReset();
   });
 
-  it('expands a node and passes path/sibling context to the LLM', async () => {
-    generateBranchExpansionMock.mockResolvedValue({
-      children: ['用户调研方法', '竞品分析框架', '需求优先级排序'],
-      provider: 'zhipu',
-      model: 'glm-4',
-      source: 'llm',
+  it('streams child/done events and passes path/sibling context to the LLM', async () => {
+    const children = ['用户调研方法', '竞品分析框架', '需求优先级排序'];
+    streamBranchExpansionMock.mockImplementation(async function* () {
+      for (const content of children) {
+        yield { type: 'child', content };
+      }
+      yield {
+        type: 'done',
+        children,
+        proof: { provider: 'zhipu', model: 'glm-4', source: 'llm' },
+      };
     });
 
     const res = await POST(makeReq({ tree: sampleTree(), nodeId: 'branch-1', normalizedDocument: demoDoc }));
-    const json = await res.json();
 
     expect(res.status).toBe(200);
-    expect(json.children).toHaveLength(3);
-    expect(json.proof.source).toBe('llm');
+    expect(res.headers.get('Content-Type')).toContain('text/event-stream');
 
-    const input = generateBranchExpansionMock.mock.calls[0][0];
+    const events = parseSSE(await res.text());
+    expect(events.map((e) => e.type)).toEqual(['child', 'child', 'child', 'done']);
+    expect(events[0].data).toEqual({ content: '用户调研方法' });
+    expect(events[3].data.children).toEqual(children);
+    expect(events[3].data.proof.source).toBe('llm');
+
+    const input = streamBranchExpansionMock.mock.calls[0][0];
     expect(input.focusContent).toBe('产品设计');
     expect(input.pathTitles).toEqual(['AI 产品经理能力模型']);
     expect(input.siblingTitles).toEqual(['数据分析']);
     expect(input.existingChildren).toEqual(['需求分析']);
     expect(input.documentMarkdown).toBe(demoDoc.markdown);
+  });
+
+  it('emits an error event (not a 502) when expansion fails', async () => {
+    streamBranchExpansionMock.mockImplementation(async function* () {
+      throw new Error('expand timeout');
+    });
+
+    const res = await POST(makeReq({ tree: sampleTree(), nodeId: 'branch-1' }));
+
+    expect(res.status).toBe(200);
+    const events = parseSSE(await res.text());
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe('error');
+    expect(events[0].data.message).toContain('expand timeout');
   });
 
   it('returns 404 when the node does not exist', async () => {
@@ -107,15 +151,5 @@ describe('POST /api/expand', () => {
 
     expect(res.status).toBe(400);
     expect(json.error).toBeTruthy();
-  });
-
-  it('returns 502 when expansion fails', async () => {
-    generateBranchExpansionMock.mockRejectedValue(new Error('expand timeout'));
-
-    const res = await POST(makeReq({ tree: sampleTree(), nodeId: 'branch-1' }));
-    const json = await res.json();
-
-    expect(res.status).toBe(502);
-    expect(json.error).toContain('expand timeout');
   });
 });

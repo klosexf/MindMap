@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 
 import { nanoid } from 'nanoid';
-import { generateText, streamObject } from 'ai';
+import { generateText, streamObject, streamText } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import type { FetchFunction } from '@ai-sdk/provider-utils';
 import { Agent } from 'undici';
@@ -19,12 +19,12 @@ import {
 import {
   MAX_TREE_DEPTH,
   MAX_TREE_NODES,
-  applyTreePatch,
   clampTree,
   countNodes,
   createSourceRefFallback,
-  flattenTree,
   getDefaultMindMapTree,
+  progressiveTreePatches,
+  rootOnlyTree,
   traverseTree,
 } from '@/lib/utils/tree';
 import {
@@ -46,14 +46,17 @@ import {
   BRANCH_EXPANSION_SYSTEM,
   DOCUMENT_SUMMARY_SYSTEM,
   MARKDOWN_SUMMARY_SYSTEM,
+  NODE_ACTION_SYSTEM,
   TREE_OPTIMIZE_SYSTEM,
   buildBranchExpansionPrompt,
   buildCompatJsonPrompt,
   buildMarkdownPreviewPrompt,
+  buildNodeActionPrompt,
   buildPrompt,
   buildTreeOptimizePrompt,
   resolveModelProfile,
   type BranchExpansionInput,
+  type NodeActionInput,
   type TreeOptimizeMode,
   type TreeOptimizationInput,
 } from '@/lib/llm/prompts';
@@ -67,12 +70,6 @@ export type GenerateStreamEvent =
   | { type: 'node'; data: { patch: TreePatch; node: MindMapNode } }
   | { type: 'complete'; data: { tree: MindMapTree } }
   | { type: 'error'; data: { message: string } };
-
-interface IndexedNode {
-  node: MindMapNode;
-  parentId?: string;
-  index: number;
-}
 
 type OpenAICompatibleProvider = 'openai' | 'zhipu' | 'kimi' | 'minimax' | 'qwen' | 'hunyuan' | 'deepseek';
 
@@ -1004,7 +1001,7 @@ function detectAndFilterLowQualityTitles(tree: MindMapTree): MindMapTree {
 
 const MAX_CONTENT_LENGTH = 40;
 
-function splitOversizedNodeContent(tree: MindMapTree): MindMapTree {
+export function splitOversizedNodeContent(tree: MindMapTree): MindMapTree {
   function splitText(text: string): string[] {
     if (text.length <= MAX_CONTENT_LENGTH) return [text];
     
@@ -1023,17 +1020,19 @@ function splitOversizedNodeContent(tree: MindMapTree): MindMapTree {
 
   function splitNode(node: MindMapNode, depth: number): MindMapNode {
     const existingChildren = (node.children || []).map((c) => splitNode(c, depth + 1));
-    
-    if (node.content.length <= MAX_CONTENT_LENGTH || depth >= MAX_TREE_DEPTH - 1) {
+
+    if (node.content.length <= MAX_CONTENT_LENGTH) {
       return { ...node, children: existingChildren };
     }
-    
+
     const parts = splitText(node.content);
-    if (parts.length <= 1) {
-      return { 
-        ...node, 
-        content: node.content.slice(0, MAX_CONTENT_LENGTH - 1) + '…', 
-        children: existingChildren 
+    // 深度不足（拆分会超出层级上限）或文本无分隔点时，退化为截断兜底：
+    // 叶层超长内容（如 OCR 原文段落）不允许原样保留
+    if (parts.length <= 1 || depth >= MAX_TREE_DEPTH - 1) {
+      return {
+        ...node,
+        content: node.content.slice(0, MAX_CONTENT_LENGTH - 1) + '…',
+        children: existingChildren,
       };
     }
     
@@ -1068,6 +1067,35 @@ function splitOversizedNodeContent(tree: MindMapTree): MindMapTree {
   }
   
   return { ...tree, root: splitNode(tree.root, 0) };
+}
+
+/**
+ * 泛化标签模式：以分类性名词结尾且整体较短，无法独立传达实质信息。
+ * 仅匹配「XX的特征」「XX条件」类标签式标题；刻意排除 价值/意义/原因/目标/策略/挑战
+ * 等可能出现在实质内容里的词，避免误删。
+ */
+const LEAF_LABEL_PATTERN = /(特征|条件|维度|因素|属性|要素|概述|背景|简介|介绍|现状|其他|相关|补充|附录|说明)$/;
+
+/**
+ * 清理二级层的"空标签叶子"节点：无子节点且标题为泛化标签（如"回报这些能力的岗位特征"），
+ * 悬挂在分支下只会产生信息空洞。仅作用于二级层（depth 2），不动一级分支与深层叶子。
+ */
+export function removeLeafLabelNodes(tree: MindMapTree): MindMapTree {
+  function processNode(node: MindMapNode, depth: number): MindMapNode {
+    if (!node.children || node.children.length === 0) {
+      return node;
+    }
+    const processedChildren = node.children
+      .map((child) => processNode(child, depth + 1))
+      .filter((child) => {
+        if (depth + 1 !== 2) return true;
+        if (child.children?.length) return true;
+        const trimmed = child.content.trim();
+        return !(trimmed.length <= 20 && LEAF_LABEL_PATTERN.test(trimmed));
+      });
+    return { ...node, children: processedChildren };
+  }
+  return { ...tree, root: processNode(tree.root, 0) };
 }
 
 function extractSentences(text: string, limit: number): string[] {
@@ -1311,7 +1339,7 @@ function sanitizePartialNode(raw: unknown): { content: string; children?: any[] 
   return normalized;
 }
 
-function llmTreeToMindMapTree(llmTree: LLMMindMapTree, doc: NormalizedDocument): MindMapTree {
+function llmTreeToMindMapTree(llmTree: LLMMindMapTree, doc: NormalizedDocument, baseTreeId?: string): MindMapTree {
   const sourceRef = makeDefaultSourceRef(doc);
   const root = createNodeFromLLM(llmTree.root, sourceRef);
   root.meta.type = 'main';
@@ -1331,65 +1359,22 @@ function llmTreeToMindMapTree(llmTree: LLMMindMapTree, doc: NormalizedDocument):
   const deduped = deduplicateNodeTitles(restructured);
   const filtered = detectAndFilterLowQualityTitles(deduped);
   const expanded = ensureFirstLayerDetails(filtered, doc);
-  return splitOversizedNodeContent(expanded);
+  const split = splitOversizedNodeContent(expanded);
+  const finalTree = removeLeafLabelNodes(split);
+  // 会话级 tree.id：同一流式生成内 skeleton 与 complete 树共享 id，
+  // 保证客户端 URL 与存储记录不错位
+  return baseTreeId ? { ...finalTree, id: baseTreeId } : finalTree;
 }
 
-function buildDiffPatches(prevTree: MindMapTree, nextTree: MindMapTree): TreePatch[] {
-  const prevMap = new Map<string, IndexedNode>();
-  const nextMap = new Map<string, IndexedNode>();
-
-  flattenTree(prevTree.root).forEach((item) => {
-    prevMap.set(item.node.id, item);
-  });
-  flattenTree(nextTree.root).forEach((item) => {
-    nextMap.set(item.node.id, item);
-  });
-
-  const patches: TreePatch[] = [];
-
-  for (const [id, current] of nextMap.entries()) {
-    const previous = prevMap.get(id);
-
-    if (!previous && current.parentId) {
-      patches.push({
-        type: 'add',
-        nodeId: id,
-        parentId: current.parentId,
-        index: current.index,
-        node: current.node,
-        timestamp: Date.now(),
-      });
-      continue;
-    }
-
-    if (previous) {
-      const contentChanged = previous.node.content !== current.node.content;
-      const collapsedChanged = (previous.node.collapsed ?? false) !== (current.node.collapsed ?? false);
-      if (contentChanged || collapsedChanged) {
-        patches.push({
-          type: 'update',
-          nodeId: id,
-          node: {
-            content: current.node.content,
-            collapsed: current.node.collapsed,
-          },
-          timestamp: Date.now(),
-        });
-      }
-    }
-  }
-
-  for (const [id] of prevMap.entries()) {
-    if (!nextMap.has(id) && id !== prevTree.root.id) {
-      patches.push({
-        type: 'delete',
-        nodeId: id,
-        timestamp: Date.now(),
-      });
-    }
-  }
-
-  return patches;
+/**
+ * 将终树根节点 id 替换为骨架根 id。
+ * 实时生成的首个 skeleton 只含根节点（rootOnlyTree），后续 node 事件的
+ * add patch 以终树根为 parent——id 不一致时客户端 applyTreePatch 找不到
+ * 父节点会静默丢弃，故终树必须先 rebase 到骨架根上。
+ */
+function rebaseTreeRoot(tree: MindMapTree, rootId: string): MindMapTree {
+  if (tree.root.id === rootId) return tree;
+  return { ...tree, root: { ...tree.root, id: rootId } };
 }
 
 function extractKeywords(text: string, limit: number): string[] {
@@ -1405,7 +1390,7 @@ function extractKeywords(text: string, limit: number): string[] {
   return sorted.slice(0, limit).map(([word]) => word);
 }
 
-export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree {
+export function buildHeuristicMindMapTree(doc: NormalizedDocument, baseTreeId?: string): MindMapTree {
   const sourceRef = makeDefaultSourceRef(doc);
   const metaTitle = doc.sourceMeta.title && !isFileOrDownloadTitle(doc.sourceMeta.title) ? doc.sourceMeta.title : undefined;
   let title = extractSmartTitle(doc.markdown, doc.sourceMeta.sourceFileName) || metaTitle || '思维导图';
@@ -1450,7 +1435,8 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
     const deduped = deduplicateNodeTitles(restructured);
     const filtered = detectAndFilterLowQualityTitles(deduped);
     const expanded = ensureFirstLayerDetails(filtered, doc);
-    return mindMapTreeSchema.parse(splitOversizedNodeContent(expanded));
+    const heuristicTree = mindMapTreeSchema.parse(splitOversizedNodeContent(expanded));
+    return baseTreeId ? { ...heuristicTree, id: baseTreeId } : heuristicTree;
   }
 
   const sentences = extractSentences(doc.markdown, 12);
@@ -1508,7 +1494,9 @@ export function buildHeuristicMindMapTree(doc: NormalizedDocument): MindMapTree 
   const deduped = deduplicateNodeTitles(restructured);
   const filtered = detectAndFilterLowQualityTitles(deduped);
   const expanded = ensureFirstLayerDetails(filtered, doc);
-  return mindMapTreeSchema.parse(splitOversizedNodeContent(expanded));
+  const heuristicTree = mindMapTreeSchema.parse(splitOversizedNodeContent(expanded));
+  // 会话级 tree.id：与 llmTreeToMindMapTree 保持一致的复用语义
+  return baseTreeId ? { ...heuristicTree, id: baseTreeId } : heuristicTree;
 }
 
 
@@ -1661,7 +1649,7 @@ async function generateTreeWithCompatProvider(
   doc: NormalizedDocument,
   llmConfig: ResolvedLLMConfig,
   requestConfig: LLMRequestConfig,
-  options: { abortSignal?: AbortSignal },
+  options: { abortSignal?: AbortSignal; baseTreeId?: string },
 ): Promise<MindMapTree> {
   const modelProvider = createProviderClient(llmConfig);
   const languageModel = modelProvider.chat(llmConfig.model as any);
@@ -1717,7 +1705,7 @@ async function generateTreeWithCompatProvider(
 
   const treeStartedAt = Date.now();
   const parsedTree = parsedTreeWithMeta.tree;
-  const finalTree = llmTreeToMindMapTree(parsedTree, doc);
+  const finalTree = llmTreeToMindMapTree(parsedTree, doc, options.baseTreeId);
   logCompatTiming('request.transform_complete', {
     elapsedMs: Date.now() - treeStartedAt,
     totalElapsedMs: Date.now() - requestStartedAt,
@@ -2090,6 +2078,9 @@ export async function* generateMindMapStream(
 ): AsyncGenerator<GenerateStreamEvent> {
   const llmConfig = resolveLLMConfig();
   const hasApiKey = Boolean(llmConfig.apiKey);
+  // 会话级 tree.id：本次生成的所有树（skeleton/complete/降级）共享同一 id，
+  // 客户端可据此在首个 skeleton 到达时即跳转 /g/{id} 并保证落盘记录不错位
+  const sessionTreeId = nanoid();
 
   console.log('[MindMap Debug] LLM配置:', {
     provider: llmConfig.provider,
@@ -2101,30 +2092,44 @@ export async function* generateMindMapStream(
 
   if (!llmConfig.supported || !hasApiKey) {
     console.log('[MindMap Debug] 走路径1: 启发式生成（无API Key或provider不支持）');
-    const fallback = buildHeuristicMindMapTree(doc);
-    yield { type: 'skeleton', data: { tree: fallback } };
-
-    const flattened = flattenTree(fallback.root);
-    for (const item of flattened.slice(1)) {
-      if (!item.parentId) continue;
-      yield {
-        type: 'node',
-        data: {
-          patch: {
-            type: 'add',
-            nodeId: item.node.id,
-            parentId: item.parentId,
-            index: item.index,
-            node: item.node,
-            timestamp: Date.now(),
-          },
-          node: item.node,
-        },
-      };
+    const fallback = buildHeuristicMindMapTree(doc, sessionTreeId);
+    // 最小骨架：仅根节点。客户端秒级进入编辑器时只看到根，
+    // 其余节点经下方 node 事件逐个回放（一个一个生长），
+    // 避免启发式全树预览与最终结果不符的观感。
+    yield { type: 'skeleton', data: { tree: rootOnlyTree(fallback) } };
+    for (const { patch, node } of progressiveTreePatches(fallback)) {
+      yield { type: 'node', data: { patch, node } };
     }
-
     yield { type: 'complete', data: { tree: fallback } };
     return;
+  }
+
+  // ===== 会话共享启发式树：rootOnly 骨架的根来源 + 各路径失败时的降级终树 =====
+  const heuristicTree = buildHeuristicMindMapTree(doc, sessionTreeId);
+  const skeletonRootId = heuristicTree.root.id;
+
+  /** 终树逐个下发（DFS 先序、先父后子）：配合客户端节拍调度实现逐个生长 */
+  function* emitProgressiveNodes(tree: MindMapTree): Generator<GenerateStreamEvent> {
+    for (const { patch, node } of progressiveTreePatches(tree)) {
+      yield { type: 'node', data: { patch, node } };
+    }
+  }
+
+  /** 根内容对齐事件：skeleton 根是启发式标题，终树根不同则先下发 update 让根尽早变成最终标题 */
+  function rootContentUpdateEvent(currentContent: string, nextRoot: MindMapNode): GenerateStreamEvent | null {
+    if (currentContent === nextRoot.content) return null;
+    return {
+      type: 'node',
+      data: {
+        patch: {
+          type: 'update',
+          nodeId: skeletonRootId,
+          node: { content: nextRoot.content },
+          timestamp: Date.now(),
+        },
+        node: { ...nextRoot, children: [] },
+      },
+    };
   }
 
   // ===== 微信文章 + 混元搜索增强：优先走混元联网生成路径 =====
@@ -2134,8 +2139,7 @@ export async function* generateMindMapStream(
   if (isWeChatUrl) {
     const hunyuanApiKey = process.env.HUNYUAN_API_KEY?.trim();
     if (hunyuanApiKey) {
-      let workingTree = buildHeuristicMindMapTree(doc);
-      yield { type: 'skeleton', data: { tree: workingTree } };
+      yield { type: 'skeleton', data: { tree: rootOnlyTree(heuristicTree) } };
 
       try {
         const { json: rawJson } = await generateWeChatMindMapViaHunyuan(
@@ -2144,14 +2148,13 @@ export async function* generateMindMapStream(
 
         const parsedTree = parseLLMTreeFromText(rawJson);
         if (parsedTree) {
-          const finalTree = llmTreeToMindMapTree(parsedTree, doc);
-          const patches = buildDiffPatches(workingTree, finalTree);
-          for (const patch of patches) {
-            workingTree = applyTreePatch(workingTree, patch);
-            if (patch.type === 'add') {
-              yield { type: 'node', data: { patch, node: patch.node } };
-            }
-          }
+          const finalTree = rebaseTreeRoot(
+            llmTreeToMindMapTree(parsedTree, doc, sessionTreeId),
+            skeletonRootId,
+          );
+          const rootEvent = rootContentUpdateEvent(heuristicTree.root.content, finalTree.root);
+          if (rootEvent) yield rootEvent;
+          yield* emitProgressiveNodes(finalTree);
           yield { type: 'complete', data: { tree: finalTree } };
           return;
         }
@@ -2159,13 +2162,13 @@ export async function* generateMindMapStream(
         const errMsg = hunyuanError instanceof Error ? hunyuanError.message : '混元搜索增强失败';
         console.warn(`[MindMap] 腾讯混元搜索增强生成微信文章思维导图失败，降级：${errMsg}`);
       }
+      // 解析失败/异常：降级继续走后续路径（会再发 rootOnly 骨架，客户端按树替换处理）
     }
   }
 
   // 降级：智谱AI联网搜索
   if (isWeChatUrl && llmConfig.resolvedProvider === 'zhipu' && llmConfig.apiKey) {
-    let workingTree = buildHeuristicMindMapTree(doc);
-    yield { type: 'skeleton', data: { tree: workingTree } };
+    yield { type: 'skeleton', data: { tree: rootOnlyTree(heuristicTree) } };
 
     try {
       const { json: rawJson } = await generateWeChatMindMapViaZhipuWebSearch(
@@ -2175,17 +2178,13 @@ export async function* generateMindMapStream(
 
       const parsedTree = parseLLMTreeFromText(rawJson);
       if (parsedTree) {
-        const finalTree = llmTreeToMindMapTree(parsedTree, doc);
-
-        // 发送增量补丁
-        const patches = buildDiffPatches(workingTree, finalTree);
-        for (const patch of patches) {
-          workingTree = applyTreePatch(workingTree, patch);
-          if (patch.type === 'add') {
-            yield { type: 'node', data: { patch, node: patch.node } };
-          }
-        }
-
+        const finalTree = rebaseTreeRoot(
+          llmTreeToMindMapTree(parsedTree, doc, sessionTreeId),
+          skeletonRootId,
+        );
+        const rootEvent = rootContentUpdateEvent(heuristicTree.root.content, finalTree.root);
+        if (rootEvent) yield rootEvent;
+        yield* emitProgressiveNodes(finalTree);
         yield { type: 'complete', data: { tree: finalTree } };
         return;
       }
@@ -2204,71 +2203,145 @@ export async function* generateMindMapStream(
   const modelProfile = resolveModelProfile(llmConfig.resolvedProvider);
   const prompt = buildPrompt(doc, { density: modelProfile.density });
   const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
-  let workingTree = buildHeuristicMindMapTree(doc);
-  let skeletonSent = false;
-  let latestStableTree = workingTree;
 
   if (modelProfile.outputMode === 'text-json') {
     console.log('[MindMap Debug] 走路径3: 非OpenAI Provider -', llmConfig.resolvedProvider);
     console.log('[MindMap Debug] 使用提示词: buildCompatJsonPrompt()');
-    skeletonSent = true;
-    yield {
-      type: 'skeleton',
-      data: {
-        tree: workingTree,
-      },
-    };
+    yield { type: 'skeleton', data: { tree: rootOnlyTree(heuristicTree) } };
 
     try {
-      const finalTree = await generateTreeWithCompatProvider(doc, llmConfig, requestConfig, options);
-      const patches = buildDiffPatches(latestStableTree, finalTree);
-      for (const patch of patches) {
-        workingTree = applyTreePatch(workingTree, patch);
-        if (patch.type === 'add') {
-          yield {
-            type: 'node',
-            data: {
-              patch,
-              node: patch.node,
-            },
-          };
-        }
-      }
-
-      yield {
-        type: 'complete',
-        data: {
-          tree: finalTree,
-        },
-      };
+      const finalTree = await generateTreeWithCompatProvider(doc, llmConfig, requestConfig, {
+        ...options,
+        baseTreeId: sessionTreeId,
+      });
+      const rebased = rebaseTreeRoot(finalTree, skeletonRootId);
+      const rootEvent = rootContentUpdateEvent(heuristicTree.root.content, rebased.root);
+      if (rootEvent) yield rootEvent;
+      yield* emitProgressiveNodes(rebased);
+      yield { type: 'complete', data: { tree: rebased } };
       return;
     } catch (error) {
+      // 降级终树也逐个回放，避免 rootOnly 骨架瞬间跳到全树
+      yield* emitProgressiveNodes(heuristicTree);
       yield {
         type: 'error',
         data: {
           message:
             error instanceof Error
-              ? `${error.message}. 已返回本地启发式结果（节点数 ${countNodes(workingTree.root)}）。`
+              ? `${error.message}. 已返回本地启发式结果（节点数 ${countNodes(heuristicTree.root)}）。`
               : '生成失败，已返回本地启发式结果。',
         },
       };
-      yield {
-        type: 'complete',
-        data: {
-          tree: workingTree,
-        },
-      };
+      yield { type: 'complete', data: { tree: heuristicTree } };
       return;
     }
   }
 
   const modelProvider = createProviderClient(llmConfig);
 
+  // ===== 路径2: OpenAI Provider（streamObject 流式）=====
+  // partial 期间用轻量预览树（无重后处理，结构即 LLM 输出，跨 partial 槽位稳定），
+  // 以「父id:索引 → 稳定节点id」映射实现节点逐个下发；complete 走全量后处理，
+  // 由客户端以终树自愈覆盖（见 generation-session 的 complete 处理）。
+  const stableIdBySlot = new Map<string, string>();
+  const emittedContentById = new Map<string, string>();
+  let emittedRootContent: string = heuristicTree.root.content;
+  let lastPreviewTree: MindMapTree | null = null;
+
+  const buildPreviewTree = (llmTree: LLMMindMapTree): MindMapTree => {
+    const sourceRef = makeDefaultSourceRef(doc);
+    const rawRoot = createNodeFromLLM(llmTree.root, sourceRef);
+    rawRoot.meta.type = 'main';
+    const tree: MindMapTree = {
+      ...getDefaultMindMapTree(
+        llmTree.title || doc.sourceMeta.title || '思维导图',
+        sourceRef,
+        doc.sourceMeta.type,
+      ),
+      id: sessionTreeId,
+      root: rawRoot,
+    };
+    return clampTree(tree, MAX_TREE_DEPTH, MAX_TREE_NODES);
+  };
+
+  /** 跨 partial 稳定 id：同槽位（父id:索引）复用 id */
+  const restabilizeIds = (node: MindMapNode, parentStableId: string, index: number): MindMapNode => {
+    const slot = `${parentStableId}:${index}`;
+    let id = stableIdBySlot.get(slot);
+    if (!id) {
+      id = node.id;
+      stableIdBySlot.set(slot, id);
+    }
+    const children = (node.children || []).map((child, i) => restabilizeIds(child, id, i));
+    return { ...node, id, children };
+  };
+
+  /** 对预览树做增量下发：新节点 add（DFS 先序、先父后子），内容变化 update（逐字生长） */
+  function* emitGrowthEvents(tree: MindMapTree): Generator<GenerateStreamEvent> {
+    if (tree.root.content !== emittedRootContent) {
+      emittedRootContent = tree.root.content;
+      yield {
+        type: 'node',
+        data: {
+          patch: {
+            type: 'update',
+            nodeId: skeletonRootId,
+            node: { content: tree.root.content },
+            timestamp: Date.now(),
+          },
+          node: { ...tree.root, children: [] },
+        },
+      };
+    }
+
+    function* walk(parent: MindMapNode): Generator<GenerateStreamEvent> {
+      const children = parent.children || [];
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        const prev = emittedContentById.get(child.id);
+        if (prev === undefined) {
+          emittedContentById.set(child.id, child.content);
+          yield {
+            type: 'node',
+            data: {
+              patch: {
+                type: 'add',
+                nodeId: child.id,
+                parentId: parent.id,
+                index: i,
+                node: { ...child, children: [] },
+                timestamp: Date.now(),
+              },
+              node: child,
+            },
+          };
+        } else if (prev !== child.content) {
+          emittedContentById.set(child.id, child.content);
+          yield {
+            type: 'node',
+            data: {
+              patch: {
+                type: 'update',
+                nodeId: child.id,
+                node: { content: child.content },
+                timestamp: Date.now(),
+              },
+              node: { ...child, children: [] },
+            },
+          };
+        }
+        yield* walk(child);
+      }
+    }
+
+    yield* walk(tree.root);
+  }
+
   try {
     console.log('[MindMap Debug] 走路径2: OpenAI Provider');
     console.log('[MindMap Debug] 使用提示词: buildPrompt()');
     console.log('[MindMap Debug] 提示词长度:', prompt.length, '字符');
-    
+
     // Most non-OpenAI providers expose Chat Completions compatible endpoints, not Responses API.
     const languageModel =
       llmConfig.resolvedProvider === 'openai'
@@ -2284,6 +2357,9 @@ export async function* generateMindMapStream(
       timeout: requestConfig.timeoutMs,
       abortSignal: options.abortSignal,
     });
+
+    // 立即下发最小骨架：客户端秒级进入编辑器，其余节点随 partial 逐个流入
+    yield { type: 'skeleton', data: { tree: rootOnlyTree(heuristicTree) } };
 
     for await (const partial of result.partialObjectStream) {
       const candidateRoot = sanitizePartialNode((partial as { root?: unknown })?.root);
@@ -2302,82 +2378,131 @@ export async function* generateMindMapStream(
         continue;
       }
 
-      const nextTree = llmTreeToMindMapTree(parseResult.data, doc);
-
-      if (!skeletonSent) {
-        skeletonSent = true;
-        latestStableTree = nextTree;
-        workingTree = nextTree;
-        yield {
-          type: 'skeleton',
-          data: {
-            tree: nextTree,
-          },
-        };
-        continue;
-      }
-
-      const patches = buildDiffPatches(latestStableTree, nextTree);
-      for (const patch of patches) {
-        workingTree = applyTreePatch(workingTree, patch);
-
-        if (patch.type === 'add') {
-          yield {
-            type: 'node',
-            data: {
-              patch,
-              node: patch.node,
-            },
-          };
-        }
-      }
-
-      latestStableTree = nextTree;
+      const preview = buildPreviewTree(parseResult.data);
+      const stabilizedRoot: MindMapNode = {
+        ...preview.root,
+        id: skeletonRootId,
+        children: (preview.root.children || []).map((child, i) => restabilizeIds(child, skeletonRootId, i)),
+      };
+      lastPreviewTree = { ...preview, root: stabilizedRoot };
+      yield* emitGrowthEvents(lastPreviewTree);
     }
 
     const finalObject = await result.object;
-    const finalTree = llmTreeToMindMapTree(finalObject, doc);
-
-    if (!skeletonSent) {
-      yield { type: 'skeleton', data: { tree: finalTree } };
-    }
-
-    yield {
-      type: 'complete',
-      data: {
-        tree: finalTree,
-      },
-    };
+    const finalTree = rebaseTreeRoot(llmTreeToMindMapTree(finalObject, doc, sessionTreeId), skeletonRootId);
+    yield { type: 'complete', data: { tree: finalTree } };
   } catch (error) {
-    const fallback = latestStableTree;
-    if (!skeletonSent) {
-      yield { type: 'skeleton', data: { tree: fallback } };
+    if (lastPreviewTree) {
+      // 已有流式预览：直接以预览树收尾（避免异 id 启发式回放造成重复节点）
+      yield {
+        type: 'error',
+        data: {
+          message:
+            error instanceof Error
+              ? `${error.message}. 已返回已生成的部分结果（节点数 ${countNodes(lastPreviewTree.root)}）。`
+              : '生成失败，已返回已生成的部分结果。',
+        },
+      };
+      yield { type: 'complete', data: { tree: lastPreviewTree } };
+    } else {
+      // 尚无任何 partial：降级启发式树逐个回放（与其他路径降级一致）
+      yield* emitProgressiveNodes(heuristicTree);
+      yield {
+        type: 'error',
+        data: {
+          message:
+            error instanceof Error
+              ? `${error.message}. 已返回本地启发式结果（节点数 ${countNodes(heuristicTree.root)}）。`
+              : '生成失败，已返回本地启发式结果。',
+        },
+      };
+      yield { type: 'complete', data: { tree: heuristicTree } };
     }
-
-    yield {
-      type: 'error',
-      data: {
-        message:
-          error instanceof Error
-            ? `${error.message}. 已返回本地启发式结果（节点数 ${countNodes(fallback.root)}）。`
-            : '生成失败，已返回本地启发式结果。',
-      },
-    };
-
-    yield {
-      type: 'complete',
-      data: {
-        tree: fallback,
-      },
-    };
   }
 }
 
-export interface BranchExpansionResult {
-  children: string[];
-  provider: string;
-  model: string;
-  source: 'llm' | 'heuristic';
+export interface BranchExpansionStreamEvent {
+  type: 'child' | 'done';
+  /** child 事件：新完成的子主题内容 */
+  content?: string;
+  /** done 事件：服务端权威子主题列表（终态对账用） */
+  children?: string[];
+  /** done 事件：生成来源证明 */
+  proof?: { provider: string; model: string; source: 'llm' | 'heuristic' };
+}
+
+/**
+ * 从流式增量缓冲中提取「已完成」的子主题字符串。
+ *
+ * 只处理 happy path：首个 `[` 后的顶层数组元素——字符串元素（含转义）
+ * 与 {content} 对象元素整体跳读；未闭合的尾部元素忽略（等后续增量）。
+ * 数组闭合（`]`）后停止扫描，避免误收尾部散文中的引号。
+ * 返回全量已完成列表，调用方按自身已消费偏移增量取用。
+ */
+export function extractCompletedArrayStrings(buffer: string): string[] {
+  const start = buffer.indexOf('[');
+  if (start === -1) return [];
+
+  const out: string[] = [];
+  let i = start + 1;
+  while (i < buffer.length) {
+    const ch = buffer[i];
+
+    if (ch === '"') {
+      let j = i + 1;
+      let closed = false;
+      while (j < buffer.length) {
+        if (buffer[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (buffer[j] === '"') {
+          closed = true;
+          break;
+        }
+        j += 1;
+      }
+      if (!closed) break;
+      try {
+        const value = JSON.parse(buffer.slice(i, j + 1));
+        if (typeof value === 'string') out.push(value);
+      } catch {
+        // 非法转义序列：跳过该元素
+      }
+      i = j + 1;
+      continue;
+    }
+
+    if (ch === '{') {
+      let depth = 1;
+      let j = i + 1;
+      let closed = false;
+      while (j < buffer.length) {
+        if (buffer[j] === '{') depth += 1;
+        else if (buffer[j] === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            closed = true;
+            break;
+          }
+        }
+        j += 1;
+      }
+      if (!closed) break;
+      try {
+        const obj = JSON.parse(buffer.slice(i, j + 1)) as { content?: unknown };
+        if (typeof obj?.content === 'string') out.push(obj.content);
+      } catch {
+        // 非法对象：跳过
+      }
+      i = j + 1;
+      continue;
+    }
+
+    if (ch === ']') break; // 数组已闭合，不再扫描
+    i += 1;
+  }
+  return out;
 }
 
 function parseBranchExpansionChildren(rawText: string): string[] {
@@ -2463,12 +2588,19 @@ function buildHeuristicBranchExpansion(input: BranchExpansionInput): string[] {
   return children;
 }
 
-export async function generateBranchExpansion(
+/**
+ * 分支扩展（智能生成子主题）：流式产出。
+ * LLM 增量输出经 extractCompletedArrayStrings 提取，每完成一个子主题
+ * 立即 yield child 事件（供前端打字机回放）；流结束后以终态解析结果
+ * yield done 事件（服务端权威列表，供前端对账）。
+ * LLM 未配置时走启发式兜底：children 直接逐个 yield。
+ */
+export async function* streamBranchExpansion(
   input: BranchExpansionInput,
   options: {
     abortSignal?: AbortSignal;
   } = {},
-): Promise<BranchExpansionResult> {
+): AsyncGenerator<BranchExpansionStreamEvent, void, unknown> {
   const focus = input.focusContent.trim();
   if (!focus) {
     throw new Error('选中节点内容为空，无法扩展。');
@@ -2483,12 +2615,15 @@ export async function generateBranchExpansion(
       const keyHint = llmConfig.keyEnv || '对应 provider 的 API key';
       throw new Error(`LLM 未配置且原文中无可提炼的相关内容：请配置 ${keyHint} 后重试。`);
     }
-    return {
+    for (const content of heuristicChildren) {
+      yield { type: 'child', content };
+    }
+    yield {
+      type: 'done',
       children: heuristicChildren,
-      provider: 'local',
-      model: 'heuristic-v1',
-      source: 'heuristic',
+      proof: { provider: 'local', model: 'heuristic-v1', source: 'heuristic' },
     };
+    return;
   }
 
   const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
@@ -2502,7 +2637,7 @@ export async function generateBranchExpansion(
       ? modelProvider(llmConfig.model)
       : modelProvider.chat(llmConfig.model as any);
 
-  const result = await generateText({
+  const result = streamText({
     model: languageModel,
     system: BRANCH_EXPANSION_SYSTEM,
     prompt: buildBranchExpansionPrompt(input),
@@ -2513,7 +2648,22 @@ export async function generateBranchExpansion(
     maxOutputTokens: 800,
   });
 
-  let children = parseBranchExpansionChildren(result.text);
+  let full = '';
+  let emitted = 0;
+  for await (const delta of result.textStream) {
+    if (!delta) continue;
+    full += delta;
+    const found = extractCompletedArrayStrings(full);
+    if (found.length > emitted) {
+      for (let k = emitted; k < found.length; k += 1) {
+        const content = found[k].trim().slice(0, 120);
+        if (content) yield { type: 'child', content };
+      }
+      emitted = found.length;
+    }
+  }
+
+  let children = parseBranchExpansionChildren(full);
   if (children.length === 0 && heuristicChildren.length > 0) {
     children = heuristicChildren;
   }
@@ -2521,12 +2671,56 @@ export async function generateBranchExpansion(
     throw new Error('AI 扩展结果为空，请重试或换个节点。');
   }
 
-  return {
+  yield {
+    type: 'done',
     children,
-    provider: llmConfig.resolvedProvider || llmConfig.provider,
-    model: llmConfig.model,
-    source: 'llm',
+    proof: {
+      provider: llmConfig.resolvedProvider || llmConfig.provider,
+      model: llmConfig.model,
+      source: 'llm',
+    },
   };
+}
+
+/**
+ * 节点文本 AI 操作（润色/拓展/简化/提问）：流式产出结果文本增量。
+ * LLM 未配置时直接抛错（文本处理无可靠的本地降级路径）。
+ */
+export async function* streamNodeActionText(
+  input: NodeActionInput,
+  options: { abortSignal?: AbortSignal } = {},
+): AsyncGenerator<string, void, unknown> {
+  const nodeContent = input.nodeContent.trim();
+  if (!nodeContent) {
+    throw new Error('选中节点内容为空，无法处理。');
+  }
+
+  const llmConfig = resolveLLMConfig();
+  if (!llmConfig.supported || !llmConfig.apiKey) {
+    const keyHint = llmConfig.keyEnv || '对应 provider 的 API key';
+    throw new Error(`LLM 未配置：请配置 ${keyHint} 后重试。`);
+  }
+
+  const requestConfig = resolveLLMRequestConfig(llmConfig.resolvedProvider);
+  const modelProvider = createProviderClient(llmConfig);
+  const languageModel =
+    llmConfig.resolvedProvider === 'openai'
+      ? modelProvider(llmConfig.model)
+      : modelProvider.chat(llmConfig.model as any);
+
+  const result = streamText({
+    model: languageModel,
+    system: NODE_ACTION_SYSTEM,
+    prompt: buildNodeActionPrompt({ ...input, nodeContent }),
+    temperature: 0.4,
+    maxOutputTokens: 1200,
+    abortSignal: options.abortSignal,
+    maxRetries: requestConfig.maxRetries,
+  });
+
+  for await (const delta of result.textStream) {
+    if (delta) yield delta;
+  }
 }
 
 export interface TreeOptimizationResult {

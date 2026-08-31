@@ -2,7 +2,7 @@
 
 import { create } from 'zustand';
 
-import type { LayoutDirection, MindMapTree, NodePosition, TreePatch } from '@/lib/types/mindmap';
+import type { LayoutDirection, MindMapTree, NodeNote, NodePosition, TreePatch } from '@/lib/types/mindmap';
 import { applyTreePatch, createNode, findNode, findParentInfo } from '@/lib/utils/tree';
 
 const MAX_HISTORY_ENTRIES = 50;
@@ -25,13 +25,18 @@ interface MindMapState {
   setTree: (tree: MindMapTree | null) => void;
   applyPatch: (patch: TreePatch) => void;
   applyPatches: (patches: TreePatch[]) => void;
+  /** 实时生成回放专用：走 applyTreePatch 但不入 undo 历史（含 add 幂等守卫） */
+  applyAiGenerationPatches: (patches: TreePatch[]) => void;
   undo: () => void;
   redo: () => void;
   setSelectedNode: (id: string | null) => void;
   updateNodeContent: (id: string, content: string) => void;
+  updateNodeNote: (id: string, note: { content: string } | null) => void;
   toggleNodeCollapse: (id: string) => void;
   addChildNode: (parentId: string, content: string) => string | void;
   addAiChildren: (parentId: string, contents: string[]) => string[];
+  /** AI 分支扩展流式回放结束后提交撤销快照：整体保持单步可撤销 */
+  commitHistorySnapshot: (snapshot: { tree: MindMapTree; selectedNodeId: string | null }) => void;
   replaceTreeKeepHistory: (tree: MindMapTree) => void;
   addSiblingNode: (nodeId: string, content: string) => string | void;
   deleteNode: (nodeId: string) => void;
@@ -99,6 +104,21 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
 
     set(history ? { tree: next, ...history } : { tree: next });
   },
+  applyAiGenerationPatches: (patches) => {
+    const state = get();
+    const current = state.tree;
+    if (!current || patches.length === 0) return;
+
+    let next = current;
+    for (const patch of patches) {
+      // 幂等守卫：启发式路径 skeleton 已含全树，node 事件会重发同 id 节点
+      if (patch.type === 'add' && findNode(next.root, patch.nodeId)) continue;
+      next = applyTreePatch(next, patch);
+    }
+
+    // 不入 undo 历史：生成回放是系统行为；complete/树替换会重置历史线
+    set({ tree: next });
+  },
   undo: () => {
     const state = get();
     const { past, future, tree, selectedNodeId } = state;
@@ -140,6 +160,25 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
       nodeId: id,
       node: { content },
       timestamp: Date.now(),
+    });
+  },
+  // note 传 null 表示删除笔记（patch 中 note: undefined，Object.assign 后即清除）
+  updateNodeNote: (id, note) => {
+    const existing = get().tree ? findNode(get().tree!.root, id) : undefined;
+    const now = Date.now();
+    get().applyPatch({
+      type: 'update',
+      nodeId: id,
+      node: {
+        note: note
+          ? {
+              content: note.content,
+              createdAt: existing?.note?.createdAt ?? now,
+              updatedAt: now,
+            }
+          : undefined,
+      },
+      timestamp: now,
     });
   },
   toggleNodeCollapse: (id) => {
@@ -213,6 +252,23 @@ export const useMindMapStore = create<MindMapState>((set, get) => ({
 
     get().applyPatches(patches);
     return patches.map((patch) => patch.nodeId);
+  },
+  // AI 分支扩展流式回放：打字机补丁经 applyAiGenerationPatches 直写（不入栈），
+  // 回放结束后由会话调用本方法把「扩展前」快照一次性压入 past，整体单步可撤销。
+  commitHistorySnapshot: (snapshot) => {
+    const state = get();
+    const current = state.tree;
+    // 树已切换（用户离开该导图）或无实际变更时不入栈
+    if (!current || current.id !== snapshot.tree.id || current === snapshot.tree) return;
+
+    set({
+      past: [...state.past, { tree: snapshot.tree, selectedNodeId: snapshot.selectedNodeId }].slice(
+        -MAX_HISTORY_ENTRIES,
+      ),
+      future: [],
+      canUndo: true,
+      canRedo: false,
+    });
   },
   // Replace the whole tree (e.g. after an AI optimize pass) while keeping the
   // previous tree as a single undo entry instead of resetting the history line.

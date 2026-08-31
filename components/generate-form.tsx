@@ -1,10 +1,13 @@
 'use client';
 
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 
-import type { MindMapTree, NormalizedDocument } from '@/lib/types/mindmap';
+import type { NormalizedDocument } from '@/lib/types/mindmap';
 import { buildTimingLines, type GenerationTimingMarks } from '@/lib/utils/generation-timing';
+import { startGeneration } from '@/lib/streaming/generation-session';
+import { useGenerationStore } from '@/store/generation-store';
 
 type InputMode = 'text' | 'url' | 'pdf';
 const MODE_TABS: Array<{ mode: InputMode; label: string }> = [
@@ -12,11 +15,6 @@ const MODE_TABS: Array<{ mode: InputMode; label: string }> = [
   { mode: 'url', label: 'URL' },
   { mode: 'pdf', label: 'PDF' },
 ];
-
-interface StreamEvent {
-  type: string;
-  data: any;
-}
 
 interface MarkdownDebugPayload {
   title: string;
@@ -73,41 +71,12 @@ function readFileAsBase64(file: File): Promise<string> {
   });
 }
 
-async function* consumeSSEStream(response: Response): AsyncGenerator<StreamEvent> {
-  const reader = response.body?.getReader();
-  if (!reader) return;
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-
-    const messages = buffer.split('\n\n');
-    buffer = messages.pop() || '';
-
-    for (const message of messages) {
-      const lines = message.split('\n');
-      const eventLine = lines.find((line) => line.startsWith('event: '));
-      const dataLine = lines.find((line) => line.startsWith('data: '));
-      if (!eventLine || !dataLine) continue;
-
-      const type = eventLine.replace('event: ', '').trim();
-      const raw = dataLine.replace('data: ', '').trim();
-      try {
-        yield { type, data: JSON.parse(raw) };
-      } catch {
-        // noop
-      }
-    }
-  }
-}
-
 export function GenerateForm() {
   const router = useRouter();
+  const sessionStatus = useGenerationStore((s) => s.status);
+  const sessionTreeId = useGenerationStore((s) => s.treeId);
+  // 活跃会话（streaming/paused）：提交新任务会显式取代（中断）当前生成
+  const hasActiveSession = sessionStatus === 'streaming' || sessionStatus === 'paused';
   const [mode, setMode] = useState<InputMode>('text');
   const [textInput, setTextInput] = useState('');
   const [urlInput, setUrlInput] = useState('');
@@ -341,70 +310,20 @@ export function GenerateForm() {
 
       setStatus('开始流式生成导图骨架...');
 
-      const generateRes = await fetch('/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ normalizedDocument: parseJson.normalizedDocument }),
-      });
+      // 实时生成会话：SSE 消费与节点回放由会话模块驱动（跨页面存活），
+      // 首个 skeleton 到达即跳转编辑器，后续进度由编辑器横幅展示。
+      const handle = startGeneration(parseJson.normalizedDocument);
+      const treeId = await handle.firstSkeleton;
 
-      if (!generateRes.ok) {
-        const body = await generateRes.json().catch(() => ({}));
-        throw new Error(body.error || '生成接口调用失败');
-      }
-
-      let finalTree: MindMapTree | null = null;
-      let firstEventSeen = false;
-
-      for await (const event of consumeSSEStream(generateRes)) {
-        const now = Date.now();
-        setTimingNow(now);
-
-        if (!firstEventSeen) {
-          firstEventSeen = true;
-          setTimingMarks((prev) => ({ ...prev, firstEventAt: prev.firstEventAt ?? now }));
-        }
-
-        if (event.type === 'warning') {
-          setWarning(event.data?.message || '生成首包等待较久，系统仍在处理中，请稍候。');
-        }
-
-        if (event.type === 'skeleton') {
-          setTimingMarks((prev) => ({ ...prev, skeletonAt: prev.skeletonAt ?? now }));
-          setWarning(null);
-          setStatus('骨架已生成，正在补全节点...');
-        }
-
-        if (event.type === 'node') {
-          setStatus('正在追加节点...');
-        }
-
-        if (event.type === 'error') {
-          setError(event.data?.message || '生成阶段出现错误，已尝试降级');
-        }
-
-        if (event.type === 'complete') {
-          finalTree = event.data?.tree as MindMapTree;
-          setTimingMarks((prev) => ({ ...prev, completedAt: now }));
-          setStatus('生成完成，正在跳转编辑器...');
-        }
-      }
-
-      if (!finalTree || !finalTree.id) {
-        throw new Error('未收到完整导图数据');
-      }
-
-      const saveRes = await fetch(`/api/mindmaps/${finalTree.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tree: finalTree, normalizedDocument: parseJson.normalizedDocument }),
-      });
-
-      if (!saveRes.ok) {
-        const saveBody = await saveRes.json().catch(() => ({}));
-        throw new Error(saveBody.error || '导图保存失败，请重试');
-      }
-
-      router.push(`/g/${finalTree.id}`);
+      const skeletonAt = Date.now();
+      setTimingMarks((prev) => ({
+        ...prev,
+        firstEventAt: prev.firstEventAt ?? skeletonAt,
+        skeletonAt,
+        completedAt: skeletonAt,
+      }));
+      setStatus('骨架已生成，正在进入编辑器...');
+      router.push(`/g/${treeId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : '生成失败');
       setStatus('生成失败');
@@ -418,6 +337,13 @@ export function GenerateForm() {
   return (
     <section className="generate-card">
       <h2 className="panel-title">输入内容并生成导图</h2>
+      {hasActiveSession && sessionTreeId && (
+        <p className="active-session-hint">
+          已有生成进行中，可
+          <Link href={`/g/${sessionTreeId}`}>返回查看进度</Link>
+          ；再次提交将中断当前生成。
+        </p>
+      )}
       <div className="input-tabs" role="tablist" aria-label="输入类型">
         {MODE_TABS.map((tab, index) => (
           <button
@@ -508,7 +434,7 @@ export function GenerateForm() {
             </label>
           </div>
           <button type="button" className="primary-button" onClick={submitGenerate} disabled={!canSubmit}>
-            {loading ? '生成中...' : '开始生成'}
+            {loading ? '生成中...' : hasActiveSession ? '开始新生成（将中断当前）' : '开始生成'}
           </button>
         </div>
       </div>

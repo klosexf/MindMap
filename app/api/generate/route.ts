@@ -5,6 +5,7 @@ import { buildHeuristicMindMapTree, generateMindMapStream } from '@/lib/llm/gene
 import { FirstEventTimeoutError, waitForFirstEventWithWarning } from '@/lib/llm/first-event-watchdog';
 import { saveMindMap } from '@/lib/storage/mindmap-store';
 import { mindMapTreeSchema, sourceReferenceSchema, type MindMapTree } from '@/lib/types/mindmap';
+import { progressiveTreePatches, rootOnlyTree } from '@/lib/utils/tree';
 
 export const runtime = 'nodejs';
 
@@ -59,6 +60,8 @@ export async function POST(req: Request) {
             abortSignal: generationAbortController.signal,
           })[Symbol.asyncIterator]();
           let firstDataEventSent = false;
+          // 首个 skeleton 先落盘再推送：客户端 skeleton 即跳转后 GET 必不 404
+          let skeletonSaved = false;
 
           while (true) {
             const nextPromise = iterator.next();
@@ -84,6 +87,23 @@ export async function POST(req: Request) {
 
             firstDataEventSent = true;
             const event = iteration.value;
+            if (event.type === 'skeleton' && !skeletonSaved) {
+              skeletonSaved = true;
+              // 保存失败时仍推送骨架（生成继续，complete 时会再次尝试保存）
+              try {
+                await saveMindMap(event.data.tree, normalizedDocument);
+              } catch (saveErr) {
+                controller.enqueue(
+                  encoder.encode(
+                    sseMessage('error', {
+                      message: saveErr instanceof Error ? `导图保存失败: ${saveErr.message}` : '导图保存失败',
+                    }),
+                  ),
+                );
+              }
+              controller.enqueue(encoder.encode(sseMessage(event.type, event.data)));
+              continue;
+            }
             if (event.type === 'complete') {
               completedTree = mindMapTreeSchema.parse(event.data.tree);
               // 先保存再发送 complete 事件，确保客户端跳转时文件已存在
@@ -109,9 +129,16 @@ export async function POST(req: Request) {
           if (error instanceof FirstEventTimeoutError) {
             const fallback = buildHeuristicMindMapTree(normalizedDocument);
             completedTree = fallback;
-            controller.enqueue(encoder.encode(sseMessage('skeleton', { tree: fallback })));
+            // 先保存再推送 skeleton：客户端 skeleton 即跳转后 GET 必不 404；
+            // 保存失败则只发 error（不发 skeleton/complete，客户端不跳转）。
+            // skeleton 仅含根节点（rootOnly），其余节点经 node 事件逐个回放，
+            // 与 generateMindMapStream 的实时生成语义保持一致
             try {
-              await saveMindMap(completedTree);
+              await saveMindMap(fallback, normalizedDocument);
+              controller.enqueue(encoder.encode(sseMessage('skeleton', { tree: rootOnlyTree(fallback) })));
+              for (const { patch, node } of progressiveTreePatches(fallback)) {
+                controller.enqueue(encoder.encode(sseMessage('node', { patch, node })));
+              }
               controller.enqueue(encoder.encode(sseMessage('complete', { tree: fallback })));
             } catch (saveErr) {
               controller.enqueue(

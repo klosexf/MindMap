@@ -6,7 +6,7 @@ import {
   type TreePatch,
 } from '@/lib/types/mindmap';
 
-export const MAX_TREE_DEPTH = 3;
+export const MAX_TREE_DEPTH = 4;
 export const MAX_TREE_NODES = 500;
 const DROP_SIBLING_EDGE_PX = 24;
 export const DROP_BORDER_PROXIMITY_PX = 36;
@@ -110,6 +110,45 @@ export function countNodes(root: MindMapNode): number {
   return count;
 }
 
+/**
+ * 最小骨架树：仅保留根节点（剥离全部子树），用于实时生成的首个 skeleton——
+ * 客户端秒级进入编辑器时只看到根节点，其余内容经 node 事件逐个回放，
+ * 避免「启发式粗稿整树预览」与最终 LLM 结果不符的观感。
+ */
+export function rootOnlyTree(tree: MindMapTree): MindMapTree {
+  return {
+    ...tree,
+    root: { ...tree.root, children: [] },
+    meta: { ...tree.meta },
+  };
+}
+
+/**
+ * 逐节点回放事件（DFS 先序，父节点先于子节点）。
+ * 每个事件的 node 剥离 children——单个 add patch 只携带该节点本身，
+ * 客户端按节拍逐个应用即可获得「一个一个生长」的呈现效果。
+ */
+export function* progressiveTreePatches(
+  tree: MindMapTree,
+): Generator<{ patch: TreePatch; node: MindMapNode }> {
+  const flattened = flattenTree(tree.root);
+  for (const item of flattened.slice(1)) {
+    if (!item.parentId) continue;
+    const bare: MindMapNode = { ...item.node, children: [] };
+    yield {
+      patch: {
+        type: 'add',
+        nodeId: item.node.id,
+        parentId: item.parentId,
+        index: item.index,
+        node: bare,
+        timestamp: Date.now(),
+      },
+      node: bare,
+    };
+  }
+}
+
 export function findNode(root: MindMapNode, nodeId: string): MindMapNode | undefined {
   if (root.id === nodeId) return root;
   if (!root.children?.length) return undefined;
@@ -120,6 +159,19 @@ export function findNode(root: MindMapNode, nodeId: string): MindMapNode | undef
   }
 
   return undefined;
+}
+
+/** 收集节点全部后代 id（不含自身），深度优先。用于拖拽时整棵子树跟随移动。 */
+export function collectDescendantIds(node: MindMapNode): string[] {
+  const ids: string[] = [];
+  const walk = (current: MindMapNode): void => {
+    for (const child of current.children ?? []) {
+      ids.push(child.id);
+      walk(child);
+    }
+  };
+  walk(node);
+  return ids;
 }
 
 export function getNodeDepth(root: MindMapNode, nodeId: string): number | null {

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { MindMapTree } from '../lib/types/mindmap';
 import {
   applyTreePatch,
+  collectDescendantIds,
   findClosestRectByBorderProximity,
   findParentInfo,
   inferDropModeFromPoint,
@@ -58,6 +59,19 @@ function sampleTree(): MindMapTree {
     },
   };
 }
+
+describe('collectDescendantIds', () => {
+  it('collects all descendant ids excluding the node itself', () => {
+    const tree = sampleTree();
+    const aNode = tree.root.children?.find((c) => c.id === 'a');
+
+    expect(collectDescendantIds(aNode!)).toEqual(['a1', 'a2']);
+  });
+
+  it('returns an empty array for leaf nodes', () => {
+    expect(collectDescendantIds(makeNode('leaf', 'Leaf'))).toEqual([]);
+  });
+});
 
 describe('applyTreePatch move', () => {
   it('moves a node to a new parent', () => {

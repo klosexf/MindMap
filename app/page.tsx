@@ -1,6 +1,5 @@
 import { GenerateForm } from '@/components/generate-form';
 import { SavedMindMaps } from '@/components/saved-mindmaps';
-import { TemplateGallery } from '@/components/template-gallery';
 
 export default function HomePage() {
   return (
@@ -24,16 +23,11 @@ export default function HomePage() {
       <main className="page home-page">
         <section className="hero-section">
           <h1 className="hero-title">把任何长内容变成思维导图</h1>
-          <p className="hero-subtitle">
-            单人 MVP 版本，固定技术基线：G6 Mindmap + JSON Tree + Canvas/SVG 切换 + Zustand
-          </p>
         </section>
 
         <section className="home-input-block">
           <GenerateForm />
         </section>
-
-        <TemplateGallery />
 
         <section className="home-examples" aria-label="快速示例">
           <p className="examples-label">试试这些：</p>

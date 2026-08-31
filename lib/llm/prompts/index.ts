@@ -8,7 +8,7 @@
  *   的快照与 token 预算门禁
  */
 
-export const PROMPT_VERSION = 'v2.0.0';
+export const PROMPT_VERSION = 'v2.3.0';
 
 export {
   BRANCH_EXPANSION_SYSTEM,
@@ -24,11 +24,18 @@ export {
   NODE_WRITING_RULES,
   PYRAMID_DOCUMENT_SUMMARY_FRAMEWORK,
   PYRAMID_SELF_CHECK_LOOP,
+  STYLE_FRAMEWORK_RULES,
 } from './modules';
 
 export { buildPrompt, buildCompatJsonPrompt } from './mindmap';
 export { buildMarkdownPreviewPrompt } from './markdown';
 export { buildBranchExpansionPrompt, type BranchExpansionInput } from './branch';
+export {
+  NODE_ACTION_SYSTEM,
+  buildNodeActionPrompt,
+  type NodeActionInput,
+  type NodeTextAction,
+} from './node-actions';
 export { buildTreeOptimizePrompt, type TreeOptimizeMode, type TreeOptimizationInput } from './optimize';
 export {
   resolveModelProfile,

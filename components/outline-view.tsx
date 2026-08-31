@@ -8,6 +8,8 @@ import { treeToOutlineDoc, type OutlineItem } from '@/lib/utils/outline';
 interface OutlineViewProps {
   tree: MindMapTree;
   selectedNodeId: string | null;
+  /** 实时生成回放中：行内编辑与增删入口锁定，浏览/选中/展开收起保留 */
+  generating?: boolean;
   onSelectNode: (id: string) => void;
   onUpdateNodeContent: (id: string, content: string) => void;
   onAddChild: (parentId: string) => string | void;
@@ -43,6 +45,7 @@ function buildRenderTree(items: OutlineItem[]): OutlineRenderNode[] {
 export function OutlineView({
   tree,
   selectedNodeId,
+  generating = false,
   onSelectNode,
   onUpdateNodeContent,
   onAddChild,
@@ -80,29 +83,33 @@ export function OutlineView({
     }
   }, [editingId]);
 
-  const beginEdit = useCallback((nodeId: string, currentContent: string) => {
-    setEditingId(nodeId);
-    setDraft(currentContent);
-  }, []);
+  const beginEdit = useCallback(
+    (nodeId: string, currentContent: string) => {
+      if (generating) return; // 生成中禁止进入行内编辑
+      setEditingId(nodeId);
+      setDraft(currentContent);
+    },
+    [generating],
+  );
 
   const commit = useCallback(
     (nodeId: string) => {
       if (nodeId === 'root') {
         const next = draft.trim();
-        if (next && next !== doc.rootContent) {
+        if (!generating && next && next !== doc.rootContent) {
           onUpdateNodeContent(doc.rootId, next);
         }
       } else {
         const item = doc.items.find((entry) => entry.nodeId === nodeId);
         const next = draft.trim();
-        if (item && next && next !== item.content) {
+        if (!generating && item && next && next !== item.content) {
           onUpdateNodeContent(nodeId, next);
         }
       }
       setEditingId(null);
       setDraft('');
     },
-    [doc, draft, onUpdateNodeContent],
+    [doc, draft, generating, onUpdateNodeContent],
   );
 
   const cancel = useCallback(() => {
@@ -115,6 +122,7 @@ export function OutlineView({
       if (event.key === 'Enter') {
         event.preventDefault();
         commit(nodeId);
+        if (generating) return; // 生成中禁止新增节点
         const newId = onAddSibling(nodeId);
         if (typeof newId === 'string') {
           setEditingId(newId);
@@ -123,6 +131,7 @@ export function OutlineView({
       } else if (event.key === 'Tab') {
         event.preventDefault();
         commit(nodeId);
+        if (generating) return;
         const newId = onAddChild(nodeId);
         if (typeof newId === 'string') {
           setEditingId(newId);
@@ -133,7 +142,7 @@ export function OutlineView({
         cancel();
       }
     },
-    [commit, cancel, onAddSibling, onAddChild],
+    [commit, cancel, generating, onAddSibling, onAddChild],
   );
 
   const renderItem = useCallback(

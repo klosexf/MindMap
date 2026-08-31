@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { generateMindMapStream } from '../lib/llm/generate';
 import type { MindMapTree, NormalizedDocument } from '../lib/types/mindmap';
+import { countNodes } from '../lib/utils/tree';
 
 describe('generateMindMapStream', () => {
   it('emits skeleton and complete events in fallback mode', async () => {
@@ -45,6 +46,76 @@ describe('generateMindMapStream', () => {
 
     expect(events[0]).toBe('skeleton');
     expect(events.includes('complete')).toBe(true);
+  });
+
+  it('emits rootOnly skeleton and progressive node events in fallback mode', async () => {
+    const doc: NormalizedDocument = {
+      markdown: '# Title\n\nParagraph one. Paragraph two. Paragraph three.',
+      chunks: [
+        {
+          id: 'chunk_1',
+          text: 'Paragraph one. Paragraph two.',
+          tokenEstimate: 20,
+          sourceRef: { type: 'text', text: 'Paragraph one.' },
+        },
+      ],
+      sourceMeta: {
+        type: 'text',
+        title: 'Demo Title',
+      },
+    };
+
+    const originalProvider = process.env.LLM_PROVIDER;
+    const original = process.env.OPENAI_API_KEY;
+    process.env.LLM_PROVIDER = 'openai';
+    process.env.OPENAI_API_KEY = '';
+
+    const collected: Array<{ type: string; data: any }> = [];
+    for await (const event of generateMindMapStream(doc)) {
+      collected.push(event);
+    }
+
+    if (typeof originalProvider === 'string') {
+      process.env.LLM_PROVIDER = originalProvider;
+    } else {
+      delete process.env.LLM_PROVIDER;
+    }
+    if (typeof original === 'string') {
+      process.env.OPENAI_API_KEY = original;
+    } else {
+      delete process.env.OPENAI_API_KEY;
+    }
+
+    const skeleton = collected.find((event) => event.type === 'skeleton');
+    const nodeEvents = collected.filter((event) => event.type === 'node');
+    const complete = collected.find((event) => event.type === 'complete');
+
+    expect(skeleton).toBeDefined();
+    expect(complete).toBeDefined();
+    const skeletonTree = skeleton!.data.tree as MindMapTree;
+    const completeTree = complete!.data.tree as MindMapTree;
+
+    // skeleton 仅含根节点：客户端秒进编辑器只看到根，不预览启发式全树
+    expect(skeletonTree.root.children).toHaveLength(0);
+
+    // node 事件逐个下发，数量等于终树非根节点数
+    const expectedNodeCount = countNodes(completeTree.root) - 1;
+    expect(nodeEvents.length).toBe(expectedNodeCount);
+    expect(expectedNodeCount).toBeGreaterThan(0);
+
+    // DFS 先序：每个 add patch 的 parentId 必须已下发（父先于子），node 不携带 children
+    const seen = new Set<string>([skeletonTree.root.id]);
+    for (const event of nodeEvents) {
+      const patch = event.data.patch;
+      expect(patch.type).toBe('add');
+      expect(seen.has(patch.parentId)).toBe(true);
+      expect(patch.node.children).toHaveLength(0);
+      seen.add(patch.nodeId);
+    }
+
+    // complete 自愈：终树与骨架共享会话 id 与根 id
+    expect(completeTree.id).toBe(skeletonTree.id);
+    expect(completeTree.root.id).toBe(skeletonTree.root.id);
   });
 
   it('uses document chunks as fallback branches when no LLM key is configured', async () => {

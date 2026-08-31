@@ -130,3 +130,54 @@ describe('mindmap store AI helpers', () => {
     expect(useMindMapStore.getState().canRedo).toBe(false);
   });
 });
+
+describe('mindmap store applyAiGenerationPatches', () => {
+  function addPatch(parentId: string, node: MindMapNode) {
+    return { type: 'add', nodeId: node.id, parentId, index: 0, node, timestamp: Date.now() } as const;
+  }
+
+  it('applies patches without polluting the undo history', () => {
+    resetStore(sampleTree(), 'root');
+
+    useMindMapStore
+      .getState()
+      .applyAiGenerationPatches([addPatch('root', makeNode('ai-1', 'AI 回放节点'))]);
+
+    const state = useMindMapStore.getState();
+    expect(findNode(state.tree!.root, 'ai-1')).toBeTruthy();
+    // 不入 undo 历史：生成回放是系统行为
+    expect(state.past).toHaveLength(0);
+    expect(state.canUndo).toBe(false);
+
+    // undo 无历史可回退，AI 节点保留
+    state.undo();
+    expect(findNode(useMindMapStore.getState().tree!.root, 'ai-1')).toBeTruthy();
+  });
+
+  it('skips add patches whose nodeId already exists (幂等守卫)', () => {
+    resetStore(sampleTree(), 'root');
+    const before = useMindMapStore.getState().tree;
+
+    // sampleTree 已含 'child'（parent 下的子节点）
+    useMindMapStore.getState().applyAiGenerationPatches([addPatch('parent', makeNode('child', '重复节点'))]);
+
+    const after = useMindMapStore.getState().tree;
+    expect(after).toBe(before);
+    expect(after!.root.children![0].children).toHaveLength(1);
+    expect(after!.root.children![0].children![0].content).toBe('Child');
+  });
+
+  it('is a no-op when there is no tree or no patches', () => {
+    resetStore(null);
+
+    expect(() =>
+      useMindMapStore.getState().applyAiGenerationPatches([addPatch('root', makeNode('x', 'X'))]),
+    ).not.toThrow();
+    expect(useMindMapStore.getState().tree).toBeNull();
+
+    resetStore(sampleTree(), 'root');
+    const before = useMindMapStore.getState().tree;
+    useMindMapStore.getState().applyAiGenerationPatches([]);
+    expect(useMindMapStore.getState().tree).toBe(before);
+  });
+});

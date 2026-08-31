@@ -45,6 +45,14 @@ export const nodePositionSchema = z.object({
 
 export type NodePosition = z.infer<typeof nodePositionSchema>;
 
+export const nodeNoteSchema = z.object({
+  content: z.string().max(20000),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+});
+
+export type NodeNote = z.infer<typeof nodeNoteSchema>;
+
 export type MindMapNode = {
   id: string;
   content: string;
@@ -52,6 +60,7 @@ export type MindMapNode = {
   collapsed?: boolean;
   style?: NodeStyle;
   position?: NodePosition;
+  note?: NodeNote;
   meta: NodeMeta;
 };
 
@@ -63,6 +72,7 @@ export const mindMapNodeSchema: z.ZodType<MindMapNode> = z.lazy(() =>
     collapsed: z.boolean().optional(),
     style: nodeStyleSchema.optional(),
     position: nodePositionSchema.optional(),
+    note: nodeNoteSchema.optional(),
     meta: nodeMetaSchema,
   }),
 );
@@ -116,7 +126,7 @@ export type TreePatch =
   | {
       type: 'update';
       nodeId: string;
-      node: Partial<Pick<MindMapNode, 'content' | 'collapsed' | 'style' | 'position' | 'meta'>>;
+      node: Partial<Pick<MindMapNode, 'content' | 'collapsed' | 'style' | 'position' | 'note' | 'meta'>>;
       timestamp: number;
     }
   | {
@@ -161,6 +171,7 @@ export const treePatchSchema = z.discriminatedUnion('type', [
         collapsed: z.boolean().optional(),
         style: nodeStyleSchema.optional(),
         position: nodePositionSchema.optional(),
+        note: nodeNoteSchema.optional(),
         meta: nodeMetaSchema.optional(),
       })
       .refine((v) => Object.keys(v).length > 0, 'update patch requires at least one field'),

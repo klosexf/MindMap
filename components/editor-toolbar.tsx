@@ -1,13 +1,18 @@
 'use client';
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import Link from 'next/link';
 import type { LayoutDirection } from '@/lib/types/mindmap';
 
 export type AiOptimizeMode = 'simplify' | 'restructure';
 
 interface EditorToolbarProps {
+  title: string;
+  saveNotice: string | null;
   selectedNodeId: string | null;
   layoutDirection: LayoutDirection;
+  /** 实时生成回放中：内容编辑/保存/撤销重做锁定，浏览类操作保留 */
+  generating: boolean;
   dirty: boolean;
   saving: boolean;
   canUndo: boolean;
@@ -17,7 +22,6 @@ interface EditorToolbarProps {
   optimizeMode: AiOptimizeMode;
   onUndo: () => void;
   onRedo: () => void;
-  onAiExpand: () => void;
   onAiOptimizeModeChange: (mode: AiOptimizeMode) => void;
   onAiOptimize: () => void;
   onAddChild: () => void;
@@ -28,6 +32,8 @@ interface EditorToolbarProps {
   onExportMarkdown: () => void;
   onExportPng: () => void;
   onLayoutChange: (direction: LayoutDirection) => void;
+  presenting: boolean;
+  onTogglePresentation: () => void;
 }
 
 const LAYOUT_OPTIONS: Array<{ value: LayoutDirection; label: string }> = [
@@ -98,6 +104,14 @@ function LayoutDiagram({ direction }: { direction: LayoutDirection }) {
   );
 }
 
+function IconBack() {
+  return (
+    <svg {...iconProps}>
+      <path d="M15 5 8 12l7 7" />
+    </svg>
+  );
+}
+
 function IconUndo() {
   return (
     <svg {...iconProps}>
@@ -112,15 +126,6 @@ function IconRedo() {
     <svg {...iconProps}>
       <path d="m16 5 4 4-4 4" />
       <path d="M20 9H10a6 6 0 0 0 0 12h3" />
-    </svg>
-  );
-}
-
-function IconSparkle() {
-  return (
-    <svg {...iconProps}>
-      <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
-      <path d="M19 16l.9 2.1L22 19l-2.1.9L19 22l-.9-2.1L16 19l2.1-.9L19 16z" />
     </svg>
   );
 }
@@ -183,11 +188,28 @@ function IconSave() {
   );
 }
 
+function IconPresent() {
+  return (
+    <svg {...iconProps}>
+      <path d="M8 5.5v13l11-6.5-11-6.5z" />
+    </svg>
+  );
+}
+
 function IconExportFile() {
   return (
     <svg {...iconProps}>
       <path d="M12 3v12M8 7l4-4 4 4" />
       <path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
+    </svg>
+  );
+}
+
+function IconMarkdown() {
+  return (
+    <svg {...iconProps}>
+      <rect x="2.5" y="5" width="19" height="14" rx="2" />
+      <path d="M6 15V9l2.5 3L11 9v6M16.5 9v4M16.5 15v-2M14 11.5 16.5 14 19 11.5" />
     </svg>
   );
 }
@@ -218,28 +240,9 @@ function CheckIcon() {
   );
 }
 
-/* ---------- 布局方向选择器（示意图标下拉，参照 XMind 结构选择器） ---------- */
+/* ---------- 下拉面板通用关闭逻辑（外点 / Esc / 滚动 / 缩放） ---------- */
 
-function LayoutPicker({
-  value,
-  onChange,
-}: {
-  value: LayoutDirection;
-  onChange: (direction: LayoutDirection) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [anchor, setAnchor] = useState<{ top: number; left: number } | null>(null);
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const btnRef = useRef<HTMLButtonElement>(null);
-
-  const toggle = () => {
-    if (!open && btnRef.current) {
-      const r = btnRef.current.getBoundingClientRect();
-      setAnchor({ top: r.bottom + 6, left: r.left });
-    }
-    setOpen((o) => !o);
-  };
-
+function useDismissable(open: boolean, setOpen: (open: boolean) => void, wrapRef: React.RefObject<HTMLElement | null>) {
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
@@ -259,7 +262,42 @@ function LayoutPicker({
       window.removeEventListener('scroll', close, true);
       window.removeEventListener('resize', close);
     };
-  }, [open]);
+  }, [open, setOpen, wrapRef]);
+}
+
+/* ---------- 下拉锚点定位 ---------- */
+
+function useAnchor(btnRef: React.RefObject<HTMLElement | null>) {
+  const [anchor, setAnchor] = useState<{ top: number; left: number } | null>(null);
+  const sync = (open: boolean) => {
+    if (!open && btnRef.current) return;
+    const el = btnRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setAnchor(open ? { top: r.bottom + 6, left: r.left } : null);
+  };
+  return { anchor, sync };
+}
+
+/* ---------- 布局方向选择器（示意图标下拉，参照 XMind 结构选择器） ---------- */
+
+function LayoutPicker({
+  value,
+  onChange,
+}: {
+  value: LayoutDirection;
+  onChange: (direction: LayoutDirection) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const { anchor, sync } = useAnchor(btnRef);
+  useDismissable(open, setOpen, wrapRef);
+
+  const toggle = () => {
+    sync(!open);
+    setOpen((o) => !o);
+  };
 
   const currentLabel = LAYOUT_OPTIONS.find((o) => o.value === value)?.label ?? '';
 
@@ -303,6 +341,73 @@ function LayoutPicker({
   );
 }
 
+/* ---------- 导出下拉（Markdown / PNG 合并为单一入口） ---------- */
+
+function ExportPicker({
+  onExportMarkdown,
+  onExportPng,
+}: {
+  onExportMarkdown: () => void;
+  onExportPng: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const { anchor, sync } = useAnchor(btnRef);
+  useDismissable(open, setOpen, wrapRef);
+
+  const toggle = () => {
+    sync(!open);
+    setOpen((o) => !o);
+  };
+
+  return (
+    <div className="tool-dropdown" ref={wrapRef}>
+      <button
+        type="button"
+        ref={btnRef}
+        className="tool-btn"
+        onClick={toggle}
+        title="导出"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <IconExportFile />
+        <span className="tool-label">导出</span>
+        <Chevron className={open ? 'chevron-open' : ''} />
+      </button>
+      {open && anchor && (
+        <div className="layout-menu export-menu" role="menu" aria-label="导出" style={{ top: anchor.top, left: anchor.left }}>
+          <button
+            type="button"
+            role="menuitem"
+            className="layout-option"
+            onClick={() => {
+              onExportMarkdown();
+              setOpen(false);
+            }}
+          >
+            <IconMarkdown />
+            <span>Markdown 文件</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="layout-option"
+            onClick={() => {
+              onExportPng();
+              setOpen(false);
+            }}
+          >
+            <IconImage />
+            <span>PNG 图片</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---------- 通用按钮子组件 ---------- */
 
 function ToolButton({
@@ -337,8 +442,11 @@ function ToolbarGroup({ children, extra }: { children: ReactNode; extra?: string
 }
 
 export function EditorToolbar({
+  title,
+  saveNotice,
   selectedNodeId,
   layoutDirection,
+  generating,
   dirty,
   saving,
   canUndo,
@@ -348,7 +456,6 @@ export function EditorToolbar({
   optimizeMode,
   onUndo,
   onRedo,
-  onAiExpand,
   onAiOptimizeModeChange,
   onAiOptimize,
   onAddChild,
@@ -359,126 +466,138 @@ export function EditorToolbar({
   onExportMarkdown,
   onExportPng,
   onLayoutChange,
+  presenting,
+  onTogglePresentation,
 }: EditorToolbarProps) {
   const hasSelection = Boolean(selectedNodeId);
 
   return (
-    <div className="toolbar" role="toolbar" aria-label="导图编辑工具栏">
-      {/* 组 1：结构 */}
-      <ToolbarGroup>
-        <LayoutPicker value={layoutDirection} onChange={onLayoutChange} />
-      </ToolbarGroup>
+    <header className="editor-topbar">
+      {/* 身份区：返回 + 标题 + 保存状态 */}
+      <div className="editor-topbar-left">
+        <Link href="/" className="back-link" aria-label="返回首页" title="返回首页">
+          <IconBack />
+        </Link>
+        <span className="editor-divider" aria-hidden="true" />
+        <h1>{title}</h1>
+        <span
+          className={`save-state ${saveNotice ? 'active' : ''} ${dirty ? 'dirty' : ''}`}
+          role="status"
+          aria-live="polite"
+        >
+          <i className="save-dot" aria-hidden="true" />
+          {saveNotice || (dirty ? '未保存' : '已保存')}
+        </span>
+      </div>
 
-      <span className="toolbar-divider" />
+      <span className="toolbar-divider" aria-hidden="true" />
 
-      {/* 组 2：历史 */}
-      <ToolbarGroup>
-        <ToolButton
-          icon={<IconUndo />}
-          label="撤销"
-          onClick={onUndo}
-          disabled={!canUndo}
-          title="撤销 (Cmd/Ctrl+Z)"
-        />
-        <ToolButton
-          icon={<IconRedo />}
-          label="重做"
-          onClick={onRedo}
-          disabled={!canRedo}
-          title="重做 (Cmd/Ctrl+Shift+Z)"
-        />
-      </ToolbarGroup>
+      {/* 工具区：单行滚动 */}
+      <div className="toolbar" role="toolbar" aria-label="导图编辑工具栏">
+        {/* 组 1：结构 */}
+        <ToolbarGroup>
+          <LayoutPicker value={layoutDirection} onChange={onLayoutChange} />
+        </ToolbarGroup>
 
-      <span className="toolbar-divider" />
+        <span className="toolbar-divider" aria-hidden="true" />
 
-      {/* 组 3：AI（核心能力，底色块突出） */}
-      <ToolbarGroup extra="ai-group">
-        <ToolButton
-          icon={<IconSparkle />}
-          label={aiExpanding ? 'AI 扩展中…' : 'AI 扩展'}
-          onClick={onAiExpand}
-          disabled={!hasSelection || aiExpanding || optimizing}
-          title="AI 为选中节点生成子节点（结果可一键撤销）"
-        />
-        <ToolButton
-          icon={<IconWand />}
-          label={optimizing ? 'AI 优化中…' : 'AI 优化'}
-          onClick={onAiOptimize}
-          disabled={optimizing || aiExpanding}
-          title="AI 优化整图结构（结果可一键撤销）"
-        />
-        <div className="tool-select-wrap compact" title="切换 AI 优化模式">
-          <select
-            value={optimizeMode}
-            onChange={(e) => onAiOptimizeModeChange(e.target.value as AiOptimizeMode)}
-            className="tool-select"
-            aria-label="AI 优化模式"
-            disabled={optimizing || aiExpanding}
-          >
-            {OPTIMIZE_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-          <Chevron />
-        </div>
-      </ToolbarGroup>
+        {/* 组 2：历史 */}
+        <ToolbarGroup>
+          <ToolButton
+            icon={<IconUndo />}
+            label="撤销"
+            onClick={onUndo}
+            disabled={!canUndo || generating}
+            title="撤销 (Cmd/Ctrl+Z)"
+          />
+          <ToolButton
+            icon={<IconRedo />}
+            label="重做"
+            onClick={onRedo}
+            disabled={!canRedo || generating}
+            title="重做 (Cmd/Ctrl+Shift+Z)"
+          />
+        </ToolbarGroup>
 
-      <span className="toolbar-divider" />
+        <span className="toolbar-divider" aria-hidden="true" />
 
-      {/* 组 4：节点编辑 */}
-      <ToolbarGroup>
-        <ToolButton
-          icon={<IconAddSibling />}
-          label="主题"
-          onClick={onAddSibling}
-          disabled={!hasSelection}
-          title="添加同级主题 (Enter)"
-        />
-        <ToolButton
-          icon={<IconAddChild />}
-          label="细分主题"
-          onClick={onAddChild}
-          disabled={!hasSelection}
-          title="添加细分主题 (Tab)"
-        />
-        <ToolButton
-          icon={<IconCollapse />}
-          label="折叠"
-          onClick={onToggleCollapse}
-          disabled={!hasSelection}
-          title="折叠 / 展开节点"
-        />
-        <ToolButton
-          icon={<IconTrash />}
-          label="删除"
-          onClick={onDelete}
-          disabled={!hasSelection}
-          variant="danger"
-          title="删除选中节点"
-        />
-      </ToolbarGroup>
+        {/* 组 3：AI（核心能力，底色块突出） */}
+        <ToolbarGroup extra="ai-group">
+          <ToolButton
+            icon={<IconWand />}
+            label={optimizing ? 'AI 优化中…' : 'AI 优化'}
+            onClick={onAiOptimize}
+            disabled={optimizing || aiExpanding || generating}
+            title="AI 优化整图结构（结果可一键撤销）"
+          />
+          <div className="tool-select-wrap compact" title="切换 AI 优化模式">
+            <select
+              value={optimizeMode}
+              onChange={(e) => onAiOptimizeModeChange(e.target.value as AiOptimizeMode)}
+              className="tool-select"
+              aria-label="AI 优化模式"
+              disabled={optimizing || aiExpanding || generating}
+            >
+              {OPTIMIZE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <Chevron />
+          </div>
+        </ToolbarGroup>
 
-      {/* 组 5：保存与导出（右侧主操作区） */}
+        <span className="toolbar-divider" aria-hidden="true" />
+
+        {/* 组 4：节点编辑 */}
+        <ToolbarGroup>
+          <ToolButton
+            icon={<IconAddSibling />}
+            label="主题"
+            onClick={onAddSibling}
+            disabled={!hasSelection || generating}
+            title="添加同级主题 (Enter)"
+          />
+          <ToolButton
+            icon={<IconAddChild />}
+            label="细分主题"
+            onClick={onAddChild}
+            disabled={!hasSelection || generating}
+            title="添加细分主题 (Tab)"
+          />
+          <ToolButton
+            icon={<IconCollapse />}
+            label="折叠"
+            onClick={onToggleCollapse}
+            disabled={!hasSelection}
+            title="折叠 / 展开节点"
+          />
+          <ToolButton
+            icon={<IconTrash />}
+            label="删除"
+            onClick={onDelete}
+            disabled={!hasSelection || generating}
+            variant="danger"
+            title="删除选中节点"
+          />
+        </ToolbarGroup>
+      </div>
+
+      {/* 右侧主操作区 */}
       <div className="toolbar-end">
         <ToolButton
-          icon={<IconExportFile />}
-          label="Markdown"
-          onClick={onExportMarkdown}
-          title="导出为 Markdown 文件"
+          icon={<IconPresent />}
+          label={presenting ? '退出演示' : '演示'}
+          onClick={onTogglePresentation}
+          disabled={generating}
+          title="演示模式：全折叠后按分支逐步展开（空格下一步，Esc 退出）"
         />
-        <ToolButton
-          icon={<IconImage />}
-          label="PNG"
-          onClick={onExportPng}
-          title="导出为 PNG 图片"
-        />
-        <span className="toolbar-divider" />
+        <ExportPicker onExportMarkdown={onExportMarkdown} onExportPng={onExportPng} />
         <button
           type="button"
           onClick={onSave}
-          disabled={saving}
+          disabled={saving || generating}
           className={`tool-btn primary ${dirty ? 'dirty' : ''}`}
           title={dirty ? '有未保存的修改，点击保存 (Cmd/Ctrl+S)' : '所有修改已保存'}
         >
@@ -486,6 +605,6 @@ export function EditorToolbar({
           <span className="tool-label">{saving ? '保存中…' : '保存'}</span>
         </button>
       </div>
-    </div>
+    </header>
   );
 }

@@ -49,16 +49,20 @@ describe('mindmap drag preview styles', () => {
     expect(source).toMatch(/type:\s*'orth'\s+as const/);
   });
 
-  it('styles root and non-root nodes with the same rounded card treatment', () => {
+  it('styles nodes via per-depth visuals so each hierarchy level has its own treatment', () => {
     const source = readFileSync(
       path.join(process.cwd(), 'components/mindmap-editor.tsx'),
       'utf8',
     );
 
-    expect(source).toMatch(/radius:\s*NODE_VISUAL_TOKENS\.radius/);
-    expect(source).not.toMatch(/datum\.id === treeRef\.current\.root\.id\s*\?/);
-    expect(source).toMatch(/fill:\s*NODE_VISUAL_TOKENS\.fill/);
-    expect(source).toMatch(/stroke:\s*NODE_VISUAL_TOKENS\.stroke/);
+    // 暖调手作方案：fill/stroke/radius/labelFill 全部走 getNodeDepthVisuals 回调
+    expect(source).toMatch(/function getNodeDepthVisuals\(depth: number, branchIndex: number\)/);
+    for (const prop of ['fill', 'stroke', 'lineWidth', 'radius', 'labelFill']) {
+      expect(source).toMatch(new RegExp(`${prop}: \\(datum[\\s\\S]{0,160}?getNodeDepthVisuals\\(`));
+    }
+    // 一级分支与连线共享同一分支色
+    expect(source).toMatch(/branchIndexByNodeId/);
+    expect(source).toMatch(/stroke: getBranchColor\(branchIndex\)/);
   });
 
   it('drives label font size and weight from per-node metrics so the root title is emphasized', () => {
